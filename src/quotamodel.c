@@ -427,6 +427,26 @@ clean_all_quota_limit(void)
 	}
 }
 
+#if PG_VERSION_NUM >= 150000
+static shmem_request_hook_type prev_shmem_request_hook = NULL;
+
+/*
+ * PG15 forbids calling RequestAddinShmemSpace()/RequestNamedLWLockTranche()
+ * outside of a shmem_request_hook (previously they were called directly
+ * from _PG_init(), which now errors with "cannot request additional shared
+ * memory outside shmem_request_hook"). Move the requests here and chain any
+ * previously-installed hook, same pattern as shmem_startup_hook below.
+ */
+static void
+disk_quota_shmem_request(void)
+{
+	if (prev_shmem_request_hook) (*prev_shmem_request_hook)();
+
+	RequestAddinShmemSpace(DiskQuotaShmemSize());
+	RequestNamedLWLockTranche("DiskquotaLocks", DiskQuotaLocksItemNumber);
+}
+#endif /* PG_VERSION_NUM >= 150000 */
+
 /* ---- Functions for disk quota shared memory ---- */
 /*
  * DiskQuotaShmemInit
@@ -436,6 +456,10 @@ clean_all_quota_limit(void)
 void
 init_disk_quota_shmem(void)
 {
+#if PG_VERSION_NUM >= 150000
+	prev_shmem_request_hook = shmem_request_hook;
+	shmem_request_hook      = disk_quota_shmem_request;
+#else
 	/*
 	 * Request additional shared resources.  (These are no-ops if we're not in
 	 * the postmaster process.)  We'll allocate or attach to the shared
@@ -448,6 +472,7 @@ init_disk_quota_shmem(void)
 #else
 	RequestNamedLWLockTranche("DiskquotaLocks", DiskQuotaLocksItemNumber);
 #endif /* GP_VERSION_NUM */
+#endif /* PG_VERSION_NUM >= 150000 */
 
 	/* Install startup hook to initialize our shared memory. */
 	prev_shmem_startup_hook = shmem_startup_hook;
@@ -548,8 +573,7 @@ static Size
 diskquota_worker_shmem_size()
 {
 	Size size;
-	size = hash_estimate_size(MAX_NUM_TABLE_SIZE_ENTRIES / diskquota_max_monitored_databases + 100,
-	                          sizeof(TableSizeEntry));
+	size = hash_estimate_size(MAX_NUM_TABLE_SIZE_ENTRIES_PER_DB, sizeof(TableSizeEntry));
 	size = add_size(size, hash_estimate_size(MAX_LOCAL_DISK_QUOTA_REJECT_ENTRIES, sizeof(LocalRejectMapEntry)));
 	return size;
 }
@@ -599,8 +623,8 @@ init_disk_quota_model(uint32 id)
 	memset(&hash_ctl, 0, sizeof(hash_ctl));
 	hash_ctl.keysize   = sizeof(TableSizeEntryKey);
 	hash_ctl.entrysize = sizeof(TableSizeEntry);
-	table_size_map     = DiskquotaShmemInitHash(str.data, INIT_NUM_TABLE_SIZE_ENTRIES, MAX_NUM_TABLE_SIZE_ENTRIES,
-	                                            &hash_ctl, HASH_ELEM, DISKQUOTA_TAG_HASH);
+	table_size_map = DiskquotaShmemInitHash(str.data, INIT_NUM_TABLE_SIZE_ENTRIES, MAX_NUM_TABLE_SIZE_ENTRIES_PER_DB,
+	                                        &hash_ctl, HASH_ELEM, DISKQUOTA_TAG_HASH);
 
 	/* for localrejectmap */
 	/* WARNNING: The max length of name of the map is 48 */
@@ -652,8 +676,8 @@ vacuum_disk_quota_model(uint32 id)
 	memset(&hash_ctl, 0, sizeof(hash_ctl));
 	hash_ctl.keysize   = sizeof(TableSizeEntryKey);
 	hash_ctl.entrysize = sizeof(TableSizeEntry);
-	table_size_map     = DiskquotaShmemInitHash(str.data, INIT_NUM_TABLE_SIZE_ENTRIES, MAX_NUM_TABLE_SIZE_ENTRIES,
-	                                            &hash_ctl, HASH_ELEM, DISKQUOTA_TAG_HASH);
+	table_size_map = DiskquotaShmemInitHash(str.data, INIT_NUM_TABLE_SIZE_ENTRIES, MAX_NUM_TABLE_SIZE_ENTRIES_PER_DB,
+	                                        &hash_ctl, HASH_ELEM, DISKQUOTA_TAG_HASH);
 	hash_seq_init(&iter, table_size_map);
 	while ((tsentry = hash_seq_search(&iter)) != NULL)
 	{
@@ -765,8 +789,11 @@ do_check_diskquota_state_is_ready(void)
 	tupdesc = SPI_tuptable->tupdesc;
 #if GP_VERSION_NUM < 70000
 	if (SPI_processed != 1 || tupdesc->natts != 1 || ((tupdesc)->attrs[0])->atttypid != INT4OID)
-#else
+#elif GP_VERSION_NUM < 190000
 	if (SPI_processed != 1 || tupdesc->natts != 1 || ((tupdesc)->attrs[0]).atttypid != INT4OID)
+#else
+	/* WHPG19 dropped the GP-specific TupleDescData->attrs[] compat member; use the portable accessor. */
+	if (SPI_processed != 1 || tupdesc->natts != 1 || TupleDescAttr(tupdesc, 0)->atttypid != INT4OID)
 #endif /* GP_VERSION_NUM */
 	{
 		ereport(ERROR, (errcode(ERRCODE_INTERNAL_ERROR),
@@ -1841,9 +1868,13 @@ do_load_quotas(void)
 #if GP_VERSION_NUM < 70000
 	if (tupdesc->natts != NUM_QUOTA_CONFIG_ATTRS || ((tupdesc)->attrs[0])->atttypid != OIDOID ||
 	    ((tupdesc)->attrs[1])->atttypid != INT4OID || ((tupdesc)->attrs[2])->atttypid != INT8OID)
-#else
+#elif GP_VERSION_NUM < 190000
 	if (tupdesc->natts != NUM_QUOTA_CONFIG_ATTRS || ((tupdesc)->attrs[0]).atttypid != OIDOID ||
 	    ((tupdesc)->attrs[1]).atttypid != INT4OID || ((tupdesc)->attrs[2]).atttypid != INT8OID)
+#else
+	/* WHPG19 dropped the GP-specific TupleDescData->attrs[] compat member; use the portable accessor. */
+	if (tupdesc->natts != NUM_QUOTA_CONFIG_ATTRS || TupleDescAttr(tupdesc, 0)->atttypid != OIDOID ||
+	    TupleDescAttr(tupdesc, 1)->atttypid != INT4OID || TupleDescAttr(tupdesc, 2)->atttypid != INT8OID)
 #endif /* GP_VERSION_NUM */
 	{
 		ereport(ERROR, (errcode(ERRCODE_INTERNAL_ERROR),

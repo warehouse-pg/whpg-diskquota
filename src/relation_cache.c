@@ -11,6 +11,7 @@
  */
 #include "postgres.h"
 
+#include "access/htup_details.h" /* heap_freetuple() no longer transitively available on WHPG19 */
 #if GP_VERSION_NUM >= 70000
 #include "access/relation.h"
 #endif /* GP_VERSION_NUM */
@@ -19,9 +20,14 @@
 #include "catalog/pg_namespace.h"
 #include "catalog/pg_tablespace.h"
 #include "catalog/objectaccess.h"
+#include "miscadmin.h"         /* MyDatabaseId/MyDatabaseTableSpace no longer transitively available on WHPG19 */
+#include "storage/backendid.h" /* TempRelBackendId/InvalidBackendId no longer transitively available on WHPG19 */
 #include "utils/rel.h"
 #include "utils/relcache.h"
 #include "utils/relfilenodemap.h"
+#if GP_VERSION_NUM >= 190000
+#include "utils/relfilenumbermap.h" /* RelidByRelfilenode() renamed RelidByRelfilenumber(), not exported anymore */
+#endif                              /* GP_VERSION_NUM >= 190000 */
 #include "utils/syscache.h"
 #include "utils/array.h"
 #include "utils/inval.h"
@@ -60,7 +66,7 @@ get_relid_by_relfilenode(RelFileNode relfilenode)
 {
 	Oid relid;
 
-	relid = RelidByRelfilenode(relfilenode.spcNode, relfilenode.relNode);
+	relid = DiskquotaRelidByRelfilenode(relfilenode.spcNode, relfilenode.relNode);
 	if (OidIsValid(relid))
 	{
 		remove_cache_entry(InvalidOid, relfilenode.relNode);
@@ -300,7 +306,7 @@ remove_committed_relation_from_cache(void)
 		 * remains in relation_cache, the outdated relation_cache_entry should
 		 * be removed.
 		 */
-		if (OidIsValid(RelidByRelfilenode(local_entry->rnode.node.spcNode, local_entry->rnode.node.relNode)))
+		if (OidIsValid(DiskquotaRelidByRelfilenode(local_entry->rnode.node.spcNode, local_entry->rnode.node.relNode)))
 		{
 			remove_cache_entry(InvalidOid, local_entry->rnode.node.relNode);
 		}

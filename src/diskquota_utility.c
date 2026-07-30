@@ -40,12 +40,14 @@
 #include "executor/spi.h"
 #include "nodes/makefuncs.h"
 #include "pgstat.h"
+#include "storage/backendid.h" /* TempRelBackendId no longer transitively available on WHPG19 */
 #include "storage/proc.h"
 #include "utils/snapmgr.h"
 #include "utils/builtins.h"
 #include "utils/faultinjector.h"
 #include "utils/fmgroids.h"
 #include "utils/formatting.h"
+#include "utils/lsyscache.h" /* get_database_name() moved here on WHPG19 */
 #include "utils/numeric.h"
 #include "libpq-fe.h"
 #include "funcapi.h"
@@ -56,6 +58,18 @@
 
 #include "diskquota.h"
 #include "gp_activetable.h"
+
+#if GP_VERSION_NUM >= 190000
+/*
+ * WHPG19 changed relpathbackend()/GetRelationPath() to return RelPathStr (a
+ * fixed-size struct) by value instead of a char* into a static buffer, so it
+ * can be made thread-safe. diskquota stores the result in a plain char* for
+ * later use with snprintf(), so copy it out with pstrdup().
+ */
+#define DiskquotaRelpathBackend(rnode, backend, forknum) pstrdup(relpathbackend(rnode, backend, forknum).str)
+#else
+#define DiskquotaRelpathBackend(rnode, backend, forknum) relpathbackend(rnode, backend, forknum)
+#endif /* GP_VERSION_NUM >= 190000 */
 
 /* disk quota helper function */
 
@@ -1644,7 +1658,7 @@ calculate_relation_size_all_forks(RelFileNodeBackend *rnode, char relstorage, Oi
 		for (forkNum = 0; forkNum <= MAX_FORKNUM; forkNum++)
 		{
 			RelationFileStatCtx ctx = {0};
-			ctx.relation_path       = relpathbackend(rnode->node, rnode->backend, forkNum);
+			ctx.relation_path       = DiskquotaRelpathBackend(rnode->node, rnode->backend, forkNum);
 			ctx.size                = 0;
 			for (segno = 0;; segno++)
 			{
@@ -1657,7 +1671,7 @@ calculate_relation_size_all_forks(RelFileNodeBackend *rnode, char relstorage, Oi
 	else if (TableIsAoRows(relstorage, relam) || TableIsAoCols(relstorage, relam))
 	{
 		RelationFileStatCtx ctx = {0};
-		ctx.relation_path       = relpathbackend(rnode->node, rnode->backend, MAIN_FORKNUM);
+		ctx.relation_path       = DiskquotaRelpathBackend(rnode->node, rnode->backend, MAIN_FORKNUM);
 		ctx.size                = 0;
 		/*
 		 * Since the extension file with (segno=0, column=1) is not traversed by
@@ -1924,7 +1938,11 @@ DiskquotaShmemInitHash(const char           *name,       /* table string name fo
 	else
 		infoP->hash = string_hash;
 	return ShmemInitHash(name, init_size, max_size, infoP, hash_flags | HASH_FUNCTION);
-#else
+#elif GP_VERSION_NUM < 190000
 	return ShmemInitHash(name, init_size, max_size, infoP, hash_flags | HASH_BLOBS);
+#else
+	/* WHPG19 collapsed the separate init_size/max_size args into a single nelems. */
+	(void)init_size;
+	return ShmemInitHash(name, max_size, infoP, hash_flags | HASH_BLOBS);
 #endif /* GP_VERSION_NUM */
 }

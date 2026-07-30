@@ -2,7 +2,13 @@ include(${CMAKE_SOURCE_DIR}/cmake/Regress.cmake)
 
 list(APPEND isolation2_expected_DIR ${CMAKE_CURRENT_SOURCE_DIR}/isolation2/expected)
 list(APPEND regress_expected_DIR ${CMAKE_CURRENT_SOURCE_DIR}/regress/expected)
-if (${GP_MAJOR_VERSION} EQUAL 7)
+# GP_MAJOR_VERSION >= 7 covers both GP7 (PG12-based, WHPG7) and GP8 (PG19-based,
+# WHPG19) - both use the same plpython3u/gp_role=dispatch test setup introduced
+# in GP7. Only GP6 and earlier used plpython2u / the "-E" postmaster flag, and
+# there is no supported GP6 target for this branch anymore, so this was
+# previously mis-gated as "== 7" (which silently fell through to the GP6-era
+# else branch for GP8/WHPG19, where plpython2u doesn't even exist).
+if (${GP_MAJOR_VERSION} GREATER_EQUAL 7)
   list(APPEND isolation2_expected_DIR ${CMAKE_CURRENT_SOURCE_DIR}/isolation2/expected7)
   list(APPEND regress_expected_DIR ${CMAKE_CURRENT_SOURCE_DIR}/regress/expected7)
   # PLPYTHON_LANG_STR will be replaced by Regress.cmake
@@ -11,6 +17,16 @@ if (${GP_MAJOR_VERSION} EQUAL 7)
 else()
   set(PLPYTHON_LANG_STR "plpython2u")
   set(POSTMASTER_START_CMD "pg_ctl -D $MASTER_DATA_DIRECTORY -w -o \"-E\" start")
+endif()
+
+# WHPG19 (GP8/PG19) differs from GP7 in a few server-side behaviours that change
+# expected output - e.g. the AO block directory relation is now created eagerly
+# for every AO table, so it shows up alongside aoseg/aovisimap in the rejectmap.
+# Directories later in the list win, so these files override the expected7 ones
+# for the handful of tests that differ.
+if (${GP_MAJOR_VERSION} GREATER_EQUAL 19)
+  list(APPEND isolation2_expected_DIR ${CMAKE_CURRENT_SOURCE_DIR}/isolation2/expected19)
+  list(APPEND regress_expected_DIR ${CMAKE_CURRENT_SOURCE_DIR}/regress/expected19)
 endif()
 
 set(exclude_fault_injector OFF)

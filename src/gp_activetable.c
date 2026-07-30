@@ -33,6 +33,7 @@
 #include "funcapi.h"
 #include "libpq-fe.h"
 #include "storage/smgr.h"
+#include "utils/array.h" /* ArrayType/ARR_* macros no longer transitively available on WHPG19 */
 #include "utils/faultinjector.h"
 #include "utils/lsyscache.h"
 #include "utils/syscache.h"
@@ -600,7 +601,7 @@ get_active_tables_stats(ArrayType *array)
 	bool                       typbyval;
 	char                       typalign;
 	char                      *ptr;
-	bits8                     *bitmap;
+	diskquota_bits8           *bitmap;
 	int                        bitmask;
 	int                        i;
 	Oid                        relOid;
@@ -974,9 +975,13 @@ load_table_size(HTAB *local_table_stats_map)
 #if GP_VERSION_NUM < 70000
 	if (tupdesc->natts != 3 || ((tupdesc)->attrs[0])->atttypid != OIDOID ||
 	    ((tupdesc)->attrs[1])->atttypid != INT8OID || ((tupdesc)->attrs[2])->atttypid != INT2OID)
-#else
+#elif GP_VERSION_NUM < 190000
 	if (tupdesc->natts != 3 || ((tupdesc)->attrs[0]).atttypid != OIDOID || ((tupdesc)->attrs[1]).atttypid != INT8OID ||
 	    ((tupdesc)->attrs[2]).atttypid != INT2OID)
+#else
+	/* WHPG19 dropped the GP-specific TupleDescData->attrs[] compat member; use the portable accessor. */
+	if (tupdesc->natts != 3 || TupleDescAttr(tupdesc, 0)->atttypid != OIDOID ||
+	    TupleDescAttr(tupdesc, 1)->atttypid != INT8OID || TupleDescAttr(tupdesc, 2)->atttypid != INT2OID)
 #endif /* GP_VERSION_NUM */
 	{
 		if (tupdesc->natts != 3)
@@ -988,9 +993,12 @@ load_table_size(HTAB *local_table_stats_map)
 #if GP_VERSION_NUM < 70000
 			ereport(WARNING, (errmsg("[diskquota] attrs: %d, %d, %d", tupdesc->attrs[0]->atttypid,
 			                         tupdesc->attrs[1]->atttypid, tupdesc->attrs[2]->atttypid)));
-#else
+#elif GP_VERSION_NUM < 190000
 			ereport(WARNING, (errmsg("[diskquota] attrs: %d, %d, %d", tupdesc->attrs[0].atttypid,
 			                         tupdesc->attrs[1].atttypid, tupdesc->attrs[2].atttypid)));
+#else
+			ereport(WARNING, (errmsg("[diskquota] attrs: %d, %d, %d", TupleDescAttr(tupdesc, 0)->atttypid,
+			                         TupleDescAttr(tupdesc, 1)->atttypid, TupleDescAttr(tupdesc, 2)->atttypid)));
 #endif /* GP_VERSION_NUM */
 		}
 		ereport(ERROR, (errmsg("[diskquota] table \"table_size\" is corrupted in database \"%s\","

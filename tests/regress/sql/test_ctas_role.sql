@@ -6,6 +6,9 @@
 CREATE ROLE hardlimit_r;
 SELECT diskquota.set_role_quota('hardlimit_r', '1MB');
 GRANT USAGE ON SCHEMA diskquota TO hardlimit_r;
+-- PG15 revoked CREATE on the public schema from PUBLIC, so the role needs it
+-- explicitly before it can create the tables below.
+GRANT CREATE ON SCHEMA public TO hardlimit_r;
 SET ROLE hardlimit_r;
 
 -- heap table
@@ -37,6 +40,7 @@ DROP TABLE IF EXISTS ao_table;
 DROP TABLE IF EXISTS aocs_table;
 RESET ROLE;
 REVOKE USAGE ON SCHEMA diskquota FROM hardlimit_r;
+REVOKE CREATE ON SCHEMA public FROM hardlimit_r;
 DROP ROLE hardlimit_r;
 \! gpconfig -c "diskquota.hard_limit" -v "off" > /dev/null
 \! gpstop -u > /dev/null

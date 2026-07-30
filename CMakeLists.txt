@@ -78,11 +78,23 @@ if(CMAKE_INSTALL_PREFIX_INITIALIZED_TO_DEFAULT)
       CACHE PATH "default install prefix" FORCE)
 endif()
 
+# WHPG19 (GP8)'s c.h expanded StaticAssertDecl()/StaticAssertStmt() to the
+# bare `static_assert` spelling, which is only defined as a macro by
+# <assert.h> under C11+ (it's a real keyword only in C23). Under C99 it's
+# just an undeclared identifier, breaking every header that uses it - a
+# cascade, not a diskquota-specific bug. GP7/WHPG7 stays on C99 since its
+# headers don't require more.
+if(${GP_MAJOR_VERSION} GREATER_EQUAL 8)
+  set(DISKQUOTA_C_STANDARD 11)
+else()
+  set(DISKQUOTA_C_STANDARD 99)
+endif()
+
 set_target_properties(
   diskquota
   PROPERTIES OUTPUT_NAME ${DISKQUOTA_BINARY_NAME}
              PREFIX ""
-             C_STANDARD 99
+             C_STANDARD ${DISKQUOTA_C_STANDARD}
              LINKER_LANGUAGE "C")
 
 # 2.4 targets WHPG 7 only; WHPG 6 keeps shipping from the 2.3.x tags.
@@ -91,7 +103,13 @@ if(${GP_MAJOR_VERSION} EQUAL 6)
           "build WHPG6 packages from the 2.3.x maintenance tags")
 endif()
 
-if (${GP_MAJOR_VERSION} STRGREATER_EQUAL "7")
+# STRGREATER_EQUAL is a *lexicographic* string comparison: "19" < "7" (since
+# '1' < '7'), so this silently skipped linking libpq on GP8/WHPG19 - the
+# .so built and installed fine, but crashed the postmaster at
+# shared_preload_libraries load time with "undefined symbol: PQresultStatus".
+# Numeric GREATER_EQUAL compares major version numbers correctly for any
+# number of digits.
+if (${GP_MAJOR_VERSION} GREATER_EQUAL 7)
   TARGET_LINK_LIBRARIES(diskquota ${PG_LIB_DIR}/libpq.so)
 endif()
 

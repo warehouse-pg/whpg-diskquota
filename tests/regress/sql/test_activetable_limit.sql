@@ -1,5 +1,9 @@
 -- table in 'diskquota not enabled database' should not be activetable
-\! gpconfig -c diskquota.max_active_tables -v 2 > /dev/null
+-- 4, not 2: the active-table shmem hash must still be small enough to exercise
+-- issue 51, but PG19 touches more relations than PG12 while creating the
+-- extension and schema below, so a budget of 2 is exhausted before the test's
+-- own tables exist -- diskquota then cannot track sizes and stops enforcing.
+\! gpconfig -c diskquota.max_active_tables -v 4 > /dev/null
 \! gpstop -arf > /dev/null
 
 \c

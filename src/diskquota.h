@@ -21,14 +21,42 @@
 #include "lib/ilist.h"
 #include "lib/stringinfo.h"
 #include "fmgr.h"
+#include "storage/latch.h"
 #include "storage/lock.h"
 #include "storage/lwlock.h"
+#if PG_VERSION_NUM >= 160000
+#include "storage/relfilelocator.h"
+#else
 #include "storage/relfilenode.h"
+#endif /* PG_VERSION_NUM */
 #include "postmaster/bgworker.h"
+
+/*
+ * PG16 renamed RelFileNode -> RelFileLocator (and RelFileNodeBackend ->
+ * RelFileLocatorBackend), along with several of its fields and the
+ * Relation struct's rd_node member. diskquota accesses these types/fields
+ * extensively (relation_cache.c, gp_activetable.c, diskquota_utility.c,
+ * quotamodel.c), so provide textual compatibility macros here rather than
+ * threading #if guards through every call site. These identifiers are not
+ * reused elsewhere in this codebase for unrelated purposes (verified via
+ * grep), so blanket substitution is safe within diskquota's own sources.
+ */
+#if PG_VERSION_NUM >= 160000
+#define RelFileNode RelFileLocator
+#define RelFileNodeBackend RelFileLocatorBackend
+#define relNode relNumber
+#define spcNode spcOid
+#define dbNode dbOid
+#define node locator
+#define rd_node rd_locator
+#endif /* PG_VERSION_NUM */
 
 #include "utils/hsearch.h"
 #include "utils/relcache.h"
 #include "utils/timestamp.h"
+#if PG_VERSION_NUM >= 170000
+#include "utils/wait_event.h"
+#endif /* PG_VERSION_NUM */
 
 #include <signal.h>
 
@@ -36,6 +64,16 @@
 #define INIT_NUM_TABLE_SIZE_ENTRIES 128
 /* max number of TableSizeEntry in table_size_map */
 #define MAX_NUM_TABLE_SIZE_ENTRIES (diskquota_max_table_segments / SEGMENT_SIZE_ARRAY_LENGTH)
+/*
+ * Each monitored database gets its own table_size_map in shared memory, so
+ * the MAX_NUM_TABLE_SIZE_ENTRIES budget is shared across up to
+ * diskquota_max_monitored_databases of them - this must match what
+ * diskquota_worker_shmem_size() reserves per worker in quotamodel.c, or a
+ * 2nd+ monitored database fails ShmemInitHash() with "not enough shared
+ * memory" (init_disk_quota_model()/vacuum_disk_quota_model() were
+ * requesting the full undivided budget per worker instead of its share).
+ */
+#define MAX_NUM_TABLE_SIZE_ENTRIES_PER_DB (MAX_NUM_TABLE_SIZE_ENTRIES / diskquota_max_monitored_databases + 100)
 /* length of segment size array in TableSizeEntry */
 #define SEGMENT_SIZE_ARRAY_LENGTH 100
 /* max number of keys in QuotaInfoEntryKey */
@@ -58,6 +96,17 @@ typedef enum
 #define EXTENSION_SCHEMA "diskquota"
 extern int diskquota_worker_timeout;
 
+/*
+ * WHPG19 widens SIGNAL_ARGS to "int postgres_signal_arg, const pg_signal_info
+ * *pg_siginfo", so forwarding a signal on to a core handler needs the extra
+ * argument there. Use this to pass a handler's own parameters through verbatim.
+ */
+#if GP_VERSION_NUM >= 190000
+#define DISKQUOTA_FORWARD_SIGNAL_ARGS postgres_signal_arg, pg_siginfo
+#else
+#define DISKQUOTA_FORWARD_SIGNAL_ARGS postgres_signal_arg
+#endif /* GP_VERSION_NUM >= 190000 */
+
 #if GP_VERSION_NUM < 70000
 #define TableIsHeap(relstorage, relam) ((bool)(relstorage == RELSTORAGE_HEAP))
 #define TableIsAoRows(relstorage, relam) ((bool)(relstorage == RELSTORAGE_AOROWS))
@@ -71,9 +120,79 @@ extern int diskquota_worker_timeout;
 #define TableIsAoRows(relstorage, relam) ((bool)(relam == AO_ROW_TABLE_AM_OID))
 #define TableIsAoCols(relstorage, relam) ((bool)(relam == AO_COLUMN_TABLE_AM_OID))
 #define DiskquotaCreateTemplateTupleDesc(natts) CreateTemplateTupleDesc(natts);
+#if PG_VERSION_NUM >= 170000
+/*
+ * PG17 replaced the static WAIT_EVENT_* enum constants with a dynamic
+ * registration API (WaitEventExtensionNew()) for extension-defined wait
+ * events. Resolve diskquota's wait event id once (per translation unit,
+ * idempotent - the name maps to the same global id everywhere) and use it
+ * in place of the removed WAIT_EVENT_PG_SLEEP constant.
+ */
+static inline int
+DiskquotaWaitLatch(Latch *latch, int wakeEvents, long timeout)
+{
+	static uint32 diskquota_wait_event_sleep = 0;
+
+	if (diskquota_wait_event_sleep == 0) diskquota_wait_event_sleep = WaitEventExtensionNew("DiskquotaSleep");
+	return WaitLatch(latch, wakeEvents, timeout, diskquota_wait_event_sleep);
+}
+#else
 #define DiskquotaWaitLatch(latch, wakeEvents, timeout) WaitLatch(latch, wakeEvents, timeout, WAIT_EVENT_PG_SLEEP)
+#endif /* PG_VERSION_NUM >= 170000 */
 #define DiskquotaGetRelstorage(classForm) (0)
+#if GP_VERSION_NUM >= 190000
+/*
+ * PG16 collapsed init_ps_display()'s 4-arg form (username, dbname, host_info,
+ * initial_str - each shown as a separate ", "-joined field) into a single
+ * combined fixed_part string. Rebuild the same "bgworker: [diskquota] <dbname>
+ * <suffix>" display text diskquota relied on from the old call shape.
+ */
+#define DiskquotaInitPsDisplay(dbname, suffix) \
+	init_ps_display(psprintf("bgworker: [diskquota] %s %s", (dbname), (suffix)))
+#else
+#define DiskquotaInitPsDisplay(dbname, suffix) init_ps_display("bgworker:", "[diskquota]", (dbname), (suffix))
+#endif /* GP_VERSION_NUM >= 190000 */
+#if GP_VERSION_NUM >= 190000
+/*
+ * WHPG19 dropped the StrNCpy() macro from c.h entirely. Reproduce its exact
+ * semantics (strncpy() the given length, then force-terminate at the last
+ * byte - unlike plain strncpy(), which does not guarantee termination when
+ * src is >= len bytes long) so every call site keeps its original behavior.
+ */
+#define StrNCpy(dst, src, len)          \
+	do                                  \
+	{                                   \
+		char *_dst = (dst);             \
+		Size  _len = (len);             \
+		if (_len > 0)                   \
+		{                               \
+			strncpy(_dst, (src), _len); \
+			_dst[_len - 1] = '\0';      \
+		}                               \
+	} while (0)
+#endif /* GP_VERSION_NUM >= 190000 */
 #endif /* GP_VERSION_NUM */
+
+#if GP_VERSION_NUM >= 190000
+/* WHPG19 dropped the bits8 typedef from c.h; ARR_NULLBITMAP() etc. now return uint8* directly. */
+typedef uint8 diskquota_bits8;
+#else
+typedef bits8 diskquota_bits8;
+#endif /* GP_VERSION_NUM >= 190000 */
+
+#if GP_VERSION_NUM >= 190000
+/*
+ * WHPG19's utils/relfilenodemap.h still declares RelidByRelfilenode(), but
+ * the server binary no longer exports it - it was renamed to
+ * RelidByRelfilenumber() in utils/relfilenumbermap.h. Linking against the
+ * stale declaration succeeds (it's just an extern prototype); loading the
+ * .so fails at runtime with "undefined symbol" since dlopen resolves it
+ * against the running postgres binary's actual exported symbols.
+ */
+#define DiskquotaRelidByRelfilenode(reltablespace, relfilenode) RelidByRelfilenumber(reltablespace, relfilenode)
+#else
+#define DiskquotaRelidByRelfilenode(reltablespace, relfilenode) RelidByRelfilenode(reltablespace, relfilenode)
+#endif /* GP_VERSION_NUM >= 190000 */
 
 typedef enum
 {

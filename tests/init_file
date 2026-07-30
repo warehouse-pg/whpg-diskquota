@@ -12,6 +12,11 @@ m/^WARNING:  skipping .* cannot calculate this foreign table size.*/
 m/^NOTICE:  resource queue required -- using default resource queue "pg_default"/
 m/NOTICE:  One or more columns in the following table\(s\) do not have statistics: /
 m/HINT:  For non-partitioned tables, run analyze .+\. For partitioned tables, run analyze rootpartition .+\. See log for columns missing statistics\./
+# PG15+ reports the failing statement and script location when an error is
+# raised from inside a CREATE EXTENSION script. Carries no test signal, and the
+# CONTEXT: line has already been rewritten to DETAIL: by the matchsubs below.
+m/^DETAIL:  SQL statement "SELECT diskquota\.diskquota_start_worker\(\)"/
+m/^extension script file "diskquota--.*\.sql", near line \d+/
 -- end_matchignore
 
 -- start_matchsubs

@@ -14,7 +14,11 @@
 
 #include "c.h"
 #include "utils/hsearch.h"
+#if PG_VERSION_NUM >= 160000
+#include "storage/relfilelocator.h"
+#else
 #include "storage/relfilenode.h"
+#endif /* PG_VERSION_NUM */
 
 typedef struct DiskQuotaRelationCacheEntry
 {
