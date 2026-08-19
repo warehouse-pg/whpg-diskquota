@@ -835,6 +835,24 @@ refresh_disk_quota_usage(bool is_init)
 		refresh_quota_info_map();
 		/* flush local table_size_map to user table table_size */
 		flush_to_table_size();
+		/*
+		 * Publish this database's total size (sum over segments) to
+		 * launcher shmem; the cluster-wide quota check reads the sum
+		 * of these per-database totals.
+		 */
+		{
+			int64 db_total = 0;
+			int   sret = SPI_execute("select sum(size)::bigint from diskquota.table_size where segid = -1", true, 0);
+
+			if (sret == SPI_OK_SELECT && SPI_processed == 1)
+			{
+				bool  isnull = true;
+				Datum d      = SPI_getbinval(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 1, &isnull);
+
+				if (!isnull) db_total = DatumGetInt64(d);
+			}
+			diskquota_publish_db_total(db_total);
+		}
 		/* copy local reject map back to shared reject map */
 		bool reject_map_changed = flush_local_reject_map();
 		/*
@@ -1548,6 +1566,17 @@ do_load_quotas(void)
 		Oid   spcOid         = DatumGetObjectId(vals[4]);
 		Oid   primaryOid     = DatumGetObjectId(vals[5]);
 
+		/*
+		 * The cluster quota has no per-object key, so it does not
+		 * enter quota_info_map; its limit lives in launcher shmem
+		 * where every database's checks can see it.
+		 */
+		if (quotaType == CLUSTER_QUOTA)
+		{
+			diskquota_set_cluster_limit_mb(quota_limit_mb);
+			continue;
+		}
+
 		if (quotaType == NAMESPACE_TABLESPACE_QUOTA || quotaType == ROLE_TABLESPACE_QUOTA)
 		{
 			targetOid = primaryOid;
@@ -1679,6 +1708,14 @@ prepare_rejectmap_search_key(RejectMapEntry *keyitem, QuotaType type, Oid relown
 		keyitem->targetoid = relnamespace;
 	else if (type == TABLESPACE_QUOTA)
 		keyitem->targetoid = reltablespace;
+	else if (type == CLUSTER_QUOTA)
+		/*
+		 * The cluster quota is object-independent; its rejectmap key
+		 * carries no target oid. (The soft-limit check does not go
+		 * through the rejectmap; this key shape is reserved for
+		 * hardlimit dispatch.)
+		 */
+		keyitem->targetoid = InvalidOid;
 	else
 		ereport(ERROR, (errcode(ERRCODE_INTERNAL_ERROR), errmsg("[diskquota] unknown quota type: %d", type)));
 
@@ -1743,6 +1780,31 @@ quota_check_common(Oid reloid, RelFileNode *relfilenode)
 	if (!IsTransactionState()) return true;
 
 	if (diskquota_is_paused()) return true;
+
+	/*
+	 * Cluster-wide quota: reject the write when the aggregate size of
+	 * all monitored databases exceeds the configured cap. Runs on the
+	 * dispatcher only (the aggregate lives in launcher shmem there).
+	 * diskquota's own workers are exempt: they must be able to keep
+	 * maintaining diskquota.table_size, or the aggregate could never
+	 * decrease again after the cap is hit.
+	 */
+	if (OidIsValid(reloid) && IS_QUERY_DISPATCHER() && !diskquota_am_bgworker())
+	{
+		int64 limit_mb = diskquota_get_cluster_limit_mb();
+
+		if (limit_mb > 0)
+		{
+			int64 total = diskquota_get_cluster_total_size();
+
+			if (total >= limit_mb * (int64)(1 << 20))
+				ereport(ERROR,
+				        (errcode(ERRCODE_DISK_FULL), errmsg("cluster's disk space quota exceeded"),
+				         errhint("cluster usage " INT64_FORMAT " MB exceeds cluster quota " INT64_FORMAT
+				                 " MB; free disk space or raise diskquota.set_cluster_quota()",
+				                 total / (1 << 20), limit_mb)));
+		}
+	}
 
 	if (OidIsValid(reloid)) return check_rejectmap_by_reloid(reloid);
 

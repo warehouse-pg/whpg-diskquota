@@ -70,6 +70,9 @@ PG_FUNCTION_INFO_V1(set_role_tablespace_quota);
 PG_FUNCTION_INFO_V1(set_per_segment_quota);
 PG_FUNCTION_INFO_V1(relation_size_local);
 PG_FUNCTION_INFO_V1(pull_all_table_size);
+PG_FUNCTION_INFO_V1(set_cluster_quota);
+PG_FUNCTION_INFO_V1(cluster_quota_limit_mb);
+PG_FUNCTION_INFO_V1(cluster_total_size);
 
 /* timeout count to wait response from launcher process, in 1/10 sec */
 #define WAIT_TIME_COUNT 1200
@@ -725,6 +728,56 @@ set_schema_quota(PG_FUNCTION_ARGS)
 	set_quota_config_internal(namespaceoid, quota_limit_mb, NAMESPACE_QUOTA, INVALID_SEGRATIO, InvalidOid);
 	SPI_finish();
 	PG_RETURN_VOID();
+}
+
+/*
+ * Set the cluster-wide disk quota (PTT-1563): a cap on the aggregate
+ * size of all monitored databases. The configuration row persists in
+ * the current database's quota_config (targetoid = InvalidOid); the
+ * live limit is kept in launcher shmem so that checks in every
+ * database see it. A negative size deletes the quota.
+ */
+Datum
+set_cluster_quota(PG_FUNCTION_ARGS)
+{
+	char *sizestr;
+	int64 quota_limit_mb;
+
+	if (!superuser())
+	{
+		ereport(ERROR, (errcode(ERRCODE_INSUFFICIENT_PRIVILEGE), errmsg("must be superuser to set disk quota limit")));
+	}
+
+	sizestr        = text_to_cstring(PG_GETARG_TEXT_PP(0));
+	sizestr        = str_tolower(sizestr, strlen(sizestr), DEFAULT_COLLATION_OID);
+	quota_limit_mb = get_size_in_mb(sizestr);
+
+	if (quota_limit_mb == 0)
+	{
+		ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE), errmsg("disk quota can not be set to 0 MB")));
+	}
+
+	SPI_connect();
+	set_quota_config_internal(InvalidOid, quota_limit_mb, CLUSTER_QUOTA, INVALID_SEGRATIO, InvalidOid);
+	SPI_finish();
+
+	/* make the new limit effective immediately, not one naptime later */
+	diskquota_set_cluster_limit_mb(quota_limit_mb);
+	PG_RETURN_VOID();
+}
+
+/* Configured cluster quota in MB; 0 when unset. */
+Datum
+cluster_quota_limit_mb(PG_FUNCTION_ARGS)
+{
+	PG_RETURN_INT64(diskquota_get_cluster_limit_mb());
+}
+
+/* Aggregate size in bytes of all monitored databases. */
+Datum
+cluster_total_size(PG_FUNCTION_ARGS)
+{
+	PG_RETURN_INT64(diskquota_get_cluster_total_size());
 }
 
 /*

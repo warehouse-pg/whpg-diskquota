@@ -93,6 +93,16 @@ typedef enum
 	 */
 	TABLESPACE_QUOTA,
 
+	/*
+	 * CLUSTER_QUOTA
+	 * caps the aggregate disk usage of all monitored databases
+	 * (PTT-1563). Stored in `quota_config` with targetoid =
+	 * InvalidOid. It has no per-object key, so it never enters
+	 * quota_info_map; the limit and the aggregate usage live in
+	 * DiskquotaLauncherShmem instead.
+	 */
+	CLUSTER_QUOTA,
+
 	NUM_QUOTA_TYPES,
 } QuotaType;
 
@@ -222,6 +232,12 @@ typedef struct
 	DiskquotaDBEntry *dbArrayTail;
 	volatile bool     isDynamicWorker;
 	/*
+	 * Cluster-wide quota limit in MB; 0 means no cluster quota is
+	 * configured. Aligned 8-byte load/store, written by
+	 * set_cluster_quota() and by workers reloading quota_config.
+	 */
+	volatile int64 cluster_quota_limit_mb;
+	/*
 	DiskQuotaWorkerEntry worker[diskquota_max_workers]; // the hidden memory to store WorkerEntry
 	DiskquotaDBEntry     dbentry[diskquota_max_monitored_databases]; // the hidden memory for dbentry
 	*/
@@ -243,6 +259,13 @@ struct DiskquotaDBEntry
 	bool in_use; // this slot is in using. AKA dbid != 0
 
 	TimestampTz last_log_time; // the last time log current database info.
+
+	/*
+	 * Total on-disk size of this database (sum over all segments),
+	 * published by its worker once per refresh loop. Input to the
+	 * cluster-wide quota check.
+	 */
+	volatile int64 total_size;
 };
 
 typedef enum MonitorDBStatus
@@ -316,4 +339,11 @@ extern HTAB        *diskquota_hash_create(const char *tabname, long nelem, HASHC
 extern HTAB *DiskquotaShmemInitHash(const char *name, long init_size, long max_size, HASHCTL *infoP, int hash_flags,
                                     DiskquotaHashFunction hash_function);
 extern void  refresh_monitored_dbid_cache(void);
+
+/* cluster-wide quota (PTT-1563) */
+extern bool  diskquota_am_bgworker(void);
+extern void  diskquota_set_cluster_limit_mb(int64 limit_mb);
+extern int64 diskquota_get_cluster_limit_mb(void);
+extern void  diskquota_publish_db_total(int64 total);
+extern int64 diskquota_get_cluster_total_size(void);
 #endif

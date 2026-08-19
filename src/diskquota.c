@@ -2042,3 +2042,58 @@ WaitForBackgroundWorkerShutdown(BackgroundWorkerHandle *handle)
 	return status;
 }
 #endif /* GP_VERSION_NUM */
+
+/*
+ * Cluster-wide quota (PTT-1563).
+ *
+ * The cluster quota limit and the per-database totals live in
+ * DiskquotaLauncherShmem, which is only initialized on the
+ * dispatcher; every accessor below degrades to a no-op / zero on
+ * processes where that shmem is absent (segments), so callers may
+ * use them unconditionally.
+ */
+
+/* True when the current process is a diskquota bgworker. */
+bool
+diskquota_am_bgworker(void)
+{
+	return MyWorkerInfo != NULL;
+}
+
+void
+diskquota_set_cluster_limit_mb(int64 limit_mb)
+{
+	if (DiskquotaLauncherShmem == NULL) return;
+	DiskquotaLauncherShmem->cluster_quota_limit_mb = (limit_mb > 0) ? limit_mb : 0;
+}
+
+int64
+diskquota_get_cluster_limit_mb(void)
+{
+	if (DiskquotaLauncherShmem == NULL) return 0;
+	return DiskquotaLauncherShmem->cluster_quota_limit_mb;
+}
+
+/* Publish the calling worker's database total for the cluster check. */
+void
+diskquota_publish_db_total(int64 total)
+{
+	if (MyWorkerInfo == NULL || MyWorkerInfo->dbEntry == NULL) return;
+	MyWorkerInfo->dbEntry->total_size = total;
+}
+
+/* Sum of the published totals of all monitored databases. */
+int64
+diskquota_get_cluster_total_size(void)
+{
+	int64 total = 0;
+
+	if (DiskquotaLauncherShmem == NULL || DiskquotaLauncherShmem->dbArray == NULL) return 0;
+	for (int i = 0; i < diskquota_max_monitored_databases; i++)
+	{
+		DiskquotaDBEntry *dbEntry = &DiskquotaLauncherShmem->dbArray[i];
+
+		if (dbEntry->in_use) total += dbEntry->total_size;
+	}
+	return total;
+}
