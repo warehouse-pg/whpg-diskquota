@@ -1,0 +1,100 @@
+-- Test cluster-wide and per-database disk quota (PTT-1563)
+CREATE SCHEMA cdqschema;
+SET search_path TO cdqschema;
+CREATE TABLE cdq_t (i INT, t TEXT) DISTRIBUTED BY (i);
+-- cap the whole cluster
+SELECT diskquota.set_cluster_quota('10 MB');
+ set_cluster_quota 
+-------------------
+ 
+(1 row)
+
+SELECT diskquota.wait_for_worker_new_epoch();
+ wait_for_worker_new_epoch 
+---------------------------
+ t
+(1 row)
+
+SELECT diskquota.cluster_quota_limit_mb();
+ cluster_quota_limit_mb 
+------------------------
+                     10
+(1 row)
+
+-- starts under the cap, so the load is allowed to complete (soft limit)
+INSERT INTO cdq_t SELECT g, repeat('x', 1000) FROM generate_series(1, 20000) g;
+SELECT diskquota.wait_for_worker_new_epoch();
+ wait_for_worker_new_epoch 
+---------------------------
+ t
+(1 row)
+
+SELECT diskquota.wait_for_worker_new_epoch();
+ wait_for_worker_new_epoch 
+---------------------------
+ t
+(1 row)
+
+-- expect fail: cluster cap exceeded
+INSERT INTO cdq_t VALUES (1, 'x');
+ERROR:  cluster's disk space quota exceeded
+HINT:  cluster usage 23 MB exceeds cluster quota 10 MB; free disk space or raise diskquota.set_cluster_quota()
+-- reads still work
+SELECT count(*) FROM cdq_t;
+ count 
+-------
+ 20000
+(1 row)
+
+-- delete the cluster quota; writes resume
+SELECT diskquota.set_cluster_quota('-1');
+ set_cluster_quota 
+-------------------
+ 
+(1 row)
+
+SELECT diskquota.wait_for_worker_new_epoch();
+ wait_for_worker_new_epoch 
+---------------------------
+ t
+(1 row)
+
+INSERT INTO cdq_t VALUES (1, 'x');
+-- cap this database only
+SELECT diskquota.set_database_quota(current_database()::text, '10 MB');
+ set_database_quota 
+--------------------
+ 
+(1 row)
+
+SELECT diskquota.wait_for_worker_new_epoch();
+ wait_for_worker_new_epoch 
+---------------------------
+ t
+(1 row)
+
+-- expect fail: database usage already exceeds the cap
+INSERT INTO cdq_t VALUES (2, 'x');
+ERROR:  database's disk space quota exceeded with name: regression
+HINT:  database usage 21 MB exceeds database quota 10 MB; free disk space or raise diskquota.set_database_quota()
+-- expect fail: another database's quota cannot be set from here
+SELECT diskquota.set_database_quota('template1', '10 MB');
+ERROR:  set_database_quota() must be called from the target database
+HINT:  connect to "template1" and run it there
+-- delete the database quota; writes resume
+SELECT diskquota.set_database_quota(current_database()::text, '-1');
+ set_database_quota 
+--------------------
+ 
+(1 row)
+
+SELECT diskquota.wait_for_worker_new_epoch();
+ wait_for_worker_new_epoch 
+---------------------------
+ t
+(1 row)
+
+INSERT INTO cdq_t VALUES (3, 'x');
+DROP TABLE cdq_t;
+RESET search_path;
+DROP SCHEMA cdqschema;
