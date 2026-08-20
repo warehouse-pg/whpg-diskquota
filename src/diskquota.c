@@ -134,6 +134,8 @@ static void do_process_extension_ddl_message(MessageResult *code, ExtensionDDLMe
 static void terminate_all_workers(void);
 static void on_add_db(Oid dbid, MessageResult *code);
 static void on_del_db(Oid dbid, MessageResult *code);
+static void on_set_cluster_quota(int64 limit_mb);
+static void load_global_quota_config(void);
 static bool is_valid_dbid(Oid dbid);
 extern void invalidate_database_rejectmap(Oid dbid);
 static void FreeWorkerOnExit(int code, Datum arg);
@@ -763,6 +765,7 @@ disk_quota_launcher_main(Datum main_arg)
 	create_monitor_db_table();
 
 	init_database_list();
+	load_global_quota_config();
 	DisconnectAndDestroyAllGangs(false);
 
 	loop_end = time(NULL);
@@ -968,6 +971,8 @@ create_monitor_db_table(void)
 	 */
 	sql = "create schema if not exists diskquota_namespace;"
 	      "create table if not exists diskquota_namespace.database_list(dbid oid not null unique);"
+	      "create table if not exists diskquota_namespace.global_quota_config(quotatype int not null unique, "
+	      "quotalimitmb bigint not null);"
 	      "DROP SCHEMA IF EXISTS " LAUNCHER_SCHEMA
 	      " CASCADE;"
 	      "CREATE SCHEMA " LAUNCHER_SCHEMA
@@ -1212,6 +1217,11 @@ do_process_extension_ddl_message(MessageResult *code, ExtensionDDLMessage local_
 			case CMD_DROP_EXTENSION:
 				on_del_db(local_extension_ddl_message.dbid, code);
 				if (num_db > 0) num_db--;
+				*code = ERR_OK;
+				break;
+			case CMD_SET_CLUSTER_QUOTA:
+				/* the dbid field carries the limit in MB for this command */
+				on_set_cluster_quota((int64)(int)local_extension_ddl_message.dbid);
 				*code = ERR_OK;
 				break;
 			default:
@@ -2045,6 +2055,80 @@ WaitForBackgroundWorkerShutdown(BackgroundWorkerHandle *handle)
 	return status;
 }
 #endif /* GP_VERSION_NUM */
+
+/*
+ * Persist the cluster-wide quota in the launcher's database and make
+ * it effective. Runs in the launcher with SPI already connected (see
+ * do_process_extension_ddl_message); errors are caught by the caller.
+ * A non-positive limit deletes the configuration.
+ */
+static void
+on_set_cluster_quota(int64 limit_mb)
+{
+	int ret;
+
+	if (limit_mb > 0)
+	{
+		ret = SPI_execute_with_args(
+		        "update diskquota_namespace.global_quota_config set quotalimitmb = $1 where quotatype = $2", 2,
+		        (Oid[]){INT8OID, INT4OID}, (Datum[]){Int64GetDatum(limit_mb), Int32GetDatum(CLUSTER_QUOTA)}, NULL,
+		        false, 0);
+		if (ret != SPI_OK_UPDATE)
+			ereport(ERROR, (errmsg("[diskquota launcher] cannot update global_quota_config, error code %d", ret)));
+		if (SPI_processed == 0)
+		{
+			ret = SPI_execute_with_args("insert into diskquota_namespace.global_quota_config values($1, $2)", 2,
+			                            (Oid[]){INT4OID, INT8OID},
+			                            (Datum[]){Int32GetDatum(CLUSTER_QUOTA), Int64GetDatum(limit_mb)}, NULL, false,
+			                            0);
+			if (ret != SPI_OK_INSERT)
+				ereport(ERROR, (errmsg("[diskquota launcher] cannot insert global_quota_config, error code %d", ret)));
+		}
+	}
+	else
+	{
+		ret = SPI_execute_with_args("delete from diskquota_namespace.global_quota_config where quotatype = $1", 1,
+		                            (Oid[]){INT4OID}, (Datum[]){Int32GetDatum(CLUSTER_QUOTA)}, NULL, false, 0);
+		if (ret != SPI_OK_DELETE)
+			ereport(ERROR, (errmsg("[diskquota launcher] cannot delete global_quota_config, error code %d", ret)));
+	}
+
+	diskquota_set_cluster_limit_mb(limit_mb);
+}
+
+/*
+ * Load the persisted cluster-wide quota into shmem at launcher
+ * startup. Runs in the launcher, connected to the launcher's
+ * database.
+ */
+static void
+load_global_quota_config(void)
+{
+	int   ret;
+	int64 limit_mb = 0;
+
+	StartTransactionCommand();
+	PushActiveSnapshot(GetTransactionSnapshot());
+	ret = SPI_connect();
+	if (ret != SPI_OK_CONNECT)
+		ereport(ERROR, (errmsg("[diskquota launcher] SPI connect error, return code: %d.", ret)));
+	ret = SPI_execute_with_args("select quotalimitmb from diskquota_namespace.global_quota_config where quotatype = $1",
+	                            1, (Oid[]){INT4OID}, (Datum[]){Int32GetDatum(CLUSTER_QUOTA)}, NULL, true, 0);
+	if (ret != SPI_OK_SELECT)
+		ereport(ERROR, (errmsg("[diskquota launcher] cannot select global_quota_config, return code: %d.", ret)));
+	if (SPI_processed == 1)
+	{
+		bool  isnull = true;
+		Datum d      = SPI_getbinval(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 1, &isnull);
+
+		if (!isnull) limit_mb = DatumGetInt64(d);
+	}
+	SPI_finish();
+	PopActiveSnapshot();
+	CommitTransactionCommand();
+
+	diskquota_set_cluster_limit_mb(limit_mb);
+}
 
 /*
  * Cluster-wide quota (PTT-1563).

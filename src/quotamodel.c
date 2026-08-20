@@ -1593,7 +1593,11 @@ do_load_quotas(void)
 		 */
 		if (quotaType == CLUSTER_QUOTA)
 		{
-			diskquota_set_cluster_limit_mb(quota_limit_mb);
+			/*
+			 * Legacy row from before the cluster quota moved to
+			 * diskquota_namespace.global_quota_config (managed by the
+			 * launcher). Ignored.
+			 */
 			continue;
 		}
 		if (quotaType == DATABASE_QUOTA)

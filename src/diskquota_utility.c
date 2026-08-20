@@ -735,14 +735,17 @@ set_schema_quota(PG_FUNCTION_ARGS)
 
 /*
  * Set the cluster-wide disk quota (PTT-1563): a cap on the aggregate
- * size of all monitored databases. The configuration row persists in
- * the current database's quota_config (targetoid = InvalidOid); the
- * live limit is kept in launcher shmem so that checks in every
- * database see it. A negative size deletes the quota.
+ * size of all monitored databases. The request is forwarded to the
+ * diskquota launcher, which persists the value in
+ * diskquota_namespace.global_quota_config in its own database and
+ * updates the live limit in shmem — so the function may be called
+ * from any database and deletion has one authoritative home. A
+ * negative size deletes the quota.
  */
 Datum
 set_cluster_quota(PG_FUNCTION_ARGS)
 {
+	int   rc, launcher_pid;
 	char *sizestr;
 	int64 quota_limit_mb;
 
@@ -759,13 +762,58 @@ set_cluster_quota(PG_FUNCTION_ARGS)
 	{
 		ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE), errmsg("disk quota can not be set to 0 MB")));
 	}
+	/* the limit travels in the message's int-sized dbid field */
+	if (quota_limit_mb > INT_MAX)
+	{
+		ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+		                errmsg("cluster quota limit larger than %d MB is not supported", INT_MAX)));
+	}
+	if (quota_limit_mb < 0) quota_limit_mb = -1;
 
-	SPI_connect();
-	set_quota_config_internal(InvalidOid, quota_limit_mb, CLUSTER_QUOTA, INVALID_SEGRATIO, InvalidOid);
-	SPI_finish();
+	LWLockAcquire(diskquota_locks.extension_ddl_lock, LW_EXCLUSIVE);
+	LWLockAcquire(diskquota_locks.extension_ddl_message_lock, LW_EXCLUSIVE);
+	extension_ddl_message->req_pid = MyProcPid;
+	extension_ddl_message->cmd     = CMD_SET_CLUSTER_QUOTA;
+	extension_ddl_message->result  = ERR_PENDING;
+	extension_ddl_message->dbid    = (int)quota_limit_mb;
+	launcher_pid                   = extension_ddl_message->launcher_pid;
+	rc                             = kill(launcher_pid, SIGUSR2);
+	LWLockRelease(diskquota_locks.extension_ddl_message_lock);
+	if (rc == 0)
+	{
+		int count = WAIT_TIME_COUNT;
 
-	/* make the new limit effective immediately, not one naptime later */
-	diskquota_set_cluster_limit_mb(quota_limit_mb);
+		while (count-- > 0)
+		{
+			CHECK_FOR_INTERRUPTS();
+			rc = DiskquotaWaitLatch(&MyProc->procLatch, WL_LATCH_SET | WL_TIMEOUT | WL_POSTMASTER_DEATH, 100L);
+			if (rc & WL_POSTMASTER_DEATH) break;
+			ResetLatch(&MyProc->procLatch);
+
+			ereportif(kill(launcher_pid, 0) == -1 && errno == ESRCH, // do existence check
+			          ERROR,
+			          (errmsg("[diskquota] diskquota launcher pid = %d no longer exists", launcher_pid),
+			           errhint("The diskquota launcher process has been terminated for some reasons. Consider to "
+			                   "restart the cluster to start it.")));
+
+			LWLockAcquire(diskquota_locks.extension_ddl_message_lock, LW_SHARED);
+			if (extension_ddl_message->result != ERR_PENDING)
+			{
+				LWLockRelease(diskquota_locks.extension_ddl_message_lock);
+				break;
+			}
+			LWLockRelease(diskquota_locks.extension_ddl_message_lock);
+		}
+	}
+	LWLockAcquire(diskquota_locks.extension_ddl_message_lock, LW_SHARED);
+	if (extension_ddl_message->result != ERR_OK)
+	{
+		LWLockRelease(diskquota_locks.extension_ddl_message_lock);
+		LWLockRelease(diskquota_locks.extension_ddl_lock);
+		report_ddl_err(extension_ddl_message, "[diskquota] failed to set cluster quota");
+	}
+	LWLockRelease(diskquota_locks.extension_ddl_message_lock);
+	LWLockRelease(diskquota_locks.extension_ddl_lock);
 	PG_RETURN_VOID();
 }
 
