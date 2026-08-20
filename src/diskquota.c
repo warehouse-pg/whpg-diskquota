@@ -1800,7 +1800,10 @@ init_launcher_shmem()
 			memset(&DiskquotaLauncherShmem->dbArray[i], 0, sizeof(DiskquotaDBEntry));
 			DiskquotaLauncherShmem->dbArray[i].id       = i;
 			DiskquotaLauncherShmem->dbArray[i].workerId = INVALID_WORKER_ID;
+			pg_atomic_init_u64(&DiskquotaLauncherShmem->dbArray[i].total_size, 0);
+			pg_atomic_init_u64(&DiskquotaLauncherShmem->dbArray[i].db_quota_limit_mb, 0);
 		}
+		pg_atomic_init_u64(&DiskquotaLauncherShmem->cluster_quota_limit_mb, 0);
 	}
 	/* init TableSizeEntry counter */
 	diskquota_table_size_entry_num =
@@ -2064,22 +2067,30 @@ void
 diskquota_set_cluster_limit_mb(int64 limit_mb)
 {
 	if (DiskquotaLauncherShmem == NULL) return;
-	DiskquotaLauncherShmem->cluster_quota_limit_mb = (limit_mb > 0) ? limit_mb : 0;
+	pg_atomic_write_u64(&DiskquotaLauncherShmem->cluster_quota_limit_mb, (limit_mb > 0) ? (uint64)limit_mb : 0);
 }
 
 int64
 diskquota_get_cluster_limit_mb(void)
 {
 	if (DiskquotaLauncherShmem == NULL) return 0;
-	return DiskquotaLauncherShmem->cluster_quota_limit_mb;
+	return (int64)pg_atomic_read_u64(&DiskquotaLauncherShmem->cluster_quota_limit_mb);
 }
 
-/* Publish the calling worker's database total for the cluster check. */
+/* Publish the calling worker's database total for the quota checks. */
 void
 diskquota_publish_db_total(int64 total)
 {
 	if (MyWorkerInfo == NULL || MyWorkerInfo->dbEntry == NULL) return;
-	MyWorkerInfo->dbEntry->total_size = total;
+	pg_atomic_write_u64(&MyWorkerInfo->dbEntry->total_size, (total > 0) ? (uint64)total : 0);
+}
+
+/* Publish the calling worker's DATABASE_QUOTA limit (0 = unset). */
+void
+diskquota_publish_db_limit(int64 limit_mb)
+{
+	if (MyWorkerInfo == NULL || MyWorkerInfo->dbEntry == NULL) return;
+	pg_atomic_write_u64(&MyWorkerInfo->dbEntry->db_quota_limit_mb, (limit_mb > 0) ? (uint64)limit_mb : 0);
 }
 
 /* Sum of the published totals of all monitored databases. */
@@ -2093,7 +2104,47 @@ diskquota_get_cluster_total_size(void)
 	{
 		DiskquotaDBEntry *dbEntry = &DiskquotaLauncherShmem->dbArray[i];
 
-		if (dbEntry->in_use) total += dbEntry->total_size;
+		if (dbEntry->in_use) total += (int64)pg_atomic_read_u64(&dbEntry->total_size);
 	}
 	return total;
+}
+
+/* Set the DATABASE_QUOTA limit of a monitored database (0 = unset). */
+void
+diskquota_set_database_limit_mb(Oid dbid, int64 limit_mb)
+{
+	if (DiskquotaLauncherShmem == NULL || DiskquotaLauncherShmem->dbArray == NULL) return;
+	for (int i = 0; i < diskquota_max_monitored_databases; i++)
+	{
+		DiskquotaDBEntry *dbEntry = &DiskquotaLauncherShmem->dbArray[i];
+
+		if (dbEntry->in_use && dbEntry->dbid == dbid)
+		{
+			pg_atomic_write_u64(&dbEntry->db_quota_limit_mb, (limit_mb > 0) ? (uint64)limit_mb : 0);
+			return;
+		}
+	}
+}
+
+/*
+ * Fetch a monitored database's published total and DATABASE_QUOTA
+ * limit. Returns false when the database has no dbArray slot (not
+ * monitored, or not on the dispatcher).
+ */
+bool
+diskquota_get_database_status(Oid dbid, int64 *total_size, int64 *limit_mb)
+{
+	if (DiskquotaLauncherShmem == NULL || DiskquotaLauncherShmem->dbArray == NULL) return false;
+	for (int i = 0; i < diskquota_max_monitored_databases; i++)
+	{
+		DiskquotaDBEntry *dbEntry = &DiskquotaLauncherShmem->dbArray[i];
+
+		if (dbEntry->in_use && dbEntry->dbid == dbid)
+		{
+			*total_size = (int64)pg_atomic_read_u64(&dbEntry->total_size);
+			*limit_mb   = (int64)pg_atomic_read_u64(&dbEntry->db_quota_limit_mb);
+			return true;
+		}
+	}
+	return false;
 }

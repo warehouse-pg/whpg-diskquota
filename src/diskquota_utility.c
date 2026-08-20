@@ -73,6 +73,9 @@ PG_FUNCTION_INFO_V1(pull_all_table_size);
 PG_FUNCTION_INFO_V1(set_cluster_quota);
 PG_FUNCTION_INFO_V1(cluster_quota_limit_mb);
 PG_FUNCTION_INFO_V1(cluster_total_size);
+PG_FUNCTION_INFO_V1(set_database_quota);
+PG_FUNCTION_INFO_V1(database_quota_limit_mb);
+PG_FUNCTION_INFO_V1(database_total_size);
 
 /* timeout count to wait response from launcher process, in 1/10 sec */
 #define WAIT_TIME_COUNT 1200
@@ -764,6 +767,74 @@ set_cluster_quota(PG_FUNCTION_ARGS)
 	/* make the new limit effective immediately, not one naptime later */
 	diskquota_set_cluster_limit_mb(quota_limit_mb);
 	PG_RETURN_VOID();
+}
+
+/*
+ * Set the disk quota for one whole database (PTT-1563): all schemas
+ * and roles in it combined. The row persists in the target database's
+ * own quota_config (targetoid = the database oid), which is why the
+ * function must be called while connected to that database. A negative
+ * size deletes the quota.
+ */
+Datum
+set_database_quota(PG_FUNCTION_ARGS)
+{
+	char *dbname;
+	char *sizestr;
+	Oid   dboid;
+	int64 quota_limit_mb;
+
+	if (!superuser())
+	{
+		ereport(ERROR, (errcode(ERRCODE_INSUFFICIENT_PRIVILEGE), errmsg("must be superuser to set disk quota limit")));
+	}
+
+	dbname = text_to_cstring(PG_GETARG_TEXT_PP(0));
+	dboid  = get_database_oid(dbname, false);
+	if (dboid != MyDatabaseId)
+		ereport(ERROR,
+		        (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+		         errmsg("set_database_quota() must be called from the target database"),
+		         errhint("connect to \"%s\" and run it there", dbname)));
+
+	sizestr        = text_to_cstring(PG_GETARG_TEXT_PP(1));
+	sizestr        = str_tolower(sizestr, strlen(sizestr), DEFAULT_COLLATION_OID);
+	quota_limit_mb = get_size_in_mb(sizestr);
+
+	if (quota_limit_mb == 0)
+	{
+		ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE), errmsg("disk quota can not be set to 0 MB")));
+	}
+
+	SPI_connect();
+	set_quota_config_internal(dboid, quota_limit_mb, DATABASE_QUOTA, INVALID_SEGRATIO, InvalidOid);
+	SPI_finish();
+
+	/* make the new limit effective immediately, not one naptime later */
+	diskquota_set_database_limit_mb(dboid, quota_limit_mb);
+	PG_RETURN_VOID();
+}
+
+/* Configured quota of the current database in MB; 0 when unset. */
+Datum
+database_quota_limit_mb(PG_FUNCTION_ARGS)
+{
+	int64 total_size = 0;
+	int64 limit_mb   = 0;
+
+	(void)diskquota_get_database_status(MyDatabaseId, &total_size, &limit_mb);
+	PG_RETURN_INT64(limit_mb);
+}
+
+/* Published total size in bytes of the current database. */
+Datum
+database_total_size(PG_FUNCTION_ARGS)
+{
+	int64 total_size = 0;
+	int64 limit_mb   = 0;
+
+	(void)diskquota_get_database_status(MyDatabaseId, &total_size, &limit_mb);
+	PG_RETURN_INT64(total_size);
 }
 
 /* Configured cluster quota in MB; 0 when unset. */

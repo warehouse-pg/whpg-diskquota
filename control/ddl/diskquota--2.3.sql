@@ -87,6 +87,12 @@ CREATE FUNCTION diskquota.diskquota_fetch_table_stat(int4, oid[]) RETURNS setof 
 CREATE FUNCTION diskquota.set_schema_tablespace_quota(text, text, text) RETURNS void STRICT AS '$libdir/diskquota-2.3.so' LANGUAGE C;
 CREATE FUNCTION diskquota.set_role_tablespace_quota(text, text, text) RETURNS void STRICT AS '$libdir/diskquota-2.3.so' LANGUAGE C;
 CREATE FUNCTION diskquota.set_per_segment_quota(text, float4) RETURNS void STRICT AS '$libdir/diskquota-2.3.so' LANGUAGE C;
+CREATE FUNCTION diskquota.set_cluster_quota(text) RETURNS void STRICT AS '$libdir/diskquota-2.3.so' LANGUAGE C;
+CREATE FUNCTION diskquota.set_database_quota(text, text) RETURNS void STRICT AS '$libdir/diskquota-2.3.so' LANGUAGE C;
+CREATE FUNCTION diskquota.cluster_quota_limit_mb() RETURNS bigint STRICT AS '$libdir/diskquota-2.3.so' LANGUAGE C;
+CREATE FUNCTION diskquota.cluster_total_size() RETURNS bigint STRICT AS '$libdir/diskquota-2.3.so' LANGUAGE C;
+CREATE FUNCTION diskquota.database_quota_limit_mb() RETURNS bigint STRICT AS '$libdir/diskquota-2.3.so' LANGUAGE C;
+CREATE FUNCTION diskquota.database_total_size() RETURNS bigint STRICT AS '$libdir/diskquota-2.3.so' LANGUAGE C;
 CREATE FUNCTION diskquota.refresh_rejectmap(diskquota.rejectmap_entry[], oid[]) RETURNS void STRICT AS '$libdir/diskquota-2.3.so' LANGUAGE C;
 CREATE FUNCTION diskquota.show_rejectmap() RETURNS setof diskquota.rejectmap_entry_detail AS '$libdir/diskquota-2.3.so', 'show_rejectmap' LANGUAGE C;
 CREATE FUNCTION diskquota.pause() RETURNS void STRICT AS '$libdir/diskquota-2.3.so', 'diskquota_pause' LANGUAGE C;
@@ -298,6 +304,17 @@ FROM
   pg_roles ON primaryoid = pg_roles.oid JOIN
   pg_tablespace ON tablespaceoid = pg_tablespace.oid LEFT OUTER JOIN
   quota_usage ON pg_roles.oid = relowner AND pg_tablespace.oid = reltablespace;
+
+CREATE VIEW diskquota.show_cluster_quota_view AS
+SELECT
+  diskquota.cluster_quota_limit_mb() AS quota_in_mb,
+  diskquota.cluster_total_size() AS total_size_in_bytes;
+
+CREATE VIEW diskquota.show_database_quota_view AS
+SELECT
+  current_database() AS database_name,
+  diskquota.database_quota_limit_mb() AS quota_in_mb,
+  diskquota.database_total_size() AS total_size_in_bytes;
 
 CREATE VIEW diskquota.show_segment_ratio_quota_view AS
 SELECT 

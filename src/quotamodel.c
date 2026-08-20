@@ -1498,6 +1498,12 @@ do_load_quotas(void)
 	int       ret;
 	TupleDesc tupdesc;
 	int       i;
+	/*
+	 * DATABASE_QUOTA limit found in this database's quota_config;
+	 * stays 0 when the row is absent so that deleting the quota also
+	 * clears the published limit on the next reload.
+	 */
+	int64 database_quota_limit_mb = 0;
 
 	/*
 	 * TODO: we should skip to reload quota config when there is no change in
@@ -1567,13 +1573,18 @@ do_load_quotas(void)
 		Oid   primaryOid     = DatumGetObjectId(vals[5]);
 
 		/*
-		 * The cluster quota has no per-object key, so it does not
-		 * enter quota_info_map; its limit lives in launcher shmem
-		 * where every database's checks can see it.
+		 * The cluster and database quotas have no per-object key, so
+		 * they do not enter quota_info_map; their limits live in
+		 * launcher shmem where every database's checks can see them.
 		 */
 		if (quotaType == CLUSTER_QUOTA)
 		{
 			diskquota_set_cluster_limit_mb(quota_limit_mb);
+			continue;
+		}
+		if (quotaType == DATABASE_QUOTA)
+		{
+			database_quota_limit_mb = quota_limit_mb;
 			continue;
 		}
 
@@ -1597,6 +1608,8 @@ do_load_quotas(void)
 			update_limit_for_quota(quota_limit_mb * (1 << 20), segratio, quotaType, (Oid[]){targetOid, spcOid});
 		}
 	}
+
+	diskquota_publish_db_limit(database_quota_limit_mb);
 
 	return;
 }
@@ -1708,10 +1721,10 @@ prepare_rejectmap_search_key(RejectMapEntry *keyitem, QuotaType type, Oid relown
 		keyitem->targetoid = relnamespace;
 	else if (type == TABLESPACE_QUOTA)
 		keyitem->targetoid = reltablespace;
-	else if (type == CLUSTER_QUOTA)
+	else if (type == CLUSTER_QUOTA || type == DATABASE_QUOTA)
 		/*
-		 * The cluster quota is object-independent; its rejectmap key
-		 * carries no target oid. (The soft-limit check does not go
+		 * These quotas are object-independent; their rejectmap keys
+		 * carry no target oid. (The soft-limit checks do not go
 		 * through the rejectmap; this key shape is reserved for
 		 * hardlimit dispatch.)
 		 */
@@ -1791,8 +1804,20 @@ quota_check_common(Oid reloid, RelFileNode *relfilenode)
 	 */
 	if (OidIsValid(reloid) && IS_QUERY_DISPATCHER() && !diskquota_am_bgworker())
 	{
-		int64 limit_mb = diskquota_get_cluster_limit_mb();
+		int64 db_total    = 0;
+		int64 db_limit_mb = 0;
+		int64 limit_mb;
 
+		if (diskquota_get_database_status(MyDatabaseId, &db_total, &db_limit_mb) && db_limit_mb > 0 &&
+		    db_total >= db_limit_mb * (int64)(1 << 20))
+			ereport(ERROR,
+			        (errcode(ERRCODE_DISK_FULL),
+			         errmsg("database's disk space quota exceeded with name: %s", get_database_name(MyDatabaseId)),
+			         errhint("database usage " INT64_FORMAT " MB exceeds database quota " INT64_FORMAT
+			                 " MB; free disk space or raise diskquota.set_database_quota()",
+			                 db_total / (1 << 20), db_limit_mb)));
+
+		limit_mb = diskquota_get_cluster_limit_mb();
 		if (limit_mb > 0)
 		{
 			int64 total = diskquota_get_cluster_total_size();
