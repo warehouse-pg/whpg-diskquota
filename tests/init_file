@@ -57,4 +57,7 @@ s/ERROR:  cluster.s disk space quota exceeded  .seg.*/[hardlimit] cluster disk s
 m/ERROR:  database.s disk space quota exceeded with name: \d+.*/
 s/ERROR:  database.s disk space quota exceeded with name: \d+.*/[hardlimit] database disk space quota exceeded/
 
+m/WARNING:  cluster quota counts monitored databases only.*/
+s/not monitored: .*/not monitored: <unmonitored databases>/
+
 -- end_matchsubs

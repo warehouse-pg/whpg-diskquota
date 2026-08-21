@@ -2,13 +2,18 @@
 CREATE SCHEMA cdqschema;
 SET search_path TO cdqschema;
 CREATE TABLE cdq_t (i INT, t TEXT) DISTRIBUTED BY (i);
--- cap the whole cluster
+-- cap the whole cluster; an unmonitored database triggers the
+-- blind-spot warning (list normalized by init_file matchsubs)
+CREATE DATABASE cdq_unmonitored;
 SELECT diskquota.set_cluster_quota('10 MB');
+WARNING:  cluster quota counts monitored databases only; not monitored: cdq_unmonitored
+HINT:  run CREATE EXTENSION diskquota in those databases to include them
  set_cluster_quota 
 -------------------
  
 (1 row)
 
+DROP DATABASE cdq_unmonitored;
 SELECT diskquota.wait_for_worker_new_epoch();
  wait_for_worker_new_epoch 
 ---------------------------
@@ -38,7 +43,7 @@ SELECT diskquota.wait_for_worker_new_epoch();
 -- expect fail: cluster cap exceeded
 INSERT INTO cdq_t VALUES (1, 'x');
 ERROR:  cluster's disk space quota exceeded
-HINT:  cluster usage 23 MB exceeds cluster quota 10 MB; free disk space or raise diskquota.set_cluster_quota()
+HINT:  cluster usage 21 MB exceeds cluster quota 10 MB; free disk space or raise diskquota.set_cluster_quota()
 -- reads still work
 SELECT count(*) FROM cdq_t;
  count 

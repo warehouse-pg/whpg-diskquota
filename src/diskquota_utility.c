@@ -734,6 +734,55 @@ set_schema_quota(PG_FUNCTION_ARGS)
 }
 
 /*
+ * The cluster quota counts monitored databases only; a database
+ * without the diskquota extension is invisible to the cap. Make that
+ * blind spot explicit to the DBA: list every non-template database
+ * (except the launcher's own bookkeeping database) that is not being
+ * monitored. A warning rather than an error: monitoring may be
+ * intentionally partial, and databases created later are born
+ * unmonitored anyway, so refusing here could not guarantee coverage
+ * either.
+ */
+static void
+warn_unmonitored_databases(void)
+{
+	int            ret;
+	StringInfoData names;
+	int            count = 0;
+
+	SPI_connect();
+	ret = SPI_execute(
+	        "select oid, datname from pg_database where not datistemplate and datname <> 'diskquota' order by datname",
+	        true, 0);
+	if (ret != SPI_OK_SELECT) elog(ERROR, "cannot query pg_database: error code %d", ret);
+
+	initStringInfo(&names);
+	for (uint64 i = 0; i < SPI_processed; i++)
+	{
+		bool  isnull = true;
+		bool  found  = false;
+		Oid   dbid   = DatumGetObjectId(SPI_getbinval(SPI_tuptable->vals[i], SPI_tuptable->tupdesc, 1, &isnull));
+		char *dbname = SPI_getvalue(SPI_tuptable->vals[i], SPI_tuptable->tupdesc, 2);
+
+		if (isnull || dbname == NULL) continue;
+
+		LWLockAcquire(diskquota_locks.monitored_dbid_cache_lock, LW_SHARED);
+		hash_search(monitored_dbid_cache, &dbid, HASH_FIND, &found);
+		LWLockRelease(diskquota_locks.monitored_dbid_cache_lock);
+		if (found) continue;
+
+		if (count++ > 0) appendStringInfoString(&names, ", ");
+		appendStringInfoString(&names, dbname);
+	}
+
+	if (count > 0)
+		ereport(WARNING,
+		        (errmsg("cluster quota counts monitored databases only; not monitored: %s", names.data),
+		         errhint("run CREATE EXTENSION diskquota in those databases to include them")));
+	SPI_finish();
+}
+
+/*
  * Set the cluster-wide disk quota (PTT-1563): a cap on the aggregate
  * size of all monitored databases. The request is forwarded to the
  * diskquota launcher, which persists the value in
@@ -814,6 +863,8 @@ set_cluster_quota(PG_FUNCTION_ARGS)
 	}
 	LWLockRelease(diskquota_locks.extension_ddl_message_lock);
 	LWLockRelease(diskquota_locks.extension_ddl_lock);
+
+	if (quota_limit_mb > 0) warn_unmonitored_databases();
 	PG_RETURN_VOID();
 }
 

@@ -3,8 +3,11 @@ CREATE SCHEMA cdqschema;
 SET search_path TO cdqschema;
 CREATE TABLE cdq_t (i INT, t TEXT) DISTRIBUTED BY (i);
 
--- cap the whole cluster
+-- cap the whole cluster; an unmonitored database triggers the
+-- blind-spot warning (list normalized by init_file matchsubs)
+CREATE DATABASE cdq_unmonitored;
 SELECT diskquota.set_cluster_quota('10 MB');
+DROP DATABASE cdq_unmonitored;
 SELECT diskquota.wait_for_worker_new_epoch();
 SELECT diskquota.cluster_quota_limit_mb();
 -- starts under the cap, so the load is allowed to complete (soft limit)
