@@ -1846,6 +1846,12 @@ add_db_entry(Oid dbid)
 		DiskquotaDBEntry *dbEntry = &DiskquotaLauncherShmem->dbArray[i];
 		if (!dbEntry->in_use && result == NULL)
 		{
+			/*
+			 * A freed slot keeps its last occupant's published numbers;
+			 * clear them so they are never attributed to this database.
+			 */
+			pg_atomic_write_u64(&dbEntry->total_size, 0);
+			pg_atomic_write_u64(&dbEntry->db_quota_limit_mb, 0);
 			dbEntry->dbid          = dbid;
 			dbEntry->in_use        = true;
 			dbEntry->next_run_time = GetCurrentTimestamp();
