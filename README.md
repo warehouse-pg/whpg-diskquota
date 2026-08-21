@@ -82,11 +82,14 @@ Enforcement is implemented as hooks. There are two kinds of enforcement hooks:
 enforcement before query is running and enforcement during query is running.
 The 'before query' one is implemented at ExecutorCheckPerms_hook in function 
 ExecCheckRTPerms() 
-The 'during query' one is implemented at DispatcherCheckPerms_hook in function 
-checkDispatchResult(). For queries loading a huge number of data, dispatcher 
-will poll the connnection with a poll timeout. Hook will be called at every 
-poll timeout with waitMode == DISPATCH_WAIT_NONE. Currently only async 
-diskpatcher supports 'during query' quota enforcement.
+The 'during query' one requires GUC diskquota.hard_limit to be 'on'.
+Each refresh loop, the diskquota worker dispatches the rejectmap to all
+segments by calling diskquota.refresh_rejectmap() there; segments index
+it by relfilenode. The file_extend_hook in smgrextend() then looks up
+every file extension in that rejectmap and cancels the running query
+once its target is blocked, so a query that passed the 'before query'
+check but pushes usage past the limit while running is stopped within
+roughly one diskquota.naptime.
 
 ## Quota setting store
 Quota limit of a schema or a role is stored in table 'quota_config' in 
