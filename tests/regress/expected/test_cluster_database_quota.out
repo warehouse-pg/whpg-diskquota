@@ -75,7 +75,7 @@ SELECT diskquota.wait_for_worker_new_epoch();
 
 -- expect fail: database usage already exceeds the cap
 INSERT INTO cdq_t VALUES (2, 'x');
-ERROR:  database's disk space quota exceeded with name: regression
+ERROR:  database's disk space quota exceeded with name: contrib_regression
 HINT:  database usage 21 MB exceeds database quota 10 MB; free disk space or raise diskquota.set_database_quota()
 -- expect fail: another database's quota cannot be set from here
 SELECT diskquota.set_database_quota('template1', '10 MB');
