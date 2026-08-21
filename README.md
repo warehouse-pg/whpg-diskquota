@@ -4,6 +4,20 @@ objects in Greenplum DB. Currently it supports to set quota limit on schema
 and role in a given database and limit the amount of disk space that a schema 
 or a role can use. 
 
+Two coarser scopes are also supported (PTT-1563):
+
+1. A database quota caps the total size of one database, all schemas and
+roles combined: `select diskquota.set_database_quota('db1', '2 TB')`.
+
+2. A cluster quota caps the aggregate size of all monitored databases
+together: `select diskquota.set_cluster_quota('10 TB')`. Once the sum
+exceeds the cap, INSERT/UPDATE/COPY are rejected in every monitored
+database until usage drops below the cap again.
+
+Both follow the same soft-limit semantics as schema and role quotas, and
+both cooperate with `diskquota.hard_limit` to cancel in-flight queries
+that push past the cap.
+
 This project is inspired by Heikki's 
 [pg_quota project](https://github.com/hlinnaka/pg_quota) and enhance it in 
 two aspects:
@@ -81,6 +95,16 @@ its own disk quota configuration. Note that although role is a db object in
 cluster level, we limit the diskquota of a role to be database specific. 
 That is to say, a role may have different quota limit on different databases 
 and their disk usage is isolated between databases.
+
+The database quota follows the same pattern: one row in the capped
+database's own quota_config (which is why set_database_quota() must be
+run while connected to that database).
+
+The cluster quota is the one exception: being a cluster-wide fact, it is
+stored once, in table 'global_quota_config' in the 'diskquota_namespace'
+schema of the diskquota launcher's database, and is managed by the
+launcher. set_cluster_quota() can therefore be called from any database,
+and the value survives cluster restarts.
 
 # Development
 
@@ -217,9 +241,29 @@ insert into a select generate_series(1,100);
 reset search_path;
 ```
 
-3. Show schema quota limit and current usage
+3. Set/update/delete a database quota using diskquota.set_database_quota
+```
+# must be run while connected to the database being capped
+select diskquota.set_database_quota(current_database()::text, '10 GB');
+
+# delete the database quota
+select diskquota.set_database_quota(current_database()::text, '-1');
+```
+
+4. Set/update/delete the cluster quota using diskquota.set_cluster_quota
+```
+# can be run from any database
+select diskquota.set_cluster_quota('100 GB');
+
+# delete the cluster quota
+select diskquota.set_cluster_quota('-1');
+```
+
+5. Show quota limits and current usage
 ```
 select * from diskquota.show_fast_schema_quota_view;
+select * from diskquota.show_database_quota_view;
+select * from diskquota.show_cluster_quota_view;
 ```
 
 
@@ -263,6 +307,15 @@ But schema and role are different. For role, i.e. the owner of the temp table,
 diskquota will treat it the same as normal tables and sum its table size to 
 its owner's quota. While for schema, temp table is located under namespace 
 'pg_temp_backend_id', so temp table size will not sum to the current schema's qouta.
+
+3. Cluster and database quotas never block system tables or diskquota
+itself.
+
+Writes to pg_catalog and to diskquota's own tables are exempt from the
+cluster and database caps (their sizes still count toward the totals).
+This is deliberate: diskquota records usage by writing to
+diskquota.table_size, so a cap that blocked those writes could never
+observe usage dropping and would stay locked forever.
 
 # Known Issue.
 
