@@ -872,10 +872,15 @@ refresh_disk_quota_usage(bool is_init)
 		/*
 		 * Dispatch rejectmap entries to segments to perform hard-limit.
 		 * If the bgworker is in init mode, the rejectmap should be refreshed anyway.
-		 * Otherwise, only when the rejectmap is changed or the active_table_list is
-		 * not empty the rejectmap should be dispatched to segments.
+		 * Whenever the rejectmap content changed it must be dispatched even if
+		 * this worker runs with hardlimit off: segments enforce whatever map they
+		 * last received under their own hardlimit GUC, so skipping the dispatch
+		 * would leave them rejecting on entries that no longer exist (e.g. after
+		 * a quota was deleted while hardlimit was being turned off cluster-wide).
+		 * With hardlimit on, also redispatch when the active table list is
+		 * non-empty so new relfilenodes of already-rejected objects are covered.
 		 */
-		if (is_init || (diskquota_hardlimit && (reject_map_changed || hasActiveTable)))
+		if (is_init || reject_map_changed || (diskquota_hardlimit && hasActiveTable))
 			dispatch_rejectmap(local_active_table_stat_map);
 		hash_destroy(local_active_table_stat_map);
 	}
