@@ -1,0 +1,117 @@
+-- Cluster and database quotas must survive a postmaster restart:
+-- the launcher reloads the cluster limit from its global config
+-- table, the database worker re-reads its settings row, and the
+-- scoreboard totals are republished from diskquota.table_size.
+
+-- run under soft limit only: pin hard_limit off in every process
+!\retcode gpconfig -c "diskquota.hard_limit" -v "off" > /dev/null;
+-- start_ignore
+
+-- end_ignore
+(exited with code 0)
+!\retcode gpstop -u > /dev/null;
+-- start_ignore
+
+-- end_ignore
+(exited with code 0)
+
+1: CREATE SCHEMA cqr_s;
+CREATE SCHEMA
+1: CREATE TABLE cqr_s.t (i INT, t TEXT) DISTRIBUTED BY (i);
+CREATE TABLE
+1: SELECT diskquota.set_cluster_quota('10 MB');
+ set_cluster_quota 
+-------------------
+                   
+(1 row)
+1: SELECT diskquota.set_database_quota(current_database()::text, '8 MB');
+ set_database_quota 
+--------------------
+                    
+(1 row)
+1: SELECT diskquota.wait_for_worker_new_epoch();
+ wait_for_worker_new_epoch 
+---------------------------
+ t                         
+(1 row)
+-- starts under the caps, so the load completes (soft limit)
+1: INSERT INTO cqr_s.t SELECT g, repeat('x', 1000) FROM generate_series(1, 15000) g;
+INSERT 0 15000
+1: SELECT diskquota.wait_for_worker_new_epoch();
+ wait_for_worker_new_epoch 
+---------------------------
+ t                         
+(1 row)
+-- expect fail: both caps exceeded (the database cap is checked first)
+1: INSERT INTO cqr_s.t VALUES (1, 'x');
+ERROR:  database's disk space quota exceeded with name: isolation2test
+HINT:  database usage 16 MB exceeds database quota 8 MB; free disk space or raise diskquota.set_database_quota()
+1q: ... <quitting>
+
+-- hard restart of the coordinator postmaster
+!\retcode pg_ctl -D $MASTER_DATA_DIRECTORY -w stop;
+-- start_ignore
+waiting for server to shut down.... done
+server stopped
+
+-- end_ignore
+(exited with code 0)
+!\retcode pg_ctl -D $MASTER_DATA_DIRECTORY -w -o "-c gp_role=dispatch" start;
+-- start_ignore
+waiting for server to start....2026-08-21 16:41:00.310601 +08,,,p1436891,th-1589534688,,,,0,,,seg-1,,,,,"LOG","00000","starting PostgreSQL 12.12 (Greenplum Database 7.0.0-beta.0+9d05a325f8 build dev) on aarch64-unknown-linux-gnu, compiled by gcc (GCC) 11.5.0 20240719 (Red Hat 11.5.0-14), 64-bit",,,,,,,,"PostmasterMain","postmaster.c",1242,
+2026-08-21 16:41:00.310788 +08,,,p1436891,th-1589534688,,,,0,,,seg-1,,,,,"LOG","00000","listening on IPv4 address ""0.0.0.0"", port 8000",,,,,,,,"StreamServerPort","pqcomm.c",639,
+2026-08-21 16:41:00.310844 +08,,,p1436891,th-1589534688,,,,0,,,seg-1,,,,,"LOG","00000","listening on IPv6 address ""::"", port 8000",,,,,,,,"StreamServerPort","pqcomm.c",639,
+2026-08-21 16:41:00.310927 +08,,,p1436891,th-1589534688,,,,0,,,seg-1,,,,,"LOG","00000","listening on Unix socket ""/tmp/.s.PGSQL.8000""",,,,,,,,"StreamServerPort","pqcomm.c",634,
+2026-08-21 16:41:00.334481 +08,,,p1436891,th-1589534688,,,,0,,,seg-1,,,,,"LOG","00000","redirecting log output to logging collector process",,"Future log output will appear in directory ""log"".",,,,,,"SysLogger_Start","syslogger.c",920,
+ done
+server started
+
+-- end_ignore
+(exited with code 0)
+!\retcode sleep 5;
+-- start_ignore
+
+-- end_ignore
+(exited with code 0)
+
+-- both limits must have survived the restart without being re-set
+1: SELECT diskquota.wait_for_worker_new_epoch();
+ wait_for_worker_new_epoch 
+---------------------------
+ t                         
+(1 row)
+1: SELECT diskquota.cluster_quota_limit_mb();
+ cluster_quota_limit_mb 
+------------------------
+ 10                     
+(1 row)
+1: SELECT diskquota.database_quota_limit_mb();
+ database_quota_limit_mb 
+-------------------------
+ 8                       
+(1 row)
+-- expect fail: scoreboard republished, enforcement still bites
+1: INSERT INTO cqr_s.t VALUES (2, 'x');
+ERROR:  database's disk space quota exceeded with name: isolation2test
+HINT:  database usage 16 MB exceeds database quota 8 MB; free disk space or raise diskquota.set_database_quota()
+-- delete the quotas; writes resume
+1: SELECT diskquota.set_cluster_quota('-1');
+ set_cluster_quota 
+-------------------
+                   
+(1 row)
+1: SELECT diskquota.set_database_quota(current_database()::text, '-1');
+ set_database_quota 
+--------------------
+                    
+(1 row)
+1: SELECT diskquota.wait_for_worker_new_epoch();
+ wait_for_worker_new_epoch 
+---------------------------
+ t                         
+(1 row)
+1: INSERT INTO cqr_s.t VALUES (3, 'x');
+INSERT 0 1
+1: DROP SCHEMA cqr_s CASCADE;
+DROP SCHEMA
+1q: ... <quitting>
