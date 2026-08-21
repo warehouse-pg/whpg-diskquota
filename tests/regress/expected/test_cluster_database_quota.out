@@ -101,5 +101,138 @@ SELECT diskquota.wait_for_worker_new_epoch();
 
 INSERT INTO cdq_t VALUES (3, 'x');
 DROP TABLE cdq_t;
+-- === the blind spot, end to end ===
+-- a database without the extension is invisible to the cluster cap
+-- until the extension is created and initialized there
+CREATE TABLE cdqschema.cdq_t2 (i INT, t TEXT) DISTRIBUTED BY (i);
+CREATE DATABASE cdq_blind;
+-- warning again: cdq_blind is unmonitored (list normalized by matchsubs)
+SELECT diskquota.set_cluster_quota('10 MB');
+WARNING:  cluster quota counts monitored databases only; not monitored: cdq_blind
+HINT:  run CREATE EXTENSION diskquota in those databases to include them
+ set_cluster_quota 
+-------------------
+ 
+(1 row)
+
+SELECT diskquota.wait_for_worker_new_epoch();
+ wait_for_worker_new_epoch 
+---------------------------
+ t
+(1 row)
+
+\c cdq_blind
+CREATE TABLE blind_t (i INT, t TEXT) DISTRIBUTED BY (i);
+-- ~15 MB, well over the 10 MB cap: succeeds, the database is invisible
+INSERT INTO blind_t SELECT g, repeat('x', 1000) FROM generate_series(1, 15000) g;
+\c contrib_regression
+SELECT diskquota.wait_for_worker_new_epoch();
+ wait_for_worker_new_epoch 
+---------------------------
+ t
+(1 row)
+
+SELECT diskquota.wait_for_worker_new_epoch();
+ wait_for_worker_new_epoch 
+---------------------------
+ t
+(1 row)
+
+-- the unmonitored load does not show in the cluster total...
+SELECT total_size_in_bytes < 10 * 1048576 AS blind_load_invisible
+FROM diskquota.show_cluster_quota_view;
+ blind_load_invisible 
+----------------------
+ t
+(1 row)
+
+-- ...and monitored databases stay writable
+INSERT INTO cdqschema.cdq_t2 VALUES (1, 'x');
+-- monitor the blind database; initialize its existing data
+\c cdq_blind
+CREATE EXTENSION diskquota;
+WARNING:  [diskquota] diskquota is not ready because current database is not empty
+HINT:  please run 'SELECT diskquota.init_table_size_table();' to initialize diskquota
+SELECT diskquota.init_table_size_table();
+ init_table_size_table 
+-----------------------
+ 
+(1 row)
+
+SELECT diskquota.wait_for_worker_new_epoch();
+ wait_for_worker_new_epoch 
+---------------------------
+ t
+(1 row)
+
+\c contrib_regression
+SELECT diskquota.wait_for_worker_new_epoch();
+ wait_for_worker_new_epoch 
+---------------------------
+ t
+(1 row)
+
+-- the same ~15 MB is now visible and over the cap
+SELECT total_size_in_bytes > 10 * 1048576 AS blind_load_visible
+FROM diskquota.show_cluster_quota_view;
+ blind_load_visible 
+--------------------
+ t
+(1 row)
+
+-- expect fail: the cap now bites in every monitored database
+INSERT INTO cdqschema.cdq_t2 VALUES (2, 'x');
+ERROR:  cluster's disk space quota exceeded
+HINT:  cluster usage 17 MB exceeds cluster quota 10 MB; free disk space or raise diskquota.set_cluster_quota()
+-- stop monitoring the blind database; its size leaves the total
+\c cdq_blind
+SELECT diskquota.pause();
+ pause 
+-------
+ 
+(1 row)
+
+SELECT diskquota.wait_for_worker_new_epoch();
+ wait_for_worker_new_epoch 
+---------------------------
+ t
+(1 row)
+
+DROP EXTENSION diskquota;
+\c contrib_regression
+SELECT diskquota.wait_for_worker_new_epoch();
+ wait_for_worker_new_epoch 
+---------------------------
+ t
+(1 row)
+
+SELECT diskquota.wait_for_worker_new_epoch();
+ wait_for_worker_new_epoch 
+---------------------------
+ t
+(1 row)
+
+SELECT total_size_in_bytes < 10 * 1048576 AS unmonitored_excluded
+FROM diskquota.show_cluster_quota_view;
+ unmonitored_excluded 
+----------------------
+ t
+(1 row)
+
+INSERT INTO cdqschema.cdq_t2 VALUES (3, 'x');
+DROP DATABASE cdq_blind;
+SELECT diskquota.set_cluster_quota('-1');
+ set_cluster_quota 
+-------------------
+ 
+(1 row)
+
+SELECT diskquota.wait_for_worker_new_epoch();
+ wait_for_worker_new_epoch 
+---------------------------
+ t
+(1 row)
+
+DROP TABLE cdqschema.cdq_t2;
 RESET search_path;
 DROP SCHEMA cdqschema;
