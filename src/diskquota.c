@@ -139,6 +139,7 @@ static void on_add_db(Oid dbid, MessageResult *code);
 static void on_del_db(Oid dbid, MessageResult *code);
 static void on_set_cluster_quota(int64 limit_mb);
 static void load_global_quota_config(void);
+static void reap_dropped_databases(void);
 static bool is_valid_dbid(Oid dbid);
 extern void invalidate_database_rejectmap(Oid dbid);
 static void FreeWorkerOnExit(int code, Datum arg);
@@ -892,6 +893,13 @@ disk_quota_launcher_main(Datum main_arg)
 			got_sigusr1 = false;
 			sigusr1     = true;
 		}
+
+		/*
+		 * A database dropped without DROP EXTENSION leaves its
+		 * bookkeeping behind; release it, or the cluster-wide quota
+		 * total keeps counting the dead database's last size.
+		 */
+		reap_dropped_databases();
 
 		/*
 		 * Try to starts a bgworker for the curDB
@@ -2139,6 +2147,94 @@ load_global_quota_config(void)
 	CommitTransactionCommand();
 
 	diskquota_set_cluster_limit_mb(limit_mb);
+}
+
+/*
+ * Release the bookkeeping of monitored databases that no longer
+ * exist.
+ *
+ * DROP DATABASE does not go through diskquota's DROP EXTENSION
+ * teardown, so a monitored database can vanish while its dbArray
+ * slot, its database_list row and the segment monitor caches live
+ * on. The stale slot keeps the database's last published total_size,
+ * inflating the cluster-wide quota total with data that is gone.
+ * Sweep the slots and tear down each dead one the same way a DROP
+ * EXTENSION message would. Runs in the launcher once per main-loop
+ * pass.
+ */
+static void
+reap_dropped_databases(void)
+{
+	Oid *dead  = palloc(sizeof(Oid) * diskquota_max_monitored_databases);
+	int  ndead = 0;
+
+	/* SearchSysCache in is_valid_dbid requires a transaction */
+	StartTransactionCommand();
+	LWLockAcquire(diskquota_locks.dblist_lock, LW_SHARED);
+	for (int i = 0; i < diskquota_max_monitored_databases; i++)
+	{
+		DiskquotaDBEntry *dbEntry = &DiskquotaLauncherShmem->dbArray[i];
+
+		if (dbEntry->in_use && !is_valid_dbid(dbEntry->dbid)) dead[ndead++] = dbEntry->dbid;
+	}
+	LWLockRelease(diskquota_locks.dblist_lock);
+	CommitTransactionCommand();
+
+	for (int i = 0; i < ndead; i++)
+	{
+		Oid  dbid               = dead[i];
+		bool connected          = false;
+		bool pushed_active_snap = false;
+		bool ret                = true;
+
+		ereport(LOG, (errmsg("[diskquota launcher] database(oid:%u) was dropped, "
+		                     "releasing its diskquota bookkeeping",
+		                     dbid)));
+
+		StartTransactionCommand();
+		/*
+		 * A failure (e.g. a segment is down) must not take the
+		 * launcher out: the slot then stays in use and the next
+		 * loop pass retries the release.
+		 */
+		PG_TRY();
+		{
+			if (SPI_OK_CONNECT != SPI_connect())
+				ereport(ERROR, (errcode(ERRCODE_INTERNAL_ERROR),
+				                errmsg("[diskquota launcher] unable to connect to execute internal query")));
+			connected = true;
+			PushActiveSnapshot(GetTransactionSnapshot());
+			pushed_active_snap = true;
+
+			del_dbid_from_database_list(dbid);
+			release_db_entry(dbid);
+			update_monitor_db_mpp(dbid, REMOVE_DB_FROM_BEING_MONITORED, LAUNCHER_SCHEMA);
+			invalidate_database_rejectmap(dbid);
+		}
+		PG_CATCH();
+		{
+			error_context_stack = NULL;
+			HOLD_INTERRUPTS();
+			EmitErrorReport();
+			FlushErrorState();
+			ret = false;
+			RESUME_INTERRUPTS();
+		}
+		PG_END_TRY();
+		if (connected) SPI_finish();
+		if (pushed_active_snap) PopActiveSnapshot();
+		if (ret)
+		{
+			CommitTransactionCommand();
+			if (num_db > 0) num_db--;
+			if (num_db <= diskquota_max_workers) DiskquotaLauncherShmem->isDynamicWorker = false;
+		}
+		else
+			AbortCurrentTransaction();
+	}
+
+	if (ndead > 0) DisconnectAndDestroyAllGangs(false);
+	pfree(dead);
 }
 
 /*

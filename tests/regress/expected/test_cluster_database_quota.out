@@ -282,6 +282,56 @@ FROM diskquota.show_cluster_quota_view;
 
 INSERT INTO cdqschema.cdq_t2 VALUES (3, 'x');
 DROP DATABASE cdq_blind;
+-- === reaper: a dropped database's usage must leave the total ===
+-- monitor a database, fill it past the cap, then DROP DATABASE
+-- without DROP EXTENSION first: the launcher must release the dead
+-- database's bookkeeping so it stops counting toward the cluster cap
+CREATE DATABASE cdq_phantom;
+\c cdq_phantom
+CREATE EXTENSION diskquota;
+CREATE TABLE phantom_t (i INT, t TEXT) DISTRIBUTED BY (i);
+INSERT INTO phantom_t SELECT g, repeat('x', 1000) FROM generate_series(1, 15000) g;
+SELECT diskquota.wait_for_worker_new_epoch();
+ wait_for_worker_new_epoch 
+---------------------------
+ t
+(1 row)
+
+\c contrib_regression
+SET search_path TO cdqschema;
+-- the phantom load counts while its database exists
+SELECT total_size_in_bytes > 10 * 1048576 AS phantom_counted
+FROM diskquota.show_cluster_quota_view;
+ phantom_counted 
+-----------------
+ t
+(1 row)
+
+-- expect fail: over the cap
+INSERT INTO cdqschema.cdq_t2 VALUES (4, 'x');
+ERROR:  cluster's disk space quota exceeded
+HINT:  cluster usage 16 MB exceeds cluster quota 10 MB; free disk space or raise diskquota.set_cluster_quota()
+-- drop the database directly; retry while its worker's transient
+-- connections block the drop (prints DROPPED once it goes through)
+\! for i in $(seq 1 30); do psql -d contrib_regression -Atc "DROP DATABASE cdq_phantom" >/dev/null 2>&1 && { echo DROPPED; break; }; sleep 1; done
+DROPPED
+-- bounded wait for the launcher to reap the dead slot
+DO $$ BEGIN FOR i IN 1..600 LOOP EXIT WHEN diskquota.cluster_total_size() < 10 * 1048576; PERFORM pg_sleep(0.1); END LOOP; END $$;
+SELECT total_size_in_bytes < 10 * 1048576 AS phantom_reaped
+FROM diskquota.show_cluster_quota_view;
+ phantom_reaped 
+----------------
+ t
+(1 row)
+
+-- one worker cycle to clear the stale rejectmap entry; writes resume
+SELECT diskquota.wait_for_worker_new_epoch();
+ wait_for_worker_new_epoch 
+---------------------------
+ t
+(1 row)
+
+INSERT INTO cdqschema.cdq_t2 VALUES (5, 'x');
 SELECT diskquota.set_cluster_quota('-1');
  set_cluster_quota 
 -------------------
