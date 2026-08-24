@@ -36,6 +36,11 @@ INSERT INTO cdqschema.cdq_t VALUES (1, 'x');
 -- the cap: CREATE EXTENSION goes through the launcher's bookkeeping
 CREATE DATABASE cdq_join;
 \c cdq_join
+-- unmonitored database while the cluster is over its cap: it is not
+-- counted in the cluster total, so it is not blocked by it either
+CREATE TABLE join_t (i INT, t TEXT) DISTRIBUTED BY (i);
+INSERT INTO join_t VALUES (1, 'x');
+DROP TABLE join_t;
 CREATE EXTENSION diskquota;
 SELECT diskquota.wait_for_worker_new_epoch();
 DROP EXTENSION diskquota;

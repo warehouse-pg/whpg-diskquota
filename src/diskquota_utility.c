@@ -760,16 +760,12 @@ warn_unmonitored_databases(void)
 	for (uint64 i = 0; i < SPI_processed; i++)
 	{
 		bool  isnull = true;
-		bool  found  = false;
 		Oid   dbid   = DatumGetObjectId(SPI_getbinval(SPI_tuptable->vals[i], SPI_tuptable->tupdesc, 1, &isnull));
 		char *dbname = SPI_getvalue(SPI_tuptable->vals[i], SPI_tuptable->tupdesc, 2);
 
 		if (isnull || dbname == NULL) continue;
 
-		LWLockAcquire(diskquota_locks.monitored_dbid_cache_lock, LW_SHARED);
-		hash_search(monitored_dbid_cache, &dbid, HASH_FIND, &found);
-		LWLockRelease(diskquota_locks.monitored_dbid_cache_lock);
-		if (found) continue;
+		if (diskquota_is_monitored_dbid(dbid)) continue;
 
 		if (count++ > 0) appendStringInfoString(&names, ", ");
 		appendStringInfoString(&names, dbname);

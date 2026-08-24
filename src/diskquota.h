@@ -350,6 +350,7 @@ extern Oid      diskquota_parse_primary_table_oid(Oid namespace, char *relname);
 extern bool         worker_increase_epoch(Oid dbid);
 extern unsigned int worker_get_epoch(Oid dbid);
 extern bool         diskquota_is_paused(void);
+extern bool         diskquota_is_monitored_dbid(Oid dbid);
 extern bool         do_check_diskquota_state_is_ready(void);
 extern bool         diskquota_is_readiness_logged(void);
 extern void         diskquota_set_readiness_logged(void);

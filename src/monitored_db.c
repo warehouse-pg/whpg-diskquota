@@ -156,6 +156,24 @@ diskquota_is_paused()
 	return paused;
 }
 
+/*
+ * True when dbid is a diskquota-monitored database, i.e. the
+ * extension is installed there and the launcher tracks it. The
+ * object-independent quotas cover monitored databases only: an
+ * unmonitored database is neither counted in the cluster total nor
+ * blocked by it (see warn_unmonitored_databases()).
+ */
+bool
+diskquota_is_monitored_dbid(Oid dbid)
+{
+	bool found = false;
+
+	LWLockAcquire(diskquota_locks.monitored_dbid_cache_lock, LW_SHARED);
+	hash_search(monitored_dbid_cache, &dbid, HASH_FIND, &found);
+	LWLockRelease(diskquota_locks.monitored_dbid_cache_lock);
+	return found;
+}
+
 bool
 diskquota_is_readiness_logged()
 {

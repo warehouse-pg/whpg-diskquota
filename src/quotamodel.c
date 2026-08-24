@@ -1832,7 +1832,10 @@ quota_check_common(Oid reloid, RelFileNode *relfilenode)
 	/*
 	 * Cluster-wide quota: reject the write when the aggregate size of
 	 * all monitored databases exceeds the configured cap. Runs on the
-	 * dispatcher only (the aggregate lives in launcher shmem there).
+	 * dispatcher only (the aggregate lives in launcher shmem there),
+	 * and only in monitored databases: an unmonitored database is not
+	 * counted in the aggregate, so it must not be blocked by it
+	 * either (set_cluster_quota() warns about such databases).
 	 * diskquota's own processes are exempt: the workers must be able
 	 * to keep maintaining diskquota.table_size, or the aggregate could
 	 * never decrease again after the cap is hit, and the launcher must
@@ -1840,7 +1843,8 @@ quota_check_common(Oid reloid, RelFileNode *relfilenode)
 	 * be raised (set_cluster_quota) and no new database could be
 	 * monitored (CREATE EXTENSION) while the cluster is over quota.
 	 */
-	if (OidIsValid(reloid) && IS_QUERY_DISPATCHER() && !diskquota_am_bgworker() && !diskquota_am_launcher())
+	if (OidIsValid(reloid) && IS_QUERY_DISPATCHER() && !diskquota_am_bgworker() && !diskquota_am_launcher() &&
+	    diskquota_is_monitored_dbid(MyDatabaseId))
 	{
 		int64 db_total    = 0;
 		int64 db_limit_mb = 0;
