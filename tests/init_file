@@ -45,4 +45,19 @@ s/ERROR:  tablespace: \d+, schema: \d+ diskquota exceeded.*/[hardlimit] tablespa
 m/^ERROR:  Can not set disk quota for system owner:.*/
 s/^ERROR:  Can not set disk quota for system owner:.*/ERROR:  Can not set disk quota from system owner:/
 
+m/HINT:  cluster usage \d+ MB exceeds cluster quota/
+s/cluster usage \d+ MB/cluster usage XXX MB/
+
+m/HINT:  database usage \d+ MB exceeds database quota/
+s/database usage \d+ MB/database usage XXX MB/
+
+m/ERROR:  cluster.s disk space quota exceeded  .seg.*/
+s/ERROR:  cluster.s disk space quota exceeded  .seg.*/[hardlimit] cluster disk space quota exceeded/
+
+m/ERROR:  database.s disk space quota exceeded with name: \d+.*/
+s/ERROR:  database.s disk space quota exceeded with name: \d+.*/[hardlimit] database disk space quota exceeded/
+
+m/WARNING:  cluster quota counts monitored databases only.*/
+s/not monitored: .*/not monitored: <unmonitored databases>/
+
 -- end_matchsubs

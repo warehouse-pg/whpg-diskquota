@@ -86,6 +86,9 @@ ExtensionDDLMessage *extension_ddl_message = NULL;
 // a pointer to DiskquotaLauncherShmem->workerEntries in shared memory
 static DiskQuotaWorkerEntry *volatile MyWorkerInfo = NULL;
 
+// True only in the diskquota launcher process; see diskquota_am_launcher().
+static bool am_diskquota_launcher = false;
+
 // how many database diskquota are monitoring on
 static int num_db = 0;
 
@@ -134,6 +137,9 @@ static void do_process_extension_ddl_message(MessageResult *code, ExtensionDDLMe
 static void terminate_all_workers(void);
 static void on_add_db(Oid dbid, MessageResult *code);
 static void on_del_db(Oid dbid, MessageResult *code);
+static void on_set_cluster_quota(int64 limit_mb);
+static void load_global_quota_config(void);
+static void reap_dropped_databases(void);
 static bool is_valid_dbid(Oid dbid);
 extern void invalidate_database_rejectmap(Oid dbid);
 static void FreeWorkerOnExit(int code, Datum arg);
@@ -726,6 +732,8 @@ disk_quota_launcher_main(Datum main_arg)
 		proc_exit(0);
 	}
 
+	am_diskquota_launcher = true;
+
 	MemoryContextSwitchTo(TopMemoryContext);
 	init_bgworker_handles();
 
@@ -763,6 +771,7 @@ disk_quota_launcher_main(Datum main_arg)
 	create_monitor_db_table();
 
 	init_database_list();
+	load_global_quota_config();
 	DisconnectAndDestroyAllGangs(false);
 
 	loop_end = time(NULL);
@@ -886,6 +895,13 @@ disk_quota_launcher_main(Datum main_arg)
 		}
 
 		/*
+		 * A database dropped without DROP EXTENSION leaves its
+		 * bookkeeping behind; release it, or the cluster-wide quota
+		 * total keeps counting the dead database's last size.
+		 */
+		reap_dropped_databases();
+
+		/*
 		 * Try to starts a bgworker for the curDB
 		 *
 		 */
@@ -968,6 +984,8 @@ create_monitor_db_table(void)
 	 */
 	sql = "create schema if not exists diskquota_namespace;"
 	      "create table if not exists diskquota_namespace.database_list(dbid oid not null unique);"
+	      "create table if not exists diskquota_namespace.global_quota_config(quotatype int not null unique, "
+	      "quotalimitmb bigint not null);"
 	      "DROP SCHEMA IF EXISTS " LAUNCHER_SCHEMA
 	      " CASCADE;"
 	      "CREATE SCHEMA " LAUNCHER_SCHEMA
@@ -1212,6 +1230,11 @@ do_process_extension_ddl_message(MessageResult *code, ExtensionDDLMessage local_
 			case CMD_DROP_EXTENSION:
 				on_del_db(local_extension_ddl_message.dbid, code);
 				if (num_db > 0) num_db--;
+				*code = ERR_OK;
+				break;
+			case CMD_SET_CLUSTER_QUOTA:
+				/* the dbid field carries the limit in MB for this command */
+				on_set_cluster_quota((int64)(int)local_extension_ddl_message.dbid);
 				*code = ERR_OK;
 				break;
 			default:
@@ -1800,7 +1823,10 @@ init_launcher_shmem()
 			memset(&DiskquotaLauncherShmem->dbArray[i], 0, sizeof(DiskquotaDBEntry));
 			DiskquotaLauncherShmem->dbArray[i].id       = i;
 			DiskquotaLauncherShmem->dbArray[i].workerId = INVALID_WORKER_ID;
+			pg_atomic_init_u64(&DiskquotaLauncherShmem->dbArray[i].total_size, 0);
+			pg_atomic_init_u64(&DiskquotaLauncherShmem->dbArray[i].db_quota_limit_mb, 0);
 		}
+		pg_atomic_init_u64(&DiskquotaLauncherShmem->cluster_quota_limit_mb, 0);
 	}
 	/* init TableSizeEntry counter */
 	diskquota_table_size_entry_num =
@@ -1833,6 +1859,12 @@ add_db_entry(Oid dbid)
 		DiskquotaDBEntry *dbEntry = &DiskquotaLauncherShmem->dbArray[i];
 		if (!dbEntry->in_use && result == NULL)
 		{
+			/*
+			 * A freed slot keeps its last occupant's published numbers;
+			 * clear them so they are never attributed to this database.
+			 */
+			pg_atomic_write_u64(&dbEntry->total_size, 0);
+			pg_atomic_write_u64(&dbEntry->db_quota_limit_mb, 0);
 			dbEntry->dbid          = dbid;
 			dbEntry->in_use        = true;
 			dbEntry->next_run_time = GetCurrentTimestamp();
@@ -2042,3 +2074,280 @@ WaitForBackgroundWorkerShutdown(BackgroundWorkerHandle *handle)
 	return status;
 }
 #endif /* GP_VERSION_NUM */
+
+/*
+ * Persist the cluster-wide quota in the launcher's database and make
+ * it effective. Runs in the launcher with SPI already connected (see
+ * do_process_extension_ddl_message); errors are caught by the caller.
+ * A non-positive limit deletes the configuration.
+ */
+static void
+on_set_cluster_quota(int64 limit_mb)
+{
+	int ret;
+
+	if (limit_mb > 0)
+	{
+		ret = SPI_execute_with_args(
+		        "update diskquota_namespace.global_quota_config set quotalimitmb = $1 where quotatype = $2", 2,
+		        (Oid[]){INT8OID, INT4OID}, (Datum[]){Int64GetDatum(limit_mb), Int32GetDatum(CLUSTER_QUOTA)}, NULL,
+		        false, 0);
+		if (ret != SPI_OK_UPDATE)
+			ereport(ERROR, (errmsg("[diskquota launcher] cannot update global_quota_config, error code %d", ret)));
+		if (SPI_processed == 0)
+		{
+			ret = SPI_execute_with_args(
+			        "insert into diskquota_namespace.global_quota_config values($1, $2)", 2, (Oid[]){INT4OID, INT8OID},
+			        (Datum[]){Int32GetDatum(CLUSTER_QUOTA), Int64GetDatum(limit_mb)}, NULL, false, 0);
+			if (ret != SPI_OK_INSERT)
+				ereport(ERROR, (errmsg("[diskquota launcher] cannot insert global_quota_config, error code %d", ret)));
+		}
+	}
+	else
+	{
+		ret = SPI_execute_with_args("delete from diskquota_namespace.global_quota_config where quotatype = $1", 1,
+		                            (Oid[]){INT4OID}, (Datum[]){Int32GetDatum(CLUSTER_QUOTA)}, NULL, false, 0);
+		if (ret != SPI_OK_DELETE)
+			ereport(ERROR, (errmsg("[diskquota launcher] cannot delete global_quota_config, error code %d", ret)));
+	}
+
+	diskquota_set_cluster_limit_mb(limit_mb);
+}
+
+/*
+ * Load the persisted cluster-wide quota into shmem at launcher
+ * startup. Runs in the launcher, connected to the launcher's
+ * database.
+ */
+static void
+load_global_quota_config(void)
+{
+	int   ret;
+	int64 limit_mb = 0;
+
+	StartTransactionCommand();
+	PushActiveSnapshot(GetTransactionSnapshot());
+	ret = SPI_connect();
+	if (ret != SPI_OK_CONNECT)
+		ereport(ERROR, (errmsg("[diskquota launcher] SPI connect error, return code: %d.", ret)));
+	ret = SPI_execute_with_args("select quotalimitmb from diskquota_namespace.global_quota_config where quotatype = $1",
+	                            1, (Oid[]){INT4OID}, (Datum[]){Int32GetDatum(CLUSTER_QUOTA)}, NULL, true, 0);
+	if (ret != SPI_OK_SELECT)
+		ereport(ERROR, (errmsg("[diskquota launcher] cannot select global_quota_config, return code: %d.", ret)));
+	if (SPI_processed == 1)
+	{
+		bool  isnull = true;
+		Datum d      = SPI_getbinval(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 1, &isnull);
+
+		if (!isnull) limit_mb = DatumGetInt64(d);
+	}
+	SPI_finish();
+	PopActiveSnapshot();
+	CommitTransactionCommand();
+
+	diskquota_set_cluster_limit_mb(limit_mb);
+}
+
+/*
+ * Release the bookkeeping of monitored databases that no longer
+ * exist.
+ *
+ * DROP DATABASE does not go through diskquota's DROP EXTENSION
+ * teardown, so a monitored database can vanish while its dbArray
+ * slot, its database_list row and the segment monitor caches live
+ * on. The stale slot keeps the database's last published total_size,
+ * inflating the cluster-wide quota total with data that is gone.
+ * Sweep the slots and tear down each dead one the same way a DROP
+ * EXTENSION message would. Runs in the launcher once per main-loop
+ * pass.
+ */
+static void
+reap_dropped_databases(void)
+{
+	Oid *dead  = palloc(sizeof(Oid) * diskquota_max_monitored_databases);
+	int  ndead = 0;
+
+	/* SearchSysCache in is_valid_dbid requires a transaction */
+	StartTransactionCommand();
+	LWLockAcquire(diskquota_locks.dblist_lock, LW_SHARED);
+	for (int i = 0; i < diskquota_max_monitored_databases; i++)
+	{
+		DiskquotaDBEntry *dbEntry = &DiskquotaLauncherShmem->dbArray[i];
+
+		if (dbEntry->in_use && !is_valid_dbid(dbEntry->dbid)) dead[ndead++] = dbEntry->dbid;
+	}
+	LWLockRelease(diskquota_locks.dblist_lock);
+	CommitTransactionCommand();
+
+	for (int i = 0; i < ndead; i++)
+	{
+		Oid  dbid               = dead[i];
+		bool connected          = false;
+		bool pushed_active_snap = false;
+		bool ret                = true;
+
+		ereport(LOG, (errmsg("[diskquota launcher] database(oid:%u) was dropped, "
+		                     "releasing its diskquota bookkeeping",
+		                     dbid)));
+
+		StartTransactionCommand();
+		/*
+		 * A failure (e.g. a segment is down) must not take the
+		 * launcher out: the slot then stays in use and the next
+		 * loop pass retries the release.
+		 */
+		PG_TRY();
+		{
+			if (SPI_OK_CONNECT != SPI_connect())
+				ereport(ERROR, (errcode(ERRCODE_INTERNAL_ERROR),
+				                errmsg("[diskquota launcher] unable to connect to execute internal query")));
+			connected = true;
+			PushActiveSnapshot(GetTransactionSnapshot());
+			pushed_active_snap = true;
+
+			del_dbid_from_database_list(dbid);
+			release_db_entry(dbid);
+			update_monitor_db_mpp(dbid, REMOVE_DB_FROM_BEING_MONITORED, LAUNCHER_SCHEMA);
+			invalidate_database_rejectmap(dbid);
+		}
+		PG_CATCH();
+		{
+			error_context_stack = NULL;
+			HOLD_INTERRUPTS();
+			EmitErrorReport();
+			FlushErrorState();
+			ret = false;
+			RESUME_INTERRUPTS();
+		}
+		PG_END_TRY();
+		if (connected) SPI_finish();
+		if (pushed_active_snap) PopActiveSnapshot();
+		if (ret)
+		{
+			CommitTransactionCommand();
+			if (num_db > 0) num_db--;
+			if (num_db <= diskquota_max_workers) DiskquotaLauncherShmem->isDynamicWorker = false;
+		}
+		else
+			AbortCurrentTransaction();
+	}
+
+	if (ndead > 0) DisconnectAndDestroyAllGangs(false);
+	pfree(dead);
+}
+
+/*
+ * Cluster-wide quota.
+ *
+ * The cluster quota limit and the per-database totals live in
+ * DiskquotaLauncherShmem, which is only initialized on the
+ * dispatcher; every accessor below degrades to a no-op / zero on
+ * processes where that shmem is absent (segments), so callers may
+ * use them unconditionally.
+ */
+
+/* True when the current process is a diskquota bgworker. */
+bool
+diskquota_am_bgworker(void)
+{
+	return MyWorkerInfo != NULL;
+}
+
+/*
+ * True when the current process is the diskquota launcher. Like the
+ * per-database workers, the launcher runs only diskquota bookkeeping
+ * SQL (diskquota_namespace.database_list on CREATE/DROP EXTENSION,
+ * diskquota_namespace.global_quota_config on set_cluster_quota), so
+ * the object-independent quota checks must not apply to it.
+ */
+bool
+diskquota_am_launcher(void)
+{
+	return am_diskquota_launcher;
+}
+
+void
+diskquota_set_cluster_limit_mb(int64 limit_mb)
+{
+	if (DiskquotaLauncherShmem == NULL) return;
+	pg_atomic_write_u64(&DiskquotaLauncherShmem->cluster_quota_limit_mb, (limit_mb > 0) ? (uint64)limit_mb : 0);
+}
+
+int64
+diskquota_get_cluster_limit_mb(void)
+{
+	if (DiskquotaLauncherShmem == NULL) return 0;
+	return (int64)pg_atomic_read_u64(&DiskquotaLauncherShmem->cluster_quota_limit_mb);
+}
+
+/* Publish the calling worker's database total for the quota checks. */
+void
+diskquota_publish_db_total(int64 total)
+{
+	if (MyWorkerInfo == NULL || MyWorkerInfo->dbEntry == NULL) return;
+	pg_atomic_write_u64(&MyWorkerInfo->dbEntry->total_size, (total > 0) ? (uint64)total : 0);
+}
+
+/* Publish the calling worker's DATABASE_QUOTA limit (0 = unset). */
+void
+diskquota_publish_db_limit(int64 limit_mb)
+{
+	if (MyWorkerInfo == NULL || MyWorkerInfo->dbEntry == NULL) return;
+	pg_atomic_write_u64(&MyWorkerInfo->dbEntry->db_quota_limit_mb, (limit_mb > 0) ? (uint64)limit_mb : 0);
+}
+
+/* Sum of the published totals of all monitored databases. */
+int64
+diskquota_get_cluster_total_size(void)
+{
+	int64 total = 0;
+
+	if (DiskquotaLauncherShmem == NULL || DiskquotaLauncherShmem->dbArray == NULL) return 0;
+	for (int i = 0; i < diskquota_max_monitored_databases; i++)
+	{
+		DiskquotaDBEntry *dbEntry = &DiskquotaLauncherShmem->dbArray[i];
+
+		if (dbEntry->in_use) total += (int64)pg_atomic_read_u64(&dbEntry->total_size);
+	}
+	return total;
+}
+
+/* Set the DATABASE_QUOTA limit of a monitored database (0 = unset). */
+void
+diskquota_set_database_limit_mb(Oid dbid, int64 limit_mb)
+{
+	if (DiskquotaLauncherShmem == NULL || DiskquotaLauncherShmem->dbArray == NULL) return;
+	for (int i = 0; i < diskquota_max_monitored_databases; i++)
+	{
+		DiskquotaDBEntry *dbEntry = &DiskquotaLauncherShmem->dbArray[i];
+
+		if (dbEntry->in_use && dbEntry->dbid == dbid)
+		{
+			pg_atomic_write_u64(&dbEntry->db_quota_limit_mb, (limit_mb > 0) ? (uint64)limit_mb : 0);
+			return;
+		}
+	}
+}
+
+/*
+ * Fetch a monitored database's published total and DATABASE_QUOTA
+ * limit. Returns false when the database has no dbArray slot (not
+ * monitored, or not on the dispatcher).
+ */
+bool
+diskquota_get_database_status(Oid dbid, int64 *total_size, int64 *limit_mb)
+{
+	if (DiskquotaLauncherShmem == NULL || DiskquotaLauncherShmem->dbArray == NULL) return false;
+	for (int i = 0; i < diskquota_max_monitored_databases; i++)
+	{
+		DiskquotaDBEntry *dbEntry = &DiskquotaLauncherShmem->dbArray[i];
+
+		if (dbEntry->in_use && dbEntry->dbid == dbid)
+		{
+			*total_size = (int64)pg_atomic_read_u64(&dbEntry->total_size);
+			*limit_mb   = (int64)pg_atomic_read_u64(&dbEntry->db_quota_limit_mb);
+			return true;
+		}
+	}
+	return false;
+}

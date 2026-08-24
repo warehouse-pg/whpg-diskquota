@@ -70,6 +70,12 @@ PG_FUNCTION_INFO_V1(set_role_tablespace_quota);
 PG_FUNCTION_INFO_V1(set_per_segment_quota);
 PG_FUNCTION_INFO_V1(relation_size_local);
 PG_FUNCTION_INFO_V1(pull_all_table_size);
+PG_FUNCTION_INFO_V1(set_cluster_quota);
+PG_FUNCTION_INFO_V1(cluster_quota_limit_mb);
+PG_FUNCTION_INFO_V1(cluster_total_size);
+PG_FUNCTION_INFO_V1(set_database_quota);
+PG_FUNCTION_INFO_V1(database_quota_limit_mb);
+PG_FUNCTION_INFO_V1(database_total_size);
 
 /* timeout count to wait response from launcher process, in 1/10 sec */
 #define WAIT_TIME_COUNT 1200
@@ -725,6 +731,217 @@ set_schema_quota(PG_FUNCTION_ARGS)
 	set_quota_config_internal(namespaceoid, quota_limit_mb, NAMESPACE_QUOTA, INVALID_SEGRATIO, InvalidOid);
 	SPI_finish();
 	PG_RETURN_VOID();
+}
+
+/*
+ * The cluster quota counts monitored databases only; a database
+ * without the diskquota extension is invisible to the cap. Make that
+ * blind spot explicit to the DBA: list every non-template database
+ * (except the launcher's own bookkeeping database) that is not being
+ * monitored. A warning rather than an error: monitoring may be
+ * intentionally partial, and databases created later are born
+ * unmonitored anyway, so refusing here could not guarantee coverage
+ * either.
+ */
+static void
+warn_unmonitored_databases(void)
+{
+	int            ret;
+	StringInfoData names;
+	int            count = 0;
+
+	SPI_connect();
+	ret = SPI_execute(
+	        "select oid, datname from pg_database where not datistemplate and datname <> 'diskquota' order by datname",
+	        true, 0);
+	if (ret != SPI_OK_SELECT) elog(ERROR, "cannot query pg_database: error code %d", ret);
+
+	initStringInfo(&names);
+	for (uint64 i = 0; i < SPI_processed; i++)
+	{
+		bool  isnull = true;
+		Oid   dbid   = DatumGetObjectId(SPI_getbinval(SPI_tuptable->vals[i], SPI_tuptable->tupdesc, 1, &isnull));
+		char *dbname = SPI_getvalue(SPI_tuptable->vals[i], SPI_tuptable->tupdesc, 2);
+
+		if (isnull || dbname == NULL) continue;
+
+		if (diskquota_is_monitored_dbid(dbid)) continue;
+
+		if (count++ > 0) appendStringInfoString(&names, ", ");
+		appendStringInfoString(&names, dbname);
+	}
+
+	if (count > 0)
+		ereport(WARNING, (errmsg("cluster quota counts monitored databases only; not monitored: %s", names.data),
+		                  errhint("run CREATE EXTENSION diskquota in those databases to include them")));
+	SPI_finish();
+}
+
+/*
+ * Set the cluster-wide disk quota: a cap on the aggregate
+ * size of all monitored databases. The request is forwarded to the
+ * diskquota launcher, which persists the value in
+ * diskquota_namespace.global_quota_config in its own database and
+ * updates the live limit in shmem — so the function may be called
+ * from any database and deletion has one authoritative home. A
+ * negative size deletes the quota.
+ */
+Datum
+set_cluster_quota(PG_FUNCTION_ARGS)
+{
+	int   rc, launcher_pid;
+	char *sizestr;
+	int64 quota_limit_mb;
+
+	if (!superuser())
+	{
+		ereport(ERROR, (errcode(ERRCODE_INSUFFICIENT_PRIVILEGE), errmsg("must be superuser to set disk quota limit")));
+	}
+
+	sizestr        = text_to_cstring(PG_GETARG_TEXT_PP(0));
+	sizestr        = str_tolower(sizestr, strlen(sizestr), DEFAULT_COLLATION_OID);
+	quota_limit_mb = get_size_in_mb(sizestr);
+
+	if (quota_limit_mb == 0)
+	{
+		ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE), errmsg("disk quota can not be set to 0 MB")));
+	}
+	/* the limit travels in the message's int-sized dbid field */
+	if (quota_limit_mb > INT_MAX)
+	{
+		ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+		                errmsg("cluster quota limit larger than %d MB is not supported", INT_MAX)));
+	}
+	if (quota_limit_mb < 0) quota_limit_mb = -1;
+
+	LWLockAcquire(diskquota_locks.extension_ddl_lock, LW_EXCLUSIVE);
+	LWLockAcquire(diskquota_locks.extension_ddl_message_lock, LW_EXCLUSIVE);
+	extension_ddl_message->req_pid = MyProcPid;
+	extension_ddl_message->cmd     = CMD_SET_CLUSTER_QUOTA;
+	extension_ddl_message->result  = ERR_PENDING;
+	extension_ddl_message->dbid    = (int)quota_limit_mb;
+	launcher_pid                   = extension_ddl_message->launcher_pid;
+	rc                             = kill(launcher_pid, SIGUSR2);
+	LWLockRelease(diskquota_locks.extension_ddl_message_lock);
+	if (rc == 0)
+	{
+		int count = WAIT_TIME_COUNT;
+
+		while (count-- > 0)
+		{
+			CHECK_FOR_INTERRUPTS();
+			rc = DiskquotaWaitLatch(&MyProc->procLatch, WL_LATCH_SET | WL_TIMEOUT | WL_POSTMASTER_DEATH, 100L);
+			if (rc & WL_POSTMASTER_DEATH) break;
+			ResetLatch(&MyProc->procLatch);
+
+			ereportif(kill(launcher_pid, 0) == -1 && errno == ESRCH, // do existence check
+			          ERROR,
+			          (errmsg("[diskquota] diskquota launcher pid = %d no longer exists", launcher_pid),
+			           errhint("The diskquota launcher process has been terminated for some reasons. Consider to "
+			                   "restart the cluster to start it.")));
+
+			LWLockAcquire(diskquota_locks.extension_ddl_message_lock, LW_SHARED);
+			if (extension_ddl_message->result != ERR_PENDING)
+			{
+				LWLockRelease(diskquota_locks.extension_ddl_message_lock);
+				break;
+			}
+			LWLockRelease(diskquota_locks.extension_ddl_message_lock);
+		}
+	}
+	LWLockAcquire(diskquota_locks.extension_ddl_message_lock, LW_SHARED);
+	if (extension_ddl_message->result != ERR_OK)
+	{
+		LWLockRelease(diskquota_locks.extension_ddl_message_lock);
+		LWLockRelease(diskquota_locks.extension_ddl_lock);
+		report_ddl_err(extension_ddl_message, "[diskquota] failed to set cluster quota");
+	}
+	LWLockRelease(diskquota_locks.extension_ddl_message_lock);
+	LWLockRelease(diskquota_locks.extension_ddl_lock);
+
+	if (quota_limit_mb > 0) warn_unmonitored_databases();
+	PG_RETURN_VOID();
+}
+
+/*
+ * Set the disk quota for one whole database: all schemas
+ * and roles in it combined. The row persists in the target database's
+ * own quota_config (targetoid = the database oid), which is why the
+ * function must be called while connected to that database. A negative
+ * size deletes the quota.
+ */
+Datum
+set_database_quota(PG_FUNCTION_ARGS)
+{
+	char *dbname;
+	char *sizestr;
+	Oid   dboid;
+	int64 quota_limit_mb;
+
+	if (!superuser())
+	{
+		ereport(ERROR, (errcode(ERRCODE_INSUFFICIENT_PRIVILEGE), errmsg("must be superuser to set disk quota limit")));
+	}
+
+	dbname = text_to_cstring(PG_GETARG_TEXT_PP(0));
+	dboid  = get_database_oid(dbname, false);
+	if (dboid != MyDatabaseId)
+		ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+		                errmsg("set_database_quota() must be called from the target database"),
+		                errhint("connect to \"%s\" and run it there", dbname)));
+
+	sizestr        = text_to_cstring(PG_GETARG_TEXT_PP(1));
+	sizestr        = str_tolower(sizestr, strlen(sizestr), DEFAULT_COLLATION_OID);
+	quota_limit_mb = get_size_in_mb(sizestr);
+
+	if (quota_limit_mb == 0)
+	{
+		ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE), errmsg("disk quota can not be set to 0 MB")));
+	}
+
+	SPI_connect();
+	set_quota_config_internal(dboid, quota_limit_mb, DATABASE_QUOTA, INVALID_SEGRATIO, InvalidOid);
+	SPI_finish();
+
+	/* make the new limit effective immediately, not one naptime later */
+	diskquota_set_database_limit_mb(dboid, quota_limit_mb);
+	PG_RETURN_VOID();
+}
+
+/* Configured quota of the current database in MB; 0 when unset. */
+Datum
+database_quota_limit_mb(PG_FUNCTION_ARGS)
+{
+	int64 total_size = 0;
+	int64 limit_mb   = 0;
+
+	(void)diskquota_get_database_status(MyDatabaseId, &total_size, &limit_mb);
+	PG_RETURN_INT64(limit_mb);
+}
+
+/* Published total size in bytes of the current database. */
+Datum
+database_total_size(PG_FUNCTION_ARGS)
+{
+	int64 total_size = 0;
+	int64 limit_mb   = 0;
+
+	(void)diskquota_get_database_status(MyDatabaseId, &total_size, &limit_mb);
+	PG_RETURN_INT64(total_size);
+}
+
+/* Configured cluster quota in MB; 0 when unset. */
+Datum
+cluster_quota_limit_mb(PG_FUNCTION_ARGS)
+{
+	PG_RETURN_INT64(diskquota_get_cluster_limit_mb());
+}
+
+/* Aggregate size in bytes of all monitored databases. */
+Datum
+cluster_total_size(PG_FUNCTION_ARGS)
+{
+	PG_RETURN_INT64(diskquota_get_cluster_total_size());
 }
 
 /*

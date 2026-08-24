@@ -93,6 +93,26 @@ typedef enum
 	 */
 	TABLESPACE_QUOTA,
 
+	/*
+	 * CLUSTER_QUOTA
+	 * caps the aggregate disk usage of all monitored databases
+	 *. Stored in `quota_config` with targetoid =
+	 * InvalidOid. It has no per-object key, so it never enters
+	 * quota_info_map; the limit and the aggregate usage live in
+	 * DiskquotaLauncherShmem instead.
+	 */
+	CLUSTER_QUOTA,
+
+	/*
+	 * DATABASE_QUOTA
+	 * caps the total disk usage of one database (all schemas and
+	 * roles combined). Stored in that database's own `quota_config`
+	 * with targetoid = the database oid; like CLUSTER_QUOTA it has
+	 * no entry in quota_info_map — the limit lives in the launcher
+	 * shmem dbArray slot of the database.
+	 */
+	DATABASE_QUOTA,
+
 	NUM_QUOTA_TYPES,
 } QuotaType;
 
@@ -172,6 +192,15 @@ enum MessageCommand
 {
 	CMD_CREATE_EXTENSION = 1,
 	CMD_DROP_EXTENSION,
+
+	/*
+	 * Set or delete the cluster-wide quota. The message's dbid field
+	 * carries the limit in MB (negative = delete). Handled by the
+	 * launcher so that the value persists in
+	 * diskquota_namespace.global_quota_config in the launcher's
+	 * database, independent of which database the setter ran in.
+	 */
+	CMD_SET_CLUSTER_QUOTA,
 };
 
 enum MessageResult
@@ -222,6 +251,12 @@ typedef struct
 	DiskquotaDBEntry *dbArrayTail;
 	volatile bool     isDynamicWorker;
 	/*
+	 * Cluster-wide quota limit in MB; 0 means no cluster quota is
+	 * configured. Written by set_cluster_quota() and by workers
+	 * reloading quota_config.
+	 */
+	pg_atomic_uint64 cluster_quota_limit_mb;
+	/*
 	DiskQuotaWorkerEntry worker[diskquota_max_workers]; // the hidden memory to store WorkerEntry
 	DiskquotaDBEntry     dbentry[diskquota_max_monitored_databases]; // the hidden memory for dbentry
 	*/
@@ -243,6 +278,20 @@ struct DiskquotaDBEntry
 	bool in_use; // this slot is in using. AKA dbid != 0
 
 	TimestampTz last_log_time; // the last time log current database info.
+
+	/*
+	 * Total on-disk size of this database (sum over all segments),
+	 * published by its worker once per refresh loop. Input to the
+	 * cluster-wide and per-database quota checks.
+	 */
+	pg_atomic_uint64 total_size;
+
+	/*
+	 * DATABASE_QUOTA limit for this database in MB; 0 means no
+	 * database quota is configured. Written by set_database_quota()
+	 * and refreshed by the database's worker from quota_config.
+	 */
+	pg_atomic_uint64 db_quota_limit_mb;
 };
 
 typedef enum MonitorDBStatus
@@ -301,6 +350,7 @@ extern Oid      diskquota_parse_primary_table_oid(Oid namespace, char *relname);
 extern bool         worker_increase_epoch(Oid dbid);
 extern unsigned int worker_get_epoch(Oid dbid);
 extern bool         diskquota_is_paused(void);
+extern bool         diskquota_is_monitored_dbid(Oid dbid);
 extern bool         do_check_diskquota_state_is_ready(void);
 extern bool         diskquota_is_readiness_logged(void);
 extern void         diskquota_set_readiness_logged(void);
@@ -316,4 +366,15 @@ extern HTAB        *diskquota_hash_create(const char *tabname, long nelem, HASHC
 extern HTAB *DiskquotaShmemInitHash(const char *name, long init_size, long max_size, HASHCTL *infoP, int hash_flags,
                                     DiskquotaHashFunction hash_function);
 extern void  refresh_monitored_dbid_cache(void);
+
+/* cluster-wide and per-database quota */
+extern bool  diskquota_am_bgworker(void);
+extern bool  diskquota_am_launcher(void);
+extern void  diskquota_set_cluster_limit_mb(int64 limit_mb);
+extern int64 diskquota_get_cluster_limit_mb(void);
+extern void  diskquota_publish_db_total(int64 total);
+extern void  diskquota_publish_db_limit(int64 limit_mb);
+extern int64 diskquota_get_cluster_total_size(void);
+extern void  diskquota_set_database_limit_mb(Oid dbid, int64 limit_mb);
+extern bool  diskquota_get_database_status(Oid dbid, int64 *total_size, int64 *limit_mb);
 #endif
