@@ -18,6 +18,32 @@ SELECT diskquota.wait_for_worker_new_epoch();
 INSERT INTO cdq_t VALUES (1, 'x');
 -- reads still work
 SELECT count(*) FROM cdq_t;
+
+-- === launcher exemption: the cap must not wedge its own controls ===
+-- raising the quota while over the cap must work: the launcher's
+-- write to its global config table is exempt from the cap it manages
+SELECT diskquota.set_cluster_quota('1 GB');
+SELECT diskquota.cluster_quota_limit_mb();
+SELECT diskquota.wait_for_worker_new_epoch();
+-- writes resume under the raised cap
+INSERT INTO cdqschema.cdq_t VALUES (1, 'x');
+-- lower it back under current usage; the cap bites again
+SELECT diskquota.set_cluster_quota('10 MB');
+SELECT diskquota.wait_for_worker_new_epoch();
+-- expect fail: over the lowered cap again
+INSERT INTO cdqschema.cdq_t VALUES (1, 'x');
+-- a new database can start being monitored while the cluster is over
+-- the cap: CREATE EXTENSION goes through the launcher's bookkeeping
+CREATE DATABASE cdq_join;
+\c cdq_join
+CREATE EXTENSION diskquota;
+SELECT diskquota.wait_for_worker_new_epoch();
+DROP EXTENSION diskquota;
+\c contrib_regression
+SET search_path TO cdqschema;
+SELECT diskquota.wait_for_worker_new_epoch();
+DROP DATABASE cdq_join;
+
 -- delete the cluster quota; writes resume
 SELECT diskquota.set_cluster_quota('-1');
 SELECT diskquota.wait_for_worker_new_epoch();

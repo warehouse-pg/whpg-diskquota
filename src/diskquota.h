@@ -368,6 +368,7 @@ extern void  refresh_monitored_dbid_cache(void);
 
 /* cluster-wide and per-database quota (PTT-1563) */
 extern bool  diskquota_am_bgworker(void);
+extern bool  diskquota_am_launcher(void);
 extern void  diskquota_set_cluster_limit_mb(int64 limit_mb);
 extern int64 diskquota_get_cluster_limit_mb(void);
 extern void  diskquota_publish_db_total(int64 total);

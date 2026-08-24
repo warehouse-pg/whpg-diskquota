@@ -86,6 +86,9 @@ ExtensionDDLMessage *extension_ddl_message = NULL;
 // a pointer to DiskquotaLauncherShmem->workerEntries in shared memory
 static DiskQuotaWorkerEntry *volatile MyWorkerInfo = NULL;
 
+// True only in the diskquota launcher process; see diskquota_am_launcher().
+static bool am_diskquota_launcher = false;
+
 // how many database diskquota are monitoring on
 static int num_db = 0;
 
@@ -727,6 +730,8 @@ disk_quota_launcher_main(Datum main_arg)
 	{
 		proc_exit(0);
 	}
+
+	am_diskquota_launcher = true;
 
 	MemoryContextSwitchTo(TopMemoryContext);
 	init_bgworker_handles();
@@ -2151,6 +2156,19 @@ bool
 diskquota_am_bgworker(void)
 {
 	return MyWorkerInfo != NULL;
+}
+
+/*
+ * True when the current process is the diskquota launcher. Like the
+ * per-database workers, the launcher runs only diskquota bookkeeping
+ * SQL (diskquota_namespace.database_list on CREATE/DROP EXTENSION,
+ * diskquota_namespace.global_quota_config on set_cluster_quota), so
+ * the object-independent quota checks must not apply to it.
+ */
+bool
+diskquota_am_launcher(void)
+{
+	return am_diskquota_launcher;
 }
 
 void

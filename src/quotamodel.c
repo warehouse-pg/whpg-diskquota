@@ -1789,12 +1789,13 @@ check_rejectmap_by_reloid(Oid reloid)
 
 	/*
 	 * The object-independent quotas match every relation; spare
-	 * diskquota's own bookkeeping, catalog relations and the diskquota
-	 * workers, or usage could never be recorded as decreasing once the
-	 * cap is hit (see refresh_rejectmap()). Resolved before taking the
-	 * lock: get_namespace_oid() may read the catalog.
+	 * diskquota's own processes (workers and the launcher), catalog
+	 * relations and diskquota's bookkeeping schema, or usage could
+	 * never be recorded as decreasing once the cap is hit (see
+	 * refresh_rejectmap()). Resolved before taking the lock:
+	 * get_namespace_oid() may read the catalog.
 	 */
-	bool objectwide_exempt = diskquota_am_bgworker() || nsOid == PG_CATALOG_NAMESPACE ||
+	bool objectwide_exempt = diskquota_am_bgworker() || diskquota_am_launcher() || nsOid == PG_CATALOG_NAMESPACE ||
 	                         nsOid == get_namespace_oid("diskquota", true /*missing_ok*/);
 
 	LWLockAcquire(diskquota_locks.reject_map_lock, LW_SHARED);
@@ -1832,11 +1833,14 @@ quota_check_common(Oid reloid, RelFileNode *relfilenode)
 	 * Cluster-wide quota: reject the write when the aggregate size of
 	 * all monitored databases exceeds the configured cap. Runs on the
 	 * dispatcher only (the aggregate lives in launcher shmem there).
-	 * diskquota's own workers are exempt: they must be able to keep
-	 * maintaining diskquota.table_size, or the aggregate could never
-	 * decrease again after the cap is hit.
+	 * diskquota's own processes are exempt: the workers must be able
+	 * to keep maintaining diskquota.table_size, or the aggregate could
+	 * never decrease again after the cap is hit, and the launcher must
+	 * be able to write its bookkeeping tables, or the cap could never
+	 * be raised (set_cluster_quota) and no new database could be
+	 * monitored (CREATE EXTENSION) while the cluster is over quota.
 	 */
-	if (OidIsValid(reloid) && IS_QUERY_DISPATCHER() && !diskquota_am_bgworker())
+	if (OidIsValid(reloid) && IS_QUERY_DISPATCHER() && !diskquota_am_bgworker() && !diskquota_am_launcher())
 	{
 		int64 db_total    = 0;
 		int64 db_limit_mb = 0;
