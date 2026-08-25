@@ -1,0 +1,45 @@
+-- Guard the mixed-GUC rejectmap wedge: an entry dispatched to the
+-- segments while hard_limit was on must be withdrawn when its quota
+-- is deleted, even if the coordinator has meanwhile turned
+-- hard_limit off and the segments have not seen the change yet
+-- (partial reload). The worker dispatches entry REMOVALS regardless
+-- of its own copy of the GUC; without that, the segments would keep
+-- rejecting on the deleted quota until their next reload.
+
+-- hard_limit on everywhere
+!\retcode gpconfig -c "diskquota.hard_limit" -v "on" > /dev/null;
+!\retcode gpstop -u > /dev/null;
+
+1: CREATE SCHEMA mixed_s;
+1: SELECT diskquota.set_schema_quota('mixed_s', '1 MB');
+1: SELECT diskquota.wait_for_worker_new_epoch();
+-- exceed the quota; the worker dispatches a rejectmap entry
+1: CREATE TABLE mixed_s.t1 AS SELECT generate_series(1, 100000) DISTRIBUTED BY (generate_series);
+1: SELECT diskquota.wait_for_worker_new_epoch();
+1: SELECT diskquota.wait_for_worker_new_epoch();
+-- the entry reached the segments
+1: SELECT count(*) > 0 AS entry_on_segments FROM gp_dist_random('diskquota.rejectmap');
+-- expect fail: hardlimit rejects new relations of the schema
+1: CREATE TABLE mixed_s.t2 AS SELECT generate_series(1, 100) DISTRIBUTED BY (generate_series);
+
+-- turn hard_limit off on the COORDINATOR ONLY: gpconfig writes every
+-- config file, but only the coordinator postmaster is reloaded. The
+-- segments keep their in-memory hard_limit=on and keep enforcing
+-- whatever rejectmap they last received.
+!\retcode gpconfig -c "diskquota.hard_limit" -v "off" > /dev/null;
+!\retcode pg_ctl -D $MASTER_DATA_DIRECTORY reload > /dev/null;
+
+-- delete the quota; the removal must still reach the segments
+1: SELECT diskquota.set_schema_quota('mixed_s', '-1');
+1: SELECT diskquota.wait_for_worker_new_epoch();
+1: SELECT diskquota.wait_for_worker_new_epoch();
+1: SELECT count(*) AS entries_left_on_segments FROM gp_dist_random('diskquota.rejectmap');
+-- writes to the previously blocked relation resume: its stale
+-- relfilenode entries would otherwise still be enforced by the
+-- segments, which run with hard_limit=on
+1: INSERT INTO mixed_s.t1 SELECT generate_series(1, 100000);
+1: DROP SCHEMA mixed_s CASCADE;
+1q:
+
+-- reload the segments too: hard_limit off everywhere again
+!\retcode gpstop -u > /dev/null;
