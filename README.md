@@ -18,6 +18,17 @@ Both follow the same soft-limit semantics as schema and role quotas, and
 both cooperate with `diskquota.hard_limit` to cancel in-flight queries
 that push past the cap.
 
+To downgrade to 2.3, follow this order in every database:
+delete the 2.4-only quotas first (`select
+diskquota.set_database_quota('<db>', '-1')` and `select
+diskquota.set_cluster_quota('-1')`), then point
+`shared_preload_libraries` back at `diskquota-2.3` and restart, then
+run `ALTER EXTENSION diskquota UPDATE TO '2.3'`. The 2.3 worker
+does not understand the 2.4-only quota rows and hits undefined
+behavior on every refresh cycle if any still exist when it boots;
+the DDL script deletes leftovers as a safety net, but it can only
+run after the flip, which is too late to protect the first refresh.
+
 After a cluster restart the caps re-arm within about one
 `diskquota.naptime`: limits reload and each worker republishes its
 database's size on its first loop. Writes in that brief window are

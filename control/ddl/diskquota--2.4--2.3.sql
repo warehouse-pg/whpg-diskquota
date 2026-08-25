@@ -1,4 +1,9 @@
 -- remove objects introduced in 2.4
+-- The 2.3 worker feeds every quota_config row into a lookup indexed
+-- by quotatype and only knows types 0..4; a leftover CLUSTER_QUOTA(5)
+-- or DATABASE_QUOTA(6) row would make it read past that lookup on
+-- every refresh. Delete them before 2.3 can ever see the table.
+DELETE FROM diskquota.quota_config WHERE quotatype IN (5, 6);
 DROP VIEW IF EXISTS diskquota.show_cluster_quota_view;
 DROP VIEW IF EXISTS diskquota.show_database_quota_view;
 DROP FUNCTION IF EXISTS diskquota.set_cluster_quota(text);
