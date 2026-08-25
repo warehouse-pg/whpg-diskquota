@@ -1,0 +1,12 @@
+test: 2.4_install
+test: 2.4_set_quota
+test: 2.4_catalog
+# downgrade removes the 2.4-only quotas through the API first (the
+# boot guard forbids loading the 2.3 library before the preload flip,
+# so the DDL script cannot run early): the 2.3 worker must never see
+# the 2.4-only quota_config rows
+test: 2.4_downgrade_to_version_2.3
+test: 2.3_catalog
+# run 2.4 behavior test using 2.3 DDL and binary
+test: 2.4_test_in_2.3_quota_create_in_2.4
+test: 2.4_cleanup_quota
