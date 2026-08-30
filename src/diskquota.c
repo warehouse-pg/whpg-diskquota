@@ -1893,6 +1893,8 @@ static void
 release_db_entry(Oid dbid)
 {
 	DiskquotaDBEntry *db = NULL;
+
+	LWLockAcquire(diskquota_locks.dblist_lock, LW_EXCLUSIVE);
 	for (int i = 0; i < diskquota_max_monitored_databases; i++)
 	{
 		DiskquotaDBEntry *dbEntry = &DiskquotaLauncherShmem->dbArray[i];
@@ -1904,10 +1906,10 @@ release_db_entry(Oid dbid)
 	}
 	if (db == NULL)
 	{
+		LWLockRelease(diskquota_locks.dblist_lock);
 		return;
 	}
 
-	LWLockAcquire(diskquota_locks.dblist_lock, LW_EXCLUSIVE);
 	if (db->workerId != INVALID_WORKER_ID)
 	{
 		BackgroundWorkerHandle *handle = get_bgworker_handle(db->workerId);
@@ -2209,9 +2211,7 @@ reap_dropped_databases(void)
 			pushed_active_snap = true;
 
 			del_dbid_from_database_list(dbid);
-			release_db_entry(dbid);
 			update_monitor_db_mpp(dbid, REMOVE_DB_FROM_BEING_MONITORED, LAUNCHER_SCHEMA);
-			invalidate_database_rejectmap(dbid);
 		}
 		PG_CATCH();
 		{
@@ -2228,6 +2228,13 @@ reap_dropped_databases(void)
 		if (ret)
 		{
 			CommitTransactionCommand();
+			/*
+			 * Release the shmem slot only after the transactional steps
+			 * committed: when the sweep aborts, the slot stays in_use so
+			 * the next pass retries the whole release.
+			 */
+			release_db_entry(dbid);
+			invalidate_database_rejectmap(dbid);
 			if (num_db > 0) num_db--;
 			if (num_db <= diskquota_max_workers) DiskquotaLauncherShmem->isDynamicWorker = false;
 		}
@@ -2283,20 +2290,39 @@ diskquota_get_cluster_limit_mb(void)
 	return (int64)pg_atomic_read_u64(&DiskquotaLauncherShmem->cluster_quota_limit_mb);
 }
 
-/* Publish the calling worker's database total for the quota checks. */
+/*
+ * Publish the calling worker's database total for the quota checks.
+ *
+ * The slot can be released (DROP EXTENSION, the dropped-database sweep)
+ * and rebound to another database while a refresh is in flight, so the
+ * binding is revalidated under dblist_lock before every write.
+ */
 void
 diskquota_publish_db_total(int64 total)
 {
-	if (MyWorkerInfo == NULL || MyWorkerInfo->dbEntry == NULL) return;
-	pg_atomic_write_u64(&MyWorkerInfo->dbEntry->total_size, (total > 0) ? (uint64)total : 0);
+	DiskquotaDBEntry *dbEntry = (MyWorkerInfo != NULL) ? MyWorkerInfo->dbEntry : NULL;
+
+	if (dbEntry == NULL) return;
+	LWLockAcquire(diskquota_locks.dblist_lock, LW_SHARED);
+	if (dbEntry->in_use && dbEntry->dbid == MyDatabaseId)
+		pg_atomic_write_u64(&dbEntry->total_size, (total > 0) ? (uint64)total : 0);
+	LWLockRelease(diskquota_locks.dblist_lock);
 }
 
-/* Publish the calling worker's DATABASE_QUOTA limit (0 = unset). */
+/*
+ * Publish the calling worker's DATABASE_QUOTA limit (0 = unset).
+ * Same slot-binding rule as diskquota_publish_db_total().
+ */
 void
 diskquota_publish_db_limit(int64 limit_mb)
 {
-	if (MyWorkerInfo == NULL || MyWorkerInfo->dbEntry == NULL) return;
-	pg_atomic_write_u64(&MyWorkerInfo->dbEntry->db_quota_limit_mb, (limit_mb > 0) ? (uint64)limit_mb : 0);
+	DiskquotaDBEntry *dbEntry = (MyWorkerInfo != NULL) ? MyWorkerInfo->dbEntry : NULL;
+
+	if (dbEntry == NULL) return;
+	LWLockAcquire(diskquota_locks.dblist_lock, LW_SHARED);
+	if (dbEntry->in_use && dbEntry->dbid == MyDatabaseId)
+		pg_atomic_write_u64(&dbEntry->db_quota_limit_mb, (limit_mb > 0) ? (uint64)limit_mb : 0);
+	LWLockRelease(diskquota_locks.dblist_lock);
 }
 
 /* Sum of the published totals of all monitored databases. */
@@ -2306,12 +2332,15 @@ diskquota_get_cluster_total_size(void)
 	int64 total = 0;
 
 	if (DiskquotaLauncherShmem == NULL || DiskquotaLauncherShmem->dbArray == NULL) return 0;
+	/* dblist_lock keeps slot rebinding out of the scan (dbid/in_use are plain fields) */
+	LWLockAcquire(diskquota_locks.dblist_lock, LW_SHARED);
 	for (int i = 0; i < diskquota_max_monitored_databases; i++)
 	{
 		DiskquotaDBEntry *dbEntry = &DiskquotaLauncherShmem->dbArray[i];
 
 		if (dbEntry->in_use) total += (int64)pg_atomic_read_u64(&dbEntry->total_size);
 	}
+	LWLockRelease(diskquota_locks.dblist_lock);
 	return total;
 }
 
@@ -2320,6 +2349,7 @@ void
 diskquota_set_database_limit_mb(Oid dbid, int64 limit_mb)
 {
 	if (DiskquotaLauncherShmem == NULL || DiskquotaLauncherShmem->dbArray == NULL) return;
+	LWLockAcquire(diskquota_locks.dblist_lock, LW_SHARED);
 	for (int i = 0; i < diskquota_max_monitored_databases; i++)
 	{
 		DiskquotaDBEntry *dbEntry = &DiskquotaLauncherShmem->dbArray[i];
@@ -2327,9 +2357,10 @@ diskquota_set_database_limit_mb(Oid dbid, int64 limit_mb)
 		if (dbEntry->in_use && dbEntry->dbid == dbid)
 		{
 			pg_atomic_write_u64(&dbEntry->db_quota_limit_mb, (limit_mb > 0) ? (uint64)limit_mb : 0);
-			return;
+			break;
 		}
 	}
+	LWLockRelease(diskquota_locks.dblist_lock);
 }
 
 /*
@@ -2340,7 +2371,10 @@ diskquota_set_database_limit_mb(Oid dbid, int64 limit_mb)
 bool
 diskquota_get_database_status(Oid dbid, int64 *total_size, int64 *limit_mb)
 {
+	bool found = false;
+
 	if (DiskquotaLauncherShmem == NULL || DiskquotaLauncherShmem->dbArray == NULL) return false;
+	LWLockAcquire(diskquota_locks.dblist_lock, LW_SHARED);
 	for (int i = 0; i < diskquota_max_monitored_databases; i++)
 	{
 		DiskquotaDBEntry *dbEntry = &DiskquotaLauncherShmem->dbArray[i];
@@ -2349,8 +2383,10 @@ diskquota_get_database_status(Oid dbid, int64 *total_size, int64 *limit_mb)
 		{
 			*total_size = (int64)pg_atomic_read_u64(&dbEntry->total_size);
 			*limit_mb   = (int64)pg_atomic_read_u64(&dbEntry->db_quota_limit_mb);
-			return true;
+			found       = true;
+			break;
 		}
 	}
-	return false;
+	LWLockRelease(diskquota_locks.dblist_lock);
+	return found;
 }
