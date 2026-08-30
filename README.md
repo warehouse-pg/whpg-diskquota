@@ -279,6 +279,12 @@ select diskquota.set_cluster_quota('100 GB');
 select diskquota.set_cluster_quota('-1');
 ```
 
+Note: the quota views below report the size diskquota tracks and enforces
+(the sum of diskquota.table_size -- user relations and their auxiliaries).
+show_fast_database_size_view additionally includes the system-catalog size,
+so it reads slightly larger for the same database; size database/cluster
+quotas from the quota views.
+
 5. Show quota limits and current usage
 ```
 select * from diskquota.show_fast_schema_quota_view;

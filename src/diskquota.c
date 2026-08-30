@@ -1294,6 +1294,9 @@ do_process_extension_ddl_message(MessageResult *code, ExtensionDDLMessage local_
 					/* clear the out-of-quota rejectmap in shared memory */
 					invalidate_database_rejectmap(dbid);
 					break;
+				case CMD_SET_CLUSTER_QUOTA:
+					/* handled entirely before commit; no segment-side state to update */
+					break;
 				default:
 					ereport(LOG, (errmsg("[diskquota launcher]:received unsupported message cmd=%d",
 					                     local_extension_ddl_message.cmd)));

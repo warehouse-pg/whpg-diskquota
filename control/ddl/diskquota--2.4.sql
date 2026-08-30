@@ -325,6 +325,10 @@ CREATE FUNCTION diskquota.cluster_total_size() RETURNS bigint STRICT AS '$libdir
 CREATE FUNCTION diskquota.database_quota_limit_mb() RETURNS bigint STRICT AS '$libdir/diskquota-2.4.so' LANGUAGE C;
 CREATE FUNCTION diskquota.database_total_size() RETURNS bigint STRICT AS '$libdir/diskquota-2.4.so' LANGUAGE C;
 
+-- The quota views report the size diskquota tracks and enforces: the sum
+-- of diskquota.table_size (user relations and their toast/AO auxiliaries).
+-- Unlike show_fast_database_size_view they do not include the system
+-- catalog term, so they read slightly smaller for the same database.
 CREATE VIEW diskquota.show_cluster_quota_view AS
 SELECT
   diskquota.cluster_quota_limit_mb() AS quota_in_mb,

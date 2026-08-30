@@ -848,7 +848,11 @@ refresh_disk_quota_usage(bool is_init)
 		{
 			int64 db_total = 0;
 			int64 db_limit_mb, cluster_limit_mb;
-			int   sret = SPI_execute("select sum(size)::bigint from diskquota.table_size where segid = -1", true, 0);
+			/*
+			 * read_only=false: take a fresh snapshot so the sum sees the
+			 * rows flush_to_table_size() wrote earlier in this transaction.
+			 */
+			int   sret = SPI_execute("select sum(size)::bigint from diskquota.table_size where segid = -1", false, 0);
 
 			if (sret == SPI_OK_SELECT && SPI_processed == 1)
 			{
@@ -1856,6 +1860,16 @@ quota_check_common(Oid reloid, RelFileNode *relfilenode)
 		Oid   ownerOid = InvalidOid, nsOid = InvalidOid, spcOid = InvalidOid;
 
 		/*
+		 * Read the configured limits first: they are two cheap shmem
+		 * reads, and when neither object-independent quota is set (the
+		 * common case) the catalog lookups below would be pure
+		 * per-write overhead.
+		 */
+		limit_mb = diskquota_get_cluster_limit_mb();
+		(void)diskquota_get_database_status(MyDatabaseId, &db_total, &db_limit_mb);
+		if (db_limit_mb <= 0 && limit_mb <= 0) return check_rejectmap_by_reloid(reloid);
+
+		/*
 		 * The object-independent quotas cover every relation, so they
 		 * must spare catalog relations and diskquota's own bookkeeping
 		 * (diskquota.table_size etc.): blocking those would prevent
@@ -1868,8 +1882,7 @@ quota_check_common(Oid reloid, RelFileNode *relfilenode)
 		    nsOid == get_namespace_oid("diskquota", true /*missing_ok*/))
 			return check_rejectmap_by_reloid(reloid);
 
-		if (diskquota_get_database_status(MyDatabaseId, &db_total, &db_limit_mb) && db_limit_mb > 0 &&
-		    db_total >= db_limit_mb * (int64)(1 << 20))
+		if (db_limit_mb > 0 && db_total >= db_limit_mb * (int64)(1 << 20))
 			ereport(ERROR,
 			        (errcode(ERRCODE_DISK_FULL),
 			         errmsg("database's disk space quota exceeded with name: %s", get_database_name(MyDatabaseId)),
@@ -1877,7 +1890,6 @@ quota_check_common(Oid reloid, RelFileNode *relfilenode)
 			                 " MB; free disk space or raise diskquota.set_database_quota()",
 			                 db_total / (1 << 20), db_limit_mb)));
 
-		limit_mb = diskquota_get_cluster_limit_mb();
 		if (limit_mb > 0)
 		{
 			int64 total = diskquota_get_cluster_total_size();
@@ -2455,6 +2467,12 @@ show_rejectmap(PG_FUNCTION_ARGS)
 				break;
 			case NAMESPACE_TABLESPACE_QUOTA:
 				StrNCpy(targettype_str, "NAMESPACE_TABLESPACE_QUOTA", _TARGETTYPE_STR_SIZE);
+				break;
+			case CLUSTER_QUOTA:
+				StrNCpy(targettype_str, "CLUSTER_QUOTA", _TARGETTYPE_STR_SIZE);
+				break;
+			case DATABASE_QUOTA:
+				StrNCpy(targettype_str, "DATABASE_QUOTA", _TARGETTYPE_STR_SIZE);
 				break;
 			default:
 				StrNCpy(targettype_str, "UNKNOWN", _TARGETTYPE_STR_SIZE);

@@ -798,6 +798,17 @@ set_cluster_quota(PG_FUNCTION_ARGS)
 		ereport(ERROR, (errcode(ERRCODE_INSUFFICIENT_PRIVILEGE), errmsg("must be superuser to set disk quota limit")));
 	}
 
+	/*
+	 * The launcher persists the change in its own transaction, so a
+	 * ROLLBACK in the caller would not undo it: refuse to run inside
+	 * an explicit transaction block.
+	 */
+#if GP_VERSION_NUM < 70000
+	PreventTransactionChain(true, "diskquota.set_cluster_quota()");
+#else
+	PreventInTransactionBlock(true, "diskquota.set_cluster_quota()");
+#endif
+
 	sizestr        = text_to_cstring(PG_GETARG_TEXT_PP(0));
 	sizestr        = str_tolower(sizestr, strlen(sizestr), DEFAULT_COLLATION_OID);
 	quota_limit_mb = get_size_in_mb(sizestr);
@@ -884,7 +895,7 @@ set_database_quota(PG_FUNCTION_ARGS)
 	}
 
 	dbname = text_to_cstring(PG_GETARG_TEXT_PP(0));
-	dboid  = get_database_oid(dbname, false);
+	dboid  = __get_oid_auto_case_convert(get_database_oid, dbname);
 	if (dboid != MyDatabaseId)
 		ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 		                errmsg("set_database_quota() must be called from the target database"),
@@ -897,6 +908,12 @@ set_database_quota(PG_FUNCTION_ARGS)
 	if (quota_limit_mb == 0)
 	{
 		ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE), errmsg("disk quota can not be set to 0 MB")));
+	}
+	/* keep quota_limit_mb * (1 << 20) inside int64; same cap as the cluster quota */
+	if (quota_limit_mb > INT_MAX)
+	{
+		ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+		                errmsg("database quota limit larger than %d MB is not supported", INT_MAX)));
 	}
 
 	SPI_connect();

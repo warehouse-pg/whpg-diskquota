@@ -148,6 +148,17 @@ FROM diskquota.show_cluster_quota_view;
 SELECT diskquota.wait_for_worker_new_epoch();
 INSERT INTO cdqschema.cdq_t2 VALUES (5, 'x');
 
+-- === setter input validation ===
+-- expect fail: the limit would overflow the internal byte computation
+SELECT diskquota.set_database_quota(current_database()::text, '10000000000000 MB');
+-- expect fail: same cap on the cluster quota
+SELECT diskquota.set_cluster_quota('10000000000000 MB');
+-- expect fail: set_cluster_quota persists outside the caller's
+-- transaction, so it refuses to run inside an explicit block
+BEGIN;
+SELECT diskquota.set_cluster_quota('100 MB');
+ROLLBACK;
+
 SELECT diskquota.set_cluster_quota('-1');
 SELECT diskquota.wait_for_worker_new_epoch();
 DROP TABLE cdqschema.cdq_t2;
