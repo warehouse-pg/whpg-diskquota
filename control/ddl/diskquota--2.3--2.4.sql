@@ -62,3 +62,15 @@ SELECT
   current_database() AS database_name,
   diskquota.database_quota_limit_mb() AS quota_in_mb,
   diskquota.database_total_size() AS total_size_in_bytes;
+
+-- Downgrade preparation: run in EVERY monitored database before
+-- switching shared_preload_libraries back to diskquota-2.3. The 2.3
+-- worker crashes on quota_config rows with quotatype > 4, and a
+-- leftover cluster cap in diskquota_namespace.global_quota_config
+-- would silently re-arm on a later upgrade back to 2.4.
+CREATE FUNCTION diskquota.prepare_downgrade() RETURNS void AS $$
+BEGIN
+	DELETE FROM diskquota.quota_config WHERE quotatype IN (5, 6);
+	PERFORM diskquota.set_cluster_quota('-1');
+END;
+$$ LANGUAGE plpgsql;

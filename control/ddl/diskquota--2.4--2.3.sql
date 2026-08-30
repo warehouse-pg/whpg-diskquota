@@ -6,6 +6,7 @@
 DELETE FROM diskquota.quota_config WHERE quotatype IN (5, 6);
 DROP VIEW IF EXISTS diskquota.show_cluster_quota_view;
 DROP VIEW IF EXISTS diskquota.show_database_quota_view;
+DROP FUNCTION IF EXISTS diskquota.prepare_downgrade();
 DROP FUNCTION IF EXISTS diskquota.set_cluster_quota(text);
 DROP FUNCTION IF EXISTS diskquota.set_database_quota(text, text);
 DROP FUNCTION IF EXISTS diskquota.cluster_quota_limit_mb();

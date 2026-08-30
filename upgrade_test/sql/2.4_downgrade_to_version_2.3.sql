@@ -1,12 +1,13 @@
 \c
--- Remove the 2.4-only quotas through the API while 2.4 is still
--- loaded: the 2.3 worker must never see quota_config rows with
--- quotatype > 4. (The 2.4--2.3 DDL script also deletes such rows as
--- a safety net, but it can only run after the binary flip, and by
--- then a leftover row would already reach the 2.3 worker.)
-select diskquota.set_database_quota(current_database()::text, '-1');
+-- Prepare the downgrade while 2.4 is still loaded: the helper removes
+-- this database's 2.4-only quota rows (the 2.3 worker must never see
+-- quotatype > 4) and drops the cluster cap from the launcher's
+-- global_quota_config, which a plain per-database cleanup would leave
+-- behind to re-arm on a later upgrade. (The 2.4--2.3 DDL script also
+-- deletes leftover rows as a safety net, but it runs after the binary
+-- flip -- too late to protect the 2.3 worker's first refresh.)
 set client_min_messages = error;
-select diskquota.set_cluster_quota('-1');
+select diskquota.prepare_downgrade();
 reset client_min_messages;
 select count(*) as new_scope_rows_before_flip from diskquota.quota_config where quotatype in (5, 6);
 
