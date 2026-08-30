@@ -357,6 +357,28 @@ BEGIN;
 SELECT diskquota.set_cluster_quota('100 MB');
 ERROR:  diskquota.set_cluster_quota() cannot run inside a transaction block
 ROLLBACK;
+-- a rolled-back database-quota set must never reach enforcement: the
+-- worker is the only publisher of limits to shared memory
+BEGIN;
+SELECT diskquota.set_database_quota(current_database()::text, '1 MB');
+ set_database_quota 
+--------------------
+ 
+(1 row)
+
+ROLLBACK;
+SELECT diskquota.wait_for_worker_new_epoch();
+ wait_for_worker_new_epoch 
+---------------------------
+ t
+(1 row)
+
+SELECT diskquota.database_quota_limit_mb();
+ database_quota_limit_mb 
+-------------------------
+                       0
+(1 row)
+
 SELECT diskquota.set_cluster_quota('-1');
  set_cluster_quota 
 -------------------

@@ -920,8 +920,12 @@ set_database_quota(PG_FUNCTION_ARGS)
 	set_quota_config_internal(dboid, quota_limit_mb, DATABASE_QUOTA, INVALID_SEGRATIO, InvalidOid);
 	SPI_finish();
 
-	/* make the new limit effective immediately, not one naptime later */
-	diskquota_set_database_limit_mb(dboid, quota_limit_mb);
+	/*
+	 * The worker is the only publisher of the limit to shared memory:
+	 * it republishes from quota_config once per naptime, so the change
+	 * takes effect within one cycle and a rolled-back change never
+	 * leaks into enforcement.
+	 */
 	PG_RETURN_VOID();
 }
 

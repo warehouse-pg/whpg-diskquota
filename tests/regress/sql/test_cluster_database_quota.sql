@@ -158,6 +158,13 @@ SELECT diskquota.set_cluster_quota('10000000000000 MB');
 BEGIN;
 SELECT diskquota.set_cluster_quota('100 MB');
 ROLLBACK;
+-- a rolled-back database-quota set must never reach enforcement: the
+-- worker is the only publisher of limits to shared memory
+BEGIN;
+SELECT diskquota.set_database_quota(current_database()::text, '1 MB');
+ROLLBACK;
+SELECT diskquota.wait_for_worker_new_epoch();
+SELECT diskquota.database_quota_limit_mb();
 
 SELECT diskquota.set_cluster_quota('-1');
 SELECT diskquota.wait_for_worker_new_epoch();

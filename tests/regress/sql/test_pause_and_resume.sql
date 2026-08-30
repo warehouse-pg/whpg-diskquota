@@ -22,6 +22,12 @@ WHERE tableid = 'a'::regclass AND segid = -1;
 -- expect insert succeed
 INSERT INTO a SELECT generate_series(1,100000);
 
+-- the paused database is still counted: sizes keep updating while
+-- paused, only enforcement is off
+SELECT diskquota.wait_for_worker_new_epoch();
+SELECT size > 5000000 AS counted_while_paused FROM diskquota.table_size
+WHERE tableid = 'a'::regclass AND segid = -1;
+
 -- resume extension
 SELECT diskquota.resume();
 SELECT diskquota.wait_for_worker_new_epoch();

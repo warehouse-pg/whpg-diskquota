@@ -878,26 +878,36 @@ refresh_disk_quota_usage(bool is_init)
 			if (cluster_limit_mb > 0 && diskquota_get_cluster_total_size() >= cluster_limit_mb * (int64)(1 << 20))
 				add_quota_to_rejectmap(CLUSTER_QUOTA, InvalidOid, InvalidOid, false);
 		}
-		/* copy local reject map back to shared reject map */
-		bool reject_map_removed = false;
-		bool reject_map_changed = flush_local_reject_map(&reject_map_removed);
 		/*
-		 * Dispatch rejectmap entries to segments to perform hard-limit.
-		 * If the bgworker is in init mode, the rejectmap should be refreshed anyway.
-		 * With hardlimit on, dispatch when the map changed or the active table
-		 * list is non-empty so new relfilenodes of already-rejected objects are
-		 * covered. With hardlimit off, dispatch only when entries were REMOVED:
-		 * segments enforce whatever map they last received under their own
-		 * hardlimit GUC, so a deleted quota must still reach them or they would
-		 * keep rejecting on it forever (mixed-GUC states). Additions are
-		 * never sent while hardlimit is off: the removal path resends only
-		 * entries the segments have already seen (see dispatch_rejectmap),
-		 * so a segment still enforcing under its own hardlimit GUC cannot
-		 * start cancelling writes for an entry the worker never published.
+		 * A paused database is still counted -- everything above stays
+		 * fresh -- but never enforced: the shared rejectmap and the
+		 * segment maps are left untouched, which also keeps entries
+		 * planted by tests from being overwritten while they hold the
+		 * worker paused.
 		 */
-		bool full_dispatch = is_init || (diskquota_hardlimit && (reject_map_changed || hasActiveTable));
-		if (full_dispatch || reject_map_removed)
-			dispatch_rejectmap(local_active_table_stat_map, full_dispatch);
+		if (!diskquota_is_paused())
+		{
+			/* copy local reject map back to shared reject map */
+			bool reject_map_removed = false;
+			bool reject_map_changed = flush_local_reject_map(&reject_map_removed);
+			/*
+			 * Dispatch rejectmap entries to segments to perform hard-limit.
+			 * If the bgworker is in init mode, the rejectmap should be refreshed anyway.
+			 * With hardlimit on, dispatch when the map changed or the active table
+			 * list is non-empty so new relfilenodes of already-rejected objects are
+			 * covered. With hardlimit off, dispatch only when entries were REMOVED:
+			 * segments enforce whatever map they last received under their own
+			 * hardlimit GUC, so a deleted quota must still reach them or they would
+			 * keep rejecting on it forever (mixed-GUC states). Additions are
+			 * never sent while hardlimit is off: the removal path resends only
+			 * entries the segments have already seen (see dispatch_rejectmap),
+			 * so a segment still enforcing under its own hardlimit GUC cannot
+			 * start cancelling writes for an entry the worker never published.
+			 */
+			bool full_dispatch = is_init || (diskquota_hardlimit && (reject_map_changed || hasActiveTable));
+			if (full_dispatch || reject_map_removed)
+				dispatch_rejectmap(local_active_table_stat_map, full_dispatch);
+		}
 		hash_destroy(local_active_table_stat_map);
 	}
 	PG_CATCH();

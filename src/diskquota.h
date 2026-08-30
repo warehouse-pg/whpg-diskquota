@@ -375,6 +375,5 @@ extern int64 diskquota_get_cluster_limit_mb(void);
 extern void  diskquota_publish_db_total(int64 total);
 extern void  diskquota_publish_db_limit(int64 limit_mb);
 extern int64 diskquota_get_cluster_total_size(void);
-extern void  diskquota_set_database_limit_mb(Oid dbid, int64 limit_mb);
 extern bool  diskquota_get_database_status(Oid dbid, int64 *total_size, int64 *limit_mb);
 #endif

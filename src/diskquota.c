@@ -598,7 +598,6 @@ disk_quota_worker_main(Datum main_arg)
 
 	if (!MyWorkerInfo->dbEntry->inited) update_monitordb_status(MyWorkerInfo->dbEntry->dbid, DB_RUNNING);
 
-	bool        is_gang_destroyed    = false;
 	TimestampTz loop_start_timestamp = 0;
 	TimestampTz loop_end_timestamp;
 	TimestampTz log_time;
@@ -636,18 +635,15 @@ disk_quota_worker_main(Datum main_arg)
 		if (sleep_time >= diskquota_naptime * 1000)
 		{
 			SIMPLE_FAULT_INJECTOR("diskquota_worker_main");
-			if (!diskquota_is_paused())
-			{
-				/* Refresh quota model with init mode */
-				refresh_disk_quota_model(!MyWorkerInfo->dbEntry->inited);
-				MyWorkerInfo->dbEntry->inited = true;
-				is_gang_destroyed             = false;
-			}
-			else if (!is_gang_destroyed)
-			{
-				DisconnectAndDestroyAllGangs(false);
-				is_gang_destroyed = true;
-			}
+			/*
+			 * Refresh even when paused: a paused database is still
+			 * counted -- its published total keeps feeding the
+			 * cluster-wide quota -- it is only not enforced.
+			 * refresh_disk_quota_usage() leaves the shared rejectmap
+			 * and the segment maps untouched while paused.
+			 */
+			refresh_disk_quota_model(!MyWorkerInfo->dbEntry->inited);
+			MyWorkerInfo->dbEntry->inited = true;
 			worker_increase_epoch(MyWorkerInfo->dbEntry->dbid);
 
 			// GPDB6 opend a MemoryAccount for us without asking us.
@@ -2342,25 +2338,6 @@ diskquota_get_cluster_total_size(void)
 	}
 	LWLockRelease(diskquota_locks.dblist_lock);
 	return total;
-}
-
-/* Set the DATABASE_QUOTA limit of a monitored database (0 = unset). */
-void
-diskquota_set_database_limit_mb(Oid dbid, int64 limit_mb)
-{
-	if (DiskquotaLauncherShmem == NULL || DiskquotaLauncherShmem->dbArray == NULL) return;
-	LWLockAcquire(diskquota_locks.dblist_lock, LW_SHARED);
-	for (int i = 0; i < diskquota_max_monitored_databases; i++)
-	{
-		DiskquotaDBEntry *dbEntry = &DiskquotaLauncherShmem->dbArray[i];
-
-		if (dbEntry->in_use && dbEntry->dbid == dbid)
-		{
-			pg_atomic_write_u64(&dbEntry->db_quota_limit_mb, (limit_mb > 0) ? (uint64)limit_mb : 0);
-			break;
-		}
-	}
-	LWLockRelease(diskquota_locks.dblist_lock);
 }
 
 /*
