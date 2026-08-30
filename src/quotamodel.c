@@ -168,6 +168,13 @@ struct GlobalRejectMapEntry
 	RejectMapEntry keyitem;
 	bool           segexceeded;
 	/*
+	 * QD only: whether this entry has ever been included in a dispatch
+	 * to the segments. With hardlimit off, additions stay local to the
+	 * QD; a removal-triggered dispatch must then resend only entries
+	 * the segments have already seen.
+	 */
+	bool           dispatched;
+	/*
 	 * When the quota limit is exceeded on segment servers,
 	 * we need an extra auxiliary field to preserve the quota
 	 * limitation information for error message on segment
@@ -208,7 +215,7 @@ static void refresh_disk_quota_usage(bool is_init);
 static void calculate_table_disk_usage(bool is_init, HTAB *local_active_table_stat_map);
 static void flush_to_table_size(void);
 static bool flush_local_reject_map(bool *entries_removed);
-static void dispatch_rejectmap(HTAB *local_active_table_stat_map);
+static void dispatch_rejectmap(HTAB *local_active_table_stat_map, bool include_undispatched);
 static bool load_quotas(void);
 static void do_load_quotas(void);
 
@@ -882,13 +889,15 @@ refresh_disk_quota_usage(bool is_init)
 		 * covered. With hardlimit off, dispatch only when entries were REMOVED:
 		 * segments enforce whatever map they last received under their own
 		 * hardlimit GUC, so a deleted quota must still reach them or they would
-		 * keep rejecting on it forever (mixed-GUC states). Never dispatch on
-		 * additions while hardlimit is off -- the worker would overwrite
-		 * segment-side maps that tests populate directly, and additions are
-		 * meaningless to segments that do not enforce.
+		 * keep rejecting on it forever (mixed-GUC states). Additions are
+		 * never sent while hardlimit is off: the removal path resends only
+		 * entries the segments have already seen (see dispatch_rejectmap),
+		 * so a segment still enforcing under its own hardlimit GUC cannot
+		 * start cancelling writes for an entry the worker never published.
 		 */
-		if (is_init || (diskquota_hardlimit && (reject_map_changed || hasActiveTable)) || reject_map_removed)
-			dispatch_rejectmap(local_active_table_stat_map);
+		bool full_dispatch = is_init || (diskquota_hardlimit && (reject_map_changed || hasActiveTable));
+		if (full_dispatch || reject_map_removed)
+			dispatch_rejectmap(local_active_table_stat_map, full_dispatch);
 		hash_destroy(local_active_table_stat_map);
 	}
 	PG_CATCH();
@@ -1373,6 +1382,7 @@ flush_local_reject_map(bool *entries_removed)
 				rejectentry->keyitem.targettype    = localrejectentry->keyitem.targettype;
 				rejectentry->keyitem.tablespaceoid = localrejectentry->keyitem.tablespaceoid;
 				rejectentry->segexceeded           = localrejectentry->segexceeded;
+				rejectentry->dispatched            = false;
 				changed                            = true;
 			}
 			if (rejectentry->segexceeded != localrejectentry->segexceeded)
@@ -1398,9 +1408,14 @@ flush_local_reject_map(bool *entries_removed)
 
 /*
  * Dispatch rejectmap to segment servers.
+ *
+ * include_undispatched=true sends the whole map and marks every entry
+ * as seen by the segments; false (the hardlimit-off removal path)
+ * resends only entries the segments already have, so additions that
+ * were never dispatched stay local to the QD.
  */
 static void
-dispatch_rejectmap(HTAB *local_active_table_stat_map)
+dispatch_rejectmap(HTAB *local_active_table_stat_map, bool include_undispatched)
 {
 	HASH_SEQ_STATUS            hash_seq;
 	GlobalRejectMapEntry      *rejectmap_entry;
@@ -1415,16 +1430,18 @@ dispatch_rejectmap(HTAB *local_active_table_stat_map)
 	initStringInfo(&active_oids);
 	initStringInfo(&sql);
 
-	LWLockAcquire(diskquota_locks.reject_map_lock, LW_SHARED);
-	num_entries = hash_get_num_entries(disk_quota_reject_map);
+	/* exclusive: including an entry in the dispatch updates its flag */
+	LWLockAcquire(diskquota_locks.reject_map_lock, LW_EXCLUSIVE);
 	hash_seq_init(&hash_seq, disk_quota_reject_map);
 	while ((rejectmap_entry = hash_seq_search(&hash_seq)) != NULL)
 	{
+		if (!include_undispatched && !rejectmap_entry->dispatched) continue;
+		rejectmap_entry->dispatched = true;
+
+		if (rows.len > 0) appendStringInfo(&rows, ",");
 		appendStringInfo(&rows, "ROW(%d, %d, %d, %d, %s)", rejectmap_entry->keyitem.targetoid,
 		                 rejectmap_entry->keyitem.databaseoid, rejectmap_entry->keyitem.tablespaceoid,
 		                 rejectmap_entry->keyitem.targettype, rejectmap_entry->segexceeded ? "true" : "false");
-
-		if (++count != num_entries) appendStringInfo(&rows, ",");
 	}
 	LWLockRelease(diskquota_locks.reject_map_lock);
 
