@@ -334,6 +334,16 @@ add_quota_to_rejectmap(QuotaType type, Oid targetOid, Oid tablespaceoid, bool se
 	LocalRejectMapEntry *localrejectentry;
 	RejectMapEntry       keyitem = {0};
 
+	/*
+	 * A paused database keeps refreshing its usage but must not arm
+	 * enforcement: these local flags are only ever cleared by
+	 * flush_local_reject_map(), which does not run while paused, so a
+	 * mark taken during a paused cycle would replay into the shared
+	 * rejectmap on the first flush after resume, even if usage or the
+	 * quota itself is gone by then.
+	 */
+	if (diskquota_is_paused()) return;
+
 	keyitem.targetoid     = targetOid;
 	keyitem.databaseoid   = MyDatabaseId;
 	keyitem.tablespaceoid = tablespaceoid;
@@ -2379,10 +2389,13 @@ refresh_rejectmap(PG_FUNCTION_ARGS)
 		GlobalRejectMapEntry *new_entry;
 
 		/*
-		 * Skip soft limit reject entry. We don't perform soft-limit on segment servers, so we don't flush the
-		 * rejectmap entry with a valid targetoid to the global rejectmap on segment servers.
+		 * The global rejectmap on segment servers is indexed by relfilenode, so flush only the relfilenode
+		 * entries derived above. Keyed entries stay local to this UDF: soft limit is not enforced on segment
+		 * servers, and the object-independent CLUSTER/DATABASE entries carry no valid targetoid at all, so
+		 * filtering by targetoid would let them leak into the segment maps, where QE-side permission checks
+		 * build the same key and can reject writes past the coordinator's control.
 		 */
-		if (OidIsValid(rejectmapentry->keyitem.targetoid)) continue;
+		if (!OidIsValid(rejectmapentry->keyitem.relfilenode.relNode)) continue;
 
 		new_entry = hash_search(disk_quota_reject_map, &rejectmapentry->keyitem, HASH_ENTER_NULL, &found);
 		if (!found && new_entry) memcpy(new_entry, rejectmapentry, sizeof(GlobalRejectMapEntry));

@@ -98,7 +98,82 @@ INSERT 0 100000
 DROP SCHEMA
 1q: ... <quitting>
 
+-- === object-independent quotas must never plant keyed entries in ===
+-- === segment rejectmaps: those are indexed by relfilenode        ===
+!\retcode gpconfig -c "diskquota.hard_limit" -v "on" > /dev/null;
+-- start_ignore
+
+-- end_ignore
+(exited with code 0)
+!\retcode gpstop -u > /dev/null;
+-- start_ignore
+
+-- end_ignore
+(exited with code 0)
+
+1: CREATE SCHEMA mixed_s2;
+CREATE SCHEMA
+1: CREATE TABLE mixed_s2.t (i INT) DISTRIBUTED BY (i);
+CREATE TABLE
+1: INSERT INTO mixed_s2.t SELECT generate_series(1, 100000);
+INSERT 0 100000
+-- silence the unmonitored-databases warning: environment-dependent
+1: SET client_min_messages = error;
+SET
+1: SELECT diskquota.set_cluster_quota('1 MB');
+ set_cluster_quota 
+-------------------
+                   
+(1 row)
+1: RESET client_min_messages;
+RESET
+1: SELECT diskquota.wait_for_worker_new_epoch();
+ wait_for_worker_new_epoch 
+---------------------------
+ t                         
+(1 row)
+1: SELECT diskquota.wait_for_worker_new_epoch();
+ wait_for_worker_new_epoch 
+---------------------------
+ t                         
+(1 row)
+-- the keyed entry exists on the coordinator...
+1: SELECT count(*) > 0 AS qd_has_cluster_entry FROM diskquota.rejectmap WHERE target_type = 'CLUSTER_QUOTA';
+ qd_has_cluster_entry 
+----------------------
+ t                    
+(1 row)
+-- ...but never reaches the segments in keyed (relnode = 0) form
+1: SELECT count(*) AS keyed_entries_on_segments FROM gp_dist_random('diskquota.rejectmap') WHERE relnode = 0;
+ keyed_entries_on_segments 
+---------------------------
+ 0                         
+(1 row)
+1: SELECT diskquota.set_cluster_quota('-1');
+ set_cluster_quota 
+-------------------
+                   
+(1 row)
+1: SELECT diskquota.wait_for_worker_new_epoch();
+ wait_for_worker_new_epoch 
+---------------------------
+ t                         
+(1 row)
+1: SELECT diskquota.wait_for_worker_new_epoch();
+ wait_for_worker_new_epoch 
+---------------------------
+ t                         
+(1 row)
+1: DROP SCHEMA mixed_s2 CASCADE;
+DROP SCHEMA
+1q: ... <quitting>
+
 -- reload the segments too: hard_limit off everywhere again
+!\retcode gpconfig -c "diskquota.hard_limit" -v "off" > /dev/null;
+-- start_ignore
+
+-- end_ignore
+(exited with code 0)
 !\retcode gpstop -u > /dev/null;
 -- start_ignore
 

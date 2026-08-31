@@ -41,5 +41,30 @@
 1: DROP SCHEMA mixed_s CASCADE;
 1q:
 
+-- === object-independent quotas must never plant keyed entries in ===
+-- === segment rejectmaps: those are indexed by relfilenode        ===
+!\retcode gpconfig -c "diskquota.hard_limit" -v "on" > /dev/null;
+!\retcode gpstop -u > /dev/null;
+
+1: CREATE SCHEMA mixed_s2;
+1: CREATE TABLE mixed_s2.t (i INT) DISTRIBUTED BY (i);
+1: INSERT INTO mixed_s2.t SELECT generate_series(1, 100000);
+-- silence the unmonitored-databases warning: environment-dependent
+1: SET client_min_messages = error;
+1: SELECT diskquota.set_cluster_quota('1 MB');
+1: RESET client_min_messages;
+1: SELECT diskquota.wait_for_worker_new_epoch();
+1: SELECT diskquota.wait_for_worker_new_epoch();
+-- the keyed entry exists on the coordinator...
+1: SELECT count(*) > 0 AS qd_has_cluster_entry FROM diskquota.rejectmap WHERE target_type = 'CLUSTER_QUOTA';
+-- ...but never reaches the segments in keyed (relnode = 0) form
+1: SELECT count(*) AS keyed_entries_on_segments FROM gp_dist_random('diskquota.rejectmap') WHERE relnode = 0;
+1: SELECT diskquota.set_cluster_quota('-1');
+1: SELECT diskquota.wait_for_worker_new_epoch();
+1: SELECT diskquota.wait_for_worker_new_epoch();
+1: DROP SCHEMA mixed_s2 CASCADE;
+1q:
+
 -- reload the segments too: hard_limit off everywhere again
+!\retcode gpconfig -c "diskquota.hard_limit" -v "off" > /dev/null;
 !\retcode gpstop -u > /dev/null;
