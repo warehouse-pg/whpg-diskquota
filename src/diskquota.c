@@ -141,7 +141,6 @@ static void on_set_cluster_quota(int64 limit_mb);
 static void load_global_quota_config(void);
 static void reap_dropped_databases(void);
 static bool is_valid_dbid(Oid dbid);
-extern void invalidate_database_rejectmap(Oid dbid);
 static void FreeWorkerOnExit(int code, Datum arg);
 static void FreeWorker(DiskQuotaWorkerEntry *worker);
 static void init_database_list(void);
@@ -2199,8 +2198,22 @@ load_global_quota_config(void)
 static void
 reap_dropped_databases(void)
 {
+	/*
+	 * A failed sweep (e.g. a segment down) is retried, but not on every
+	 * pass: back off so a persistent failure does not emit an error
+	 * report per naptime.
+	 */
+	static int reap_backoff = 0;
+
 	Oid *dead  = palloc(sizeof(Oid) * diskquota_max_monitored_databases);
 	int  ndead = 0;
+
+	if (reap_backoff > 0)
+	{
+		reap_backoff--;
+		pfree(dead);
+		return;
+	}
 
 	/* SearchSysCache in is_valid_dbid requires a transaction */
 	StartTransactionCommand();
@@ -2212,7 +2225,62 @@ reap_dropped_databases(void)
 		if (dbEntry->in_use && !is_valid_dbid(dbEntry->dbid)) dead[ndead++] = dbEntry->dbid;
 	}
 	LWLockRelease(diskquota_locks.dblist_lock);
-	CommitTransactionCommand();
+
+	/*
+	 * Sweep the persistent list as well: a database_list row that never
+	 * got a dbArray slot (the monitored-database limit was reached, or
+	 * an earlier teardown failed halfway) is invisible to the slot scan
+	 * above, leaks forever, and on OID reuse would silently auto-monitor
+	 * an unrelated new database.
+	 */
+	{
+		bool list_ok            = true;
+		bool connected          = false;
+		bool pushed_active_snap = false;
+
+		PG_TRY();
+		{
+			if (SPI_OK_CONNECT != SPI_connect())
+				ereport(ERROR, (errcode(ERRCODE_INTERNAL_ERROR),
+				                errmsg("[diskquota launcher] unable to connect to execute internal query")));
+			connected = true;
+			PushActiveSnapshot(GetTransactionSnapshot());
+			pushed_active_snap = true;
+
+			int ret = SPI_execute("select dbid from diskquota_namespace.database_list", true, 0);
+			if (ret != SPI_OK_SELECT)
+				ereport(ERROR, (errmsg("[diskquota launcher] cannot select database_list, error code %d", ret)));
+			if (SPI_processed > 0) dead = repalloc(dead, sizeof(Oid) * (ndead + SPI_processed));
+			for (uint64 row = 0; row < SPI_processed; row++)
+			{
+				bool isnull = true;
+				Oid  dbid = DatumGetObjectId(SPI_getbinval(SPI_tuptable->vals[row], SPI_tuptable->tupdesc, 1, &isnull));
+				bool known = false;
+
+				if (isnull || is_valid_dbid(dbid)) continue;
+				for (int j = 0; j < ndead; j++)
+					if (dead[j] == dbid) known = true;
+				if (!known) dead[ndead++] = dbid;
+			}
+		}
+		PG_CATCH();
+		{
+			error_context_stack = NULL;
+			HOLD_INTERRUPTS();
+			EmitErrorReport();
+			FlushErrorState();
+			list_ok      = false;
+			reap_backoff = 10;
+			RESUME_INTERRUPTS();
+		}
+		PG_END_TRY();
+		if (connected) SPI_finish();
+		if (pushed_active_snap) PopActiveSnapshot();
+		if (list_ok)
+			CommitTransactionCommand();
+		else
+			AbortCurrentTransaction();
+	}
 
 	for (int i = 0; i < ndead; i++)
 	{
@@ -2269,7 +2337,10 @@ reap_dropped_databases(void)
 			if (num_db <= diskquota_max_workers) DiskquotaLauncherShmem->isDynamicWorker = false;
 		}
 		else
+		{
 			AbortCurrentTransaction();
+			reap_backoff = 10;
+		}
 	}
 
 	if (ndead > 0) DisconnectAndDestroyAllGangs(false);

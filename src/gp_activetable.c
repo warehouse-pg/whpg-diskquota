@@ -476,6 +476,14 @@ diskquota_fetch_table_stat(PG_FUNCTION_ARGS)
 			case REMOVE_DB_FROM_BEING_MONITORED:
 				dbid = get_dbid(PG_GETARG_ARRAYTYPE_P(1));
 				update_monitor_db(dbid, REMOVE_DB_FROM_BEING_MONITORED);
+				/*
+				 * Also drop the database's rejectmap entries: no worker
+				 * is left to dispatch a replacement, so stale entries of
+				 * an unmonitored database would occupy the fixed-size
+				 * map forever and, under hardlimit, keep rejecting a
+				 * reused relfilenode.
+				 */
+				invalidate_database_rejectmap(dbid);
 				PG_RETURN_NULL();
 			case PAUSE_DB_TO_MONITOR:
 				dbid = get_dbid(PG_GETARG_ARRAYTYPE_P(1));

@@ -30,6 +30,17 @@ cycle if any still exist when it boots; the DDL script deletes
 leftovers as a safety net, but it can only run after the flip, which
 is too late to protect the first refresh.
 
+Skipping the preparation is caught twice over: running the ALTER while
+the 2.4 library is still loaded fails early when a cluster quota is
+still configured, and the 2.3 function bodies it installs refuse to
+load a library that is not preloaded, rolling the whole ALTER back
+atomically. The path with no gate is dump/restore: a dump of a 2.4
+database restored into a 2.3 cluster recreates the 2.4-only
+quota_config rows behind the 2.3 worker's back. Run
+prepare_downgrade() (or delete the quota_config rows with
+quotatype > 4) in the source database before taking a dump that a
+2.3 cluster will restore.
+
 After a cluster restart the caps re-arm within about one
 `diskquota.naptime`: limits reload and each worker republishes its
 database's size on its first loop. Writes in that brief window are
@@ -349,7 +360,10 @@ observe usage dropping and would stay locked forever.
 Since 2.4, diskquota.pause() stops rejectmap maintenance and dispatch
 but the worker keeps refreshing table sizes, so a paused database keeps
 publishing its real total and stays correctly counted by the cluster
-quota. Before 2.4, pausing also froze size collection.
+quota. Before 2.4, pausing also froze size collection. Pausing
+therefore does not shed load: the paused worker still runs its full
+refresh, including the size queries dispatched to the segments, once
+per diskquota.naptime.
 
 # Known Issue.
 

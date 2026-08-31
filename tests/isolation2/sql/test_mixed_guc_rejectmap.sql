@@ -92,6 +92,35 @@
 1: DROP SCHEMA mixed_s3 CASCADE;
 1q:
 
+-- === a dropped database's rejectmap entries must leave the segments ===
+-- DROP DATABASE without DROP EXTENSION: the launcher's reaper tears
+-- the database down, and its dispatched REMOVE must also purge the
+-- segment rejectmaps -- with no worker left to dispatch a
+-- replacement, stale entries would occupy the fixed-size maps forever
+1: CREATE DATABASE mixed_reaper;
+2:@db_name mixed_reaper: CREATE EXTENSION diskquota;
+2:@db_name mixed_reaper: CREATE SCHEMA rs;
+2:@db_name mixed_reaper: CREATE TABLE rs.t (i INT) DISTRIBUTED BY (i);
+2:@db_name mixed_reaper: INSERT INTO rs.t SELECT generate_series(1, 100000);
+-- let the fresh database's bookkeeping settle before arming the
+-- quota: a dispatch re-derives the segment entries from the tables
+-- active in that cycle, so churn right after the overage would wipe
+-- what this test wants to observe
+2:@db_name mixed_reaper: SELECT diskquota.init_table_size_table();
+2:@db_name mixed_reaper: SELECT diskquota.wait_for_worker_new_epoch();
+2:@db_name mixed_reaper: SELECT diskquota.wait_for_worker_new_epoch();
+2:@db_name mixed_reaper: SELECT diskquota.set_schema_quota('rs', '1 MB');
+2:@db_name mixed_reaper: INSERT INTO rs.t SELECT generate_series(1, 10000);
+2:@db_name mixed_reaper: SELECT diskquota.wait_for_worker_new_epoch();
+2:@db_name mixed_reaper: SELECT diskquota.wait_for_worker_new_epoch();
+1: SELECT count(*) > 0 AS phantom_entries_on_segments FROM gp_dist_random('diskquota.rejectmap');
+2q:
+!\retcode for i in $(seq 1 30); do psql -d isolation2test -Atc "DROP DATABASE mixed_reaper" >/dev/null 2>&1 && break; sleep 1; done;
+-- give the reaper a launcher pass and the purge a dispatch
+!\retcode sleep 10;
+1: SELECT count(*) AS entries_left_on_segments FROM gp_dist_random('diskquota.rejectmap');
+1q:
+
 -- reload the segments too: hard_limit off everywhere again
 !\retcode gpconfig -c "diskquota.hard_limit" -v "off" > /dev/null;
 !\retcode gpstop -u > /dev/null;
