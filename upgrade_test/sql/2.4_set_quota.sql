@@ -45,6 +45,9 @@ select diskquota.set_database_quota(current_database()::text, '10 GB');
 set client_min_messages = error;
 select diskquota.set_cluster_quota('20 GB');
 reset client_min_messages;
+-- limits are published to shared memory by the bgworker once per
+-- naptime; wait for a refresh cycle so the views below see them
+select diskquota.wait_for_worker_new_epoch();
 select quota_in_mb from diskquota.show_database_quota_view;
 select quota_in_mb from diskquota.show_cluster_quota_view;
 select count(*) as new_scope_rows from diskquota.quota_config where quotatype in (5, 6);
