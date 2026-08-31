@@ -161,7 +161,7 @@ diskquota_is_paused()
  * extension is installed there and the launcher tracks it. The
  * object-independent quotas cover monitored databases only: an
  * unmonitored database is neither counted in the cluster total nor
- * blocked by it (see warn_unmonitored_databases()).
+ * blocked by it (see warn_uncounted_databases()).
  */
 bool
 diskquota_is_monitored_dbid(Oid dbid)
@@ -170,6 +170,27 @@ diskquota_is_monitored_dbid(Oid dbid)
 
 	LWLockAcquire(diskquota_locks.monitored_dbid_cache_lock, LW_SHARED);
 	hash_search(monitored_dbid_cache, &dbid, HASH_FIND, &found);
+	LWLockRelease(diskquota_locks.monitored_dbid_cache_lock);
+	return found;
+}
+
+/*
+ * Worker status of a monitored database; false when dbid is not
+ * monitored. DB_RUNNING is the only status in which the database's
+ * worker refreshes and publishes its total size, so any other status
+ * means the cluster quota counts the database as 0.
+ */
+bool
+diskquota_monitored_db_status(Oid dbid, uint32 *status)
+{
+	bool found = false;
+
+	LWLockAcquire(diskquota_locks.monitored_dbid_cache_lock, LW_SHARED);
+	{
+		MonitorDBEntry entry = (MonitorDBEntry)hash_search(monitored_dbid_cache, &dbid, HASH_FIND, &found);
+
+		if (found) *status = pg_atomic_read_u32(&entry->status);
+	}
 	LWLockRelease(diskquota_locks.monitored_dbid_cache_lock);
 	return found;
 }

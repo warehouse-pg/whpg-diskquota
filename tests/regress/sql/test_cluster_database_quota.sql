@@ -98,6 +98,9 @@ INSERT INTO cdqschema.cdq_t2 VALUES (1, 'x');
 -- monitor the blind database; initialize its existing data
 \c cdq_blind
 CREATE EXTENSION diskquota;
+-- monitored but not yet initialized (blind_t predates the extension):
+-- re-setting the cluster quota warns that cdq_blind counts as 0
+SELECT diskquota.set_cluster_quota('10 MB');
 SELECT diskquota.init_table_size_table();
 SELECT diskquota.wait_for_worker_new_epoch();
 \c contrib_regression

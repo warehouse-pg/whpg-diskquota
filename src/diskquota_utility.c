@@ -734,21 +734,25 @@ set_schema_quota(PG_FUNCTION_ARGS)
 }
 
 /*
- * The cluster quota counts monitored databases only; a database
- * without the diskquota extension is invisible to the cap. Make that
- * blind spot explicit to the DBA: list every non-template database
- * (except the launcher's own bookkeeping database) that is not being
- * monitored. A warning rather than an error: monitoring may be
- * intentionally partial, and databases created later are born
- * unmonitored anyway, so refusing here could not guarantee coverage
- * either.
+ * The cluster quota counts monitored databases only, and a monitored
+ * database contributes to the total only once diskquota is
+ * initialized in it (see init_table_size_table()); until then its
+ * worker publishes nothing and the database is counted as 0. Make
+ * both blind spots explicit to the DBA: list every non-template
+ * database (except the launcher's own bookkeeping database) that is
+ * either not monitored or not yet initialized. A warning rather than
+ * an error: monitoring may be intentionally partial, and databases
+ * created later are born unmonitored anyway, so refusing here could
+ * not guarantee coverage either.
  */
 static void
-warn_unmonitored_databases(void)
+warn_uncounted_databases(void)
 {
 	int            ret;
 	StringInfoData names;
-	int            count = 0;
+	StringInfoData unready;
+	int            count         = 0;
+	int            unready_count = 0;
 
 	SPI_connect();
 	ret = SPI_execute(
@@ -757,23 +761,35 @@ warn_unmonitored_databases(void)
 	if (ret != SPI_OK_SELECT) elog(ERROR, "cannot query pg_database: error code %d", ret);
 
 	initStringInfo(&names);
+	initStringInfo(&unready);
 	for (uint64 i = 0; i < SPI_processed; i++)
 	{
-		bool  isnull = true;
-		Oid   dbid   = DatumGetObjectId(SPI_getbinval(SPI_tuptable->vals[i], SPI_tuptable->tupdesc, 1, &isnull));
-		char *dbname = SPI_getvalue(SPI_tuptable->vals[i], SPI_tuptable->tupdesc, 2);
+		bool   isnull = true;
+		Oid    dbid   = DatumGetObjectId(SPI_getbinval(SPI_tuptable->vals[i], SPI_tuptable->tupdesc, 1, &isnull));
+		char  *dbname = SPI_getvalue(SPI_tuptable->vals[i], SPI_tuptable->tupdesc, 2);
+		uint32 status = DB_STATUS_UNKNOWN;
 
 		if (isnull || dbname == NULL) continue;
 
-		if (diskquota_is_monitored_dbid(dbid)) continue;
-
-		if (count++ > 0) appendStringInfoString(&names, ", ");
-		appendStringInfoString(&names, dbname);
+		if (!diskquota_monitored_db_status(dbid, &status))
+		{
+			if (count++ > 0) appendStringInfoString(&names, ", ");
+			appendStringInfoString(&names, dbname);
+		}
+		else if (status != DB_RUNNING)
+		{
+			if (unready_count++ > 0) appendStringInfoString(&unready, ", ");
+			appendStringInfoString(&unready, dbname);
+		}
 	}
 
 	if (count > 0)
 		ereport(WARNING, (errmsg("cluster quota counts monitored databases only; not monitored: %s", names.data),
 		                  errhint("run CREATE EXTENSION diskquota in those databases to include them")));
+	if (unready_count > 0)
+		ereport(WARNING,
+		        (errmsg("cluster quota counts these monitored databases as 0 until initialized: %s", unready.data),
+		         errhint("run SELECT diskquota.init_table_size_table(); in those databases to include them")));
 	SPI_finish();
 }
 
@@ -870,7 +886,7 @@ set_cluster_quota(PG_FUNCTION_ARGS)
 	LWLockRelease(diskquota_locks.extension_ddl_message_lock);
 	LWLockRelease(diskquota_locks.extension_ddl_lock);
 
-	if (quota_limit_mb > 0) warn_unmonitored_databases();
+	if (quota_limit_mb > 0) warn_uncounted_databases();
 	PG_RETURN_VOID();
 }
 
