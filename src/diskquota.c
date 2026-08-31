@@ -481,6 +481,9 @@ disk_quota_worker_main(Datum main_arg)
 	/* diskquota worker should has Gp_role as dispatcher */
 	Gp_role = GP_ROLE_DISPATCH;
 
+	/* fix the slot incarnation this worker publishes for */
+	diskquota_worker_capture_generation();
+
 	/*
 	 * Initialize diskquota related local hash map and refresh model
 	 * immediately
@@ -1291,7 +1294,13 @@ do_process_extension_ddl_message(MessageResult *code, ExtensionDDLMessage local_
 					invalidate_database_rejectmap(dbid);
 					break;
 				case CMD_SET_CLUSTER_QUOTA:
-					/* handled entirely before commit; no segment-side state to update */
+					/*
+					 * Publish the live limit only now that the change to
+					 * global_quota_config is committed: the table is
+					 * distributed, so the commit itself can abort, and a
+					 * rolled-back change must never reach enforcement.
+					 */
+					diskquota_set_cluster_limit_mb((int64)(int)local_extension_ddl_message.dbid);
 					break;
 				default:
 					ereport(LOG, (errmsg("[diskquota launcher]:received unsupported message cmd=%d",
@@ -1880,10 +1889,11 @@ add_db_entry(Oid dbid)
 		pg_atomic_write_u64(&hole->db_quota_limit_mb, 0);
 		hole->rejectmap_retry      = false;
 		hole->rejectmap_retry_full = false;
-		hole->dbid                 = dbid;
-		hole->in_use               = true;
-		hole->next_run_time        = GetCurrentTimestamp();
-		result                     = hole;
+		hole->generation++;
+		hole->dbid          = dbid;
+		hole->in_use        = true;
+		hole->next_run_time = GetCurrentTimestamp();
+		result              = hole;
 	}
 	if (result == NULL)
 		ereport(WARNING, (errmsg("[diskquota launcher] diskquota monitored database limit is reached, database(oid:%u) "
@@ -2087,10 +2097,13 @@ WaitForBackgroundWorkerShutdown(BackgroundWorkerHandle *handle)
 #endif /* GP_VERSION_NUM */
 
 /*
- * Persist the cluster-wide quota in the launcher's database and make
- * it effective. Runs in the launcher with SPI already connected (see
+ * Persist the cluster-wide quota in the launcher's database. Runs in
+ * the launcher with SPI already connected (see
  * do_process_extension_ddl_message); errors are caught by the caller.
- * A non-positive limit deletes the configuration.
+ * A non-positive limit deletes the configuration. The live limit in
+ * shmem is published by the caller's post-commit block:
+ * global_quota_config is a distributed table, so the commit can still
+ * abort, and a rolled-back change must never reach enforcement.
  */
 static void
 on_set_cluster_quota(int64 limit_mb)
@@ -2121,8 +2134,6 @@ on_set_cluster_quota(int64 limit_mb)
 		if (ret != SPI_OK_DELETE)
 			ereport(ERROR, (errmsg("[diskquota launcher] cannot delete global_quota_config, error code %d", ret)));
 	}
-
-	diskquota_set_cluster_limit_mb(limit_mb);
 }
 
 /*
@@ -2297,11 +2308,31 @@ diskquota_get_cluster_limit_mb(void)
 }
 
 /*
+ * The slot generation this worker was started for (see the generation
+ * field in DiskquotaDBEntry). Captured once at worker startup;
+ * publishes against a slot whose generation moved on are discarded.
+ */
+static uint32 my_dbentry_generation = 0;
+
+void
+diskquota_worker_capture_generation(void)
+{
+	DiskquotaDBEntry *dbEntry = (MyWorkerInfo != NULL) ? MyWorkerInfo->dbEntry : NULL;
+
+	if (dbEntry == NULL) return;
+	LWLockAcquire(diskquota_locks.dblist_lock, LW_SHARED);
+	my_dbentry_generation = dbEntry->generation;
+	LWLockRelease(diskquota_locks.dblist_lock);
+}
+
+/*
  * Publish the calling worker's database total for the quota checks.
  *
  * The slot can be released (DROP EXTENSION, the dropped-database sweep)
  * and rebound to another database while a refresh is in flight, so the
- * binding is revalidated under dblist_lock before every write.
+ * binding is revalidated under dblist_lock before every write; a
+ * binding of the same database in a newer slot generation (DROP
+ * EXTENSION plus immediate re-CREATE) is not this worker's to write.
  */
 void
 diskquota_publish_db_total(int64 total)
@@ -2310,7 +2341,7 @@ diskquota_publish_db_total(int64 total)
 
 	if (dbEntry == NULL) return;
 	LWLockAcquire(diskquota_locks.dblist_lock, LW_SHARED);
-	if (dbEntry->in_use && dbEntry->dbid == MyDatabaseId)
+	if (dbEntry->in_use && dbEntry->dbid == MyDatabaseId && dbEntry->generation == my_dbentry_generation)
 		pg_atomic_write_u64(&dbEntry->total_size, (total > 0) ? (uint64)total : 0);
 	LWLockRelease(diskquota_locks.dblist_lock);
 }
@@ -2326,7 +2357,7 @@ diskquota_publish_db_limit(int64 limit_mb)
 
 	if (dbEntry == NULL) return;
 	LWLockAcquire(diskquota_locks.dblist_lock, LW_SHARED);
-	if (dbEntry->in_use && dbEntry->dbid == MyDatabaseId)
+	if (dbEntry->in_use && dbEntry->dbid == MyDatabaseId && dbEntry->generation == my_dbentry_generation)
 		pg_atomic_write_u64(&dbEntry->db_quota_limit_mb, (limit_mb > 0) ? (uint64)limit_mb : 0);
 	LWLockRelease(diskquota_locks.dblist_lock);
 }

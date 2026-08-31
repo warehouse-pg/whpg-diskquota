@@ -308,6 +308,16 @@ struct DiskquotaDBEntry
 	 */
 	bool rejectmap_retry;
 	bool rejectmap_retry_full;
+
+	/*
+	 * Bumped every time the slot is claimed. A worker captures the
+	 * value at startup and its publishes are discarded on a mismatch:
+	 * the in_use/dbid revalidation alone cannot tell a DROP EXTENSION
+	 * plus immediate re-CREATE of the same database apart from its own
+	 * binding, so a terminating worker of the previous incarnation
+	 * could republish its stale total over the zeroed slot.
+	 */
+	uint32 generation;
 };
 
 typedef enum MonitorDBStatus
@@ -389,6 +399,7 @@ extern bool  diskquota_am_bgworker(void);
 extern bool  diskquota_am_launcher(void);
 extern void  diskquota_set_cluster_limit_mb(int64 limit_mb);
 extern int64 diskquota_get_cluster_limit_mb(void);
+extern void  diskquota_worker_capture_generation(void);
 extern void  diskquota_publish_db_total(int64 total);
 extern void  diskquota_publish_db_limit(int64 limit_mb);
 extern void  diskquota_rejectmap_retry_set(bool full);
