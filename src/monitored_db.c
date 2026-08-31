@@ -292,9 +292,19 @@ update_monitor_db(Oid dbid, FetchTableStatType action)
 		{
 			ereport(WARNING, (errmsg("can't alloc memory on dbid cache, there ary too many databases to monitor")));
 		}
-		entry->paused = false;
-		pg_atomic_init_u32(&(entry->epoch), 0);
-		pg_atomic_init_u32(&(entry->status), DB_INIT);
+		/*
+		 * Initialize only a newly created entry: the ADD is replayed --
+		 * at every launcher restart, and on the segments during every
+		 * refresh -- and resetting an existing entry would zero the
+		 * epoch under a waiting wait_for_worker_new_epoch() and clobber
+		 * the status the database's worker has already published.
+		 */
+		else if (!found)
+		{
+			entry->paused = false;
+			pg_atomic_init_u32(&(entry->epoch), 0);
+			pg_atomic_init_u32(&(entry->status), DB_INIT);
+		}
 	}
 	else if (action == REMOVE_DB_FROM_BEING_MONITORED)
 	{

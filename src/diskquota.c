@@ -599,7 +599,13 @@ disk_quota_worker_main(Datum main_arg)
 		}
 	}
 
-	if (!MyWorkerInfo->dbEntry->inited) update_monitordb_status(MyWorkerInfo->dbEntry->dbid, DB_RUNNING);
+	/*
+	 * Unconditionally, not only on the first initialization: a replayed
+	 * cache ADD (a launcher restart) can clobber the status back to
+	 * DB_INIT, and no later code path would ever correct it for an
+	 * already-inited database.
+	 */
+	update_monitordb_status(MyWorkerInfo->dbEntry->dbid, DB_RUNNING);
 
 	TimestampTz loop_start_timestamp = 0;
 	TimestampTz loop_end_timestamp;
@@ -789,6 +795,7 @@ disk_quota_launcher_main(Datum main_arg)
 	{
 		int rc;
 		CHECK_FOR_INTERRUPTS();
+		SIMPLE_FAULT_INJECTOR("diskquota_launcher_main");
 		/* pick a db to run */
 		if (advance_one_db)
 		{
@@ -1929,7 +1936,13 @@ release_db_entry(Oid dbid)
 	if (db->workerId != INVALID_WORKER_ID)
 	{
 		BackgroundWorkerHandle *handle = get_bgworker_handle(db->workerId);
-		TerminateBackgroundWorker(handle);
+		/*
+		 * NULL after a launcher restart: the handles live in launcher
+		 * process memory, so a previous incarnation's worker cannot be
+		 * terminated from here; it exits on its own once its database
+		 * entry is gone.
+		 */
+		if (handle != NULL) TerminateBackgroundWorker(handle);
 	}
 	vacuum_disk_quota_model(db->id);
 	/* should be called at last to set in_use to false */
