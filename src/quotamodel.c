@@ -148,7 +148,7 @@ typedef enum
  */
 uint16 quota_key_num[NUM_QUOTA_TYPES]                            = {1, 1, 2, 2, 1, 0, 0};
 Oid    quota_key_caches[NUM_QUOTA_TYPES][MAX_NUM_KEYS_QUOTA_MAP] = {
-        {NAMESPACEOID}, {AUTHOID}, {NAMESPACEOID, TABLESPACEOID}, {AUTHOID, TABLESPACEOID}, {TABLESPACEOID},
+        {NAMESPACEOID}, {AUTHOID},   {NAMESPACEOID, TABLESPACEOID}, {AUTHOID, TABLESPACEOID}, {TABLESPACEOID},
         {InvalidOid},   {InvalidOid}};
 HTAB *quota_info_map;
 
