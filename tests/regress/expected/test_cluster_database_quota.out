@@ -227,7 +227,10 @@ CREATE EXTENSION diskquota;
 WARNING:  [diskquota] diskquota is not ready because current database is not empty
 HINT:  please run 'SELECT diskquota.init_table_size_table();' to initialize diskquota
 -- monitored but not yet initialized (blind_t predates the extension):
--- re-setting the cluster quota warns that cdq_blind counts as 0
+-- re-setting the cluster quota warns that cdq_blind counts as 0.
+-- the scratch database keeps the unmonitored warning firing no matter
+-- which other databases exist; matchsubs normalize its list
+CREATE DATABASE cdq_scratch;
 SELECT diskquota.set_cluster_quota('10 MB');
 WARNING:  cluster quota counts monitored databases only; not monitored: <unmonitored databases>
 HINT:  run CREATE EXTENSION diskquota in those databases to include them
@@ -238,6 +241,7 @@ HINT:  run SELECT diskquota.init_table_size_table(); in those databases to inclu
  
 (1 row)
 
+DROP DATABASE cdq_scratch;
 SELECT diskquota.init_table_size_table();
  init_table_size_table 
 -----------------------

@@ -99,8 +99,12 @@ INSERT INTO cdqschema.cdq_t2 VALUES (1, 'x');
 \c cdq_blind
 CREATE EXTENSION diskquota;
 -- monitored but not yet initialized (blind_t predates the extension):
--- re-setting the cluster quota warns that cdq_blind counts as 0
+-- re-setting the cluster quota warns that cdq_blind counts as 0.
+-- the scratch database keeps the unmonitored warning firing no matter
+-- which other databases exist; matchsubs normalize its list
+CREATE DATABASE cdq_scratch;
 SELECT diskquota.set_cluster_quota('10 MB');
+DROP DATABASE cdq_scratch;
 SELECT diskquota.init_table_size_table();
 SELECT diskquota.wait_for_worker_new_epoch();
 \c contrib_regression
