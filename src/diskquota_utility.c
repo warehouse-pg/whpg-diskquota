@@ -814,6 +814,13 @@ set_cluster_quota(PG_FUNCTION_ARGS)
 		ereport(ERROR, (errcode(ERRCODE_INSUFFICIENT_PRIVILEGE), errmsg("must be superuser to set disk quota limit")));
 	}
 
+	/* the launcher and its message slot exist on the coordinator only */
+	if (!IS_QUERY_DISPATCHER())
+	{
+		ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+		                errmsg("diskquota.set_cluster_quota() can only be executed on the coordinator")));
+	}
+
 	/*
 	 * The launcher persists the change in its own transaction, so a
 	 * ROLLBACK in the caller would not undo it: refuse to run inside

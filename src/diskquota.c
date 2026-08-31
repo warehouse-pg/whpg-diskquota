@@ -1850,30 +1850,38 @@ static DiskquotaDBEntry *
 add_db_entry(Oid dbid)
 {
 	DiskquotaDBEntry *result = NULL;
+	DiskquotaDBEntry *hole   = NULL;
 
 	LWLockAcquire(diskquota_locks.dblist_lock, LW_EXCLUSIVE);
-	/* if there is already dbEntry's dbid equals dbid, returning the existing one */
+	/*
+	 * An existing binding for dbid always wins, so scan the whole array
+	 * before claiming anything: claiming a hole first would leave it
+	 * behind as an orphaned duplicate when a later slot turns out to
+	 * hold the binding, and first-match readers would then see the
+	 * orphan's zeros instead of the published values.
+	 */
 	for (int i = 0; i < diskquota_max_monitored_databases; i++)
 	{
 		DiskquotaDBEntry *dbEntry = &DiskquotaLauncherShmem->dbArray[i];
-		if (!dbEntry->in_use && result == NULL)
-		{
-			/*
-			 * A freed slot keeps its last occupant's published numbers;
-			 * clear them so they are never attributed to this database.
-			 */
-			pg_atomic_write_u64(&dbEntry->total_size, 0);
-			pg_atomic_write_u64(&dbEntry->db_quota_limit_mb, 0);
-			dbEntry->dbid          = dbid;
-			dbEntry->in_use        = true;
-			dbEntry->next_run_time = GetCurrentTimestamp();
-			result                 = dbEntry;
-		}
-		else if (dbEntry->in_use && dbEntry->dbid == dbid)
+		if (dbEntry->in_use && dbEntry->dbid == dbid)
 		{
 			result = dbEntry;
 			break;
 		}
+		if (!dbEntry->in_use && hole == NULL) hole = dbEntry;
+	}
+	if (result == NULL && hole != NULL)
+	{
+		/*
+		 * A freed slot keeps its last occupant's published numbers;
+		 * clear them so they are never attributed to this database.
+		 */
+		pg_atomic_write_u64(&hole->total_size, 0);
+		pg_atomic_write_u64(&hole->db_quota_limit_mb, 0);
+		hole->dbid          = dbid;
+		hole->in_use        = true;
+		hole->next_run_time = GetCurrentTimestamp();
+		result              = hole;
 	}
 	if (result == NULL)
 		ereport(WARNING, (errmsg("[diskquota launcher] diskquota monitored database limit is reached, database(oid:%u) "

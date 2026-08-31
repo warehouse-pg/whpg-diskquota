@@ -1,4 +1,24 @@
 -- remove objects introduced in 2.4
+-- A configured cluster quota must be removed while 2.4 is still the
+-- loaded library (diskquota.prepare_downgrade() does that): it lives
+-- in the launcher's global_quota_config, which none of the objects
+-- this script leaves behind can reach. Running this script under the
+-- 2.4 library would fail anyway when the 2.3 function bodies below
+-- force-load the not-preloaded 2.3 library, but that abort is
+-- confusing; fail early with an actionable message instead. The check
+-- calls a 2.4-library function, so it must be skipped when another
+-- library is already loaded (the shipped downgrade order flips
+-- shared_preload_libraries first).
+DO $$
+BEGIN
+	IF current_setting('shared_preload_libraries') LIKE '%diskquota-2.4%' THEN
+		IF diskquota.cluster_quota_limit_mb() > 0 THEN
+			RAISE EXCEPTION 'a cluster quota is still configured'
+			      USING HINT = 'run SELECT diskquota.prepare_downgrade() in every monitored database before downgrading';
+		END IF;
+	END IF;
+END
+$$;
 -- The 2.3 worker feeds every quota_config row into a lookup indexed
 -- by quotatype and only knows types 0..4; a leftover CLUSTER_QUOTA(5)
 -- or DATABASE_QUOTA(6) row would make it read past that lookup on
