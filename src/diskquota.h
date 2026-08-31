@@ -294,6 +294,20 @@ struct DiskquotaDBEntry
 	 * and refreshed by the database's worker from quota_config.
 	 */
 	pg_atomic_uint64 db_quota_limit_mb;
+
+	/*
+	 * Set while a rejectmap dispatch for this database has not been
+	 * confirmed by the segments: the QD map is reconciled before the
+	 * dispatch, so a dispatch that fails (a segment down; the error is
+	 * swallowed by the worker's refresh loop) would otherwise lose the
+	 * state change for good and leave the segments enforcing stale
+	 * entries. The next worker cycle resends the map.
+	 * rejectmap_retry_full remembers whether the unconfirmed dispatch
+	 * carried not-yet-dispatched additions. Only the database's
+	 * current worker touches these fields.
+	 */
+	bool rejectmap_retry;
+	bool rejectmap_retry_full;
 };
 
 typedef enum MonitorDBStatus
@@ -377,6 +391,9 @@ extern void  diskquota_set_cluster_limit_mb(int64 limit_mb);
 extern int64 diskquota_get_cluster_limit_mb(void);
 extern void  diskquota_publish_db_total(int64 total);
 extern void  diskquota_publish_db_limit(int64 limit_mb);
+extern void  diskquota_rejectmap_retry_set(bool full);
+extern void  diskquota_rejectmap_retry_clear(void);
+extern bool  diskquota_rejectmap_retry_pending(bool *full);
 extern int64 diskquota_get_cluster_total_size(void);
 extern bool  diskquota_get_database_status(Oid dbid, int64 *total_size, int64 *limit_mb);
 #endif

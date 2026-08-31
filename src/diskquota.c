@@ -1878,10 +1878,12 @@ add_db_entry(Oid dbid)
 		 */
 		pg_atomic_write_u64(&hole->total_size, 0);
 		pg_atomic_write_u64(&hole->db_quota_limit_mb, 0);
-		hole->dbid          = dbid;
-		hole->in_use        = true;
-		hole->next_run_time = GetCurrentTimestamp();
-		result              = hole;
+		hole->rejectmap_retry      = false;
+		hole->rejectmap_retry_full = false;
+		hole->dbid                 = dbid;
+		hole->in_use               = true;
+		hole->next_run_time        = GetCurrentTimestamp();
+		result                     = hole;
 	}
 	if (result == NULL)
 		ereport(WARNING, (errmsg("[diskquota launcher] diskquota monitored database limit is reached, database(oid:%u) "
@@ -2327,6 +2329,41 @@ diskquota_publish_db_limit(int64 limit_mb)
 	if (dbEntry->in_use && dbEntry->dbid == MyDatabaseId)
 		pg_atomic_write_u64(&dbEntry->db_quota_limit_mb, (limit_mb > 0) ? (uint64)limit_mb : 0);
 	LWLockRelease(diskquota_locks.dblist_lock);
+}
+
+/*
+ * Rejectmap dispatch-retry bookkeeping for the calling worker's
+ * database (see the field comments in DiskquotaDBEntry). No lock:
+ * only the database's current worker reads or writes the flags.
+ */
+void
+diskquota_rejectmap_retry_set(bool full)
+{
+	DiskquotaDBEntry *dbEntry = (MyWorkerInfo != NULL) ? MyWorkerInfo->dbEntry : NULL;
+
+	if (dbEntry == NULL) return;
+	dbEntry->rejectmap_retry = true;
+	if (full) dbEntry->rejectmap_retry_full = true;
+}
+
+void
+diskquota_rejectmap_retry_clear(void)
+{
+	DiskquotaDBEntry *dbEntry = (MyWorkerInfo != NULL) ? MyWorkerInfo->dbEntry : NULL;
+
+	if (dbEntry == NULL) return;
+	dbEntry->rejectmap_retry      = false;
+	dbEntry->rejectmap_retry_full = false;
+}
+
+bool
+diskquota_rejectmap_retry_pending(bool *full)
+{
+	DiskquotaDBEntry *dbEntry = (MyWorkerInfo != NULL) ? MyWorkerInfo->dbEntry : NULL;
+
+	if (dbEntry == NULL) return false;
+	if (full) *full = dbEntry->rejectmap_retry_full;
+	return dbEntry->rejectmap_retry;
 }
 
 /* Sum of the published totals of all monitored databases. */

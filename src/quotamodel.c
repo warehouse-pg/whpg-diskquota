@@ -917,9 +917,15 @@ refresh_disk_quota_usage(bool is_init)
 			 * entries the segments have already seen (see dispatch_rejectmap),
 			 * so a segment still enforcing under its own hardlimit GUC cannot
 			 * start cancelling writes for an entry the worker never published.
+			 * A dispatch the segments never confirmed is retried on the next
+			 * cycle, in at least the mode in which it was lost.
 			 */
-			bool full_dispatch = is_init || (diskquota_hardlimit && (reject_map_changed || hasActiveTable));
-			if (full_dispatch || reject_map_removed) dispatch_rejectmap(local_active_table_stat_map, full_dispatch);
+			bool retry_full    = false;
+			bool retry_pending = diskquota_rejectmap_retry_pending(&retry_full);
+			bool full_dispatch = is_init || (diskquota_hardlimit && (reject_map_changed || hasActiveTable)) ||
+			                     (retry_pending && retry_full);
+			if (full_dispatch || reject_map_removed || retry_pending)
+				dispatch_rejectmap(local_active_table_stat_map, full_dispatch);
 		}
 		hash_destroy(local_active_table_stat_map);
 	}
@@ -1445,6 +1451,8 @@ dispatch_rejectmap(HTAB *local_active_table_stat_map, bool include_undispatched)
 	DiskQuotaActiveTableEntry *active_table_entry;
 	int                        num_entries, count = 0;
 	CdbPgResults               cdb_pgresults = {NULL, 0};
+	List                      *sent_keys     = NIL;
+	ListCell                  *cell;
 	StringInfoData             rows;
 	StringInfoData             active_oids;
 	StringInfoData             sql;
@@ -1453,13 +1461,25 @@ dispatch_rejectmap(HTAB *local_active_table_stat_map, bool include_undispatched)
 	initStringInfo(&active_oids);
 	initStringInfo(&sql);
 
-	/* exclusive: including an entry in the dispatch updates its flag */
-	LWLockAcquire(diskquota_locks.reject_map_lock, LW_EXCLUSIVE);
+	/*
+	 * Send only this database's entries: the dispatched query runs in
+	 * this database on every segment and replaces the segments' state
+	 * for this database alone; other databases' entries are managed by
+	 * their own workers. The dispatched flag is set only after the
+	 * dispatch succeeds, so remember the keys that were sent.
+	 */
+	LWLockAcquire(diskquota_locks.reject_map_lock, LW_SHARED);
 	hash_seq_init(&hash_seq, disk_quota_reject_map);
 	while ((rejectmap_entry = hash_seq_search(&hash_seq)) != NULL)
 	{
+		RejectMapEntry *sent_key;
+
+		if (rejectmap_entry->keyitem.databaseoid != MyDatabaseId) continue;
 		if (!include_undispatched && !rejectmap_entry->dispatched) continue;
-		rejectmap_entry->dispatched = true;
+
+		sent_key  = (RejectMapEntry *)palloc(sizeof(RejectMapEntry));
+		*sent_key = rejectmap_entry->keyitem;
+		sent_keys = lappend(sent_keys, sent_key);
 
 		if (rows.len > 0) appendStringInfo(&rows, ",");
 		appendStringInfo(&rows, "ROW(%d, %d, %d, %d, %s)", rejectmap_entry->keyitem.targetoid,
@@ -1483,7 +1503,35 @@ dispatch_rejectmap(HTAB *local_active_table_stat_map, bool include_undispatched)
 	                 "ARRAY[%s]::diskquota.rejectmap_entry[], "
 	                 "ARRAY[%s]::oid[])",
 	                 rows.data, active_oids.data);
+	/*
+	 * The dispatch can fail (a segment may be down) and the worker's
+	 * refresh loop swallows the error, but flush_local_reject_map()
+	 * has already reconciled the QD map: remember that the segments
+	 * have not confirmed this state so the next cycle resends it.
+	 * Cleared below only once the dispatch returns.
+	 */
+	diskquota_rejectmap_retry_set(include_undispatched);
+
+	SIMPLE_FAULT_INJECTOR("diskquota_dispatch_rejectmap");
 	CdbDispatchCommand(sql.data, DF_NONE, &cdb_pgresults);
+
+	/*
+	 * The segments hold the sent state now. Mark the sent entries as
+	 * dispatched (marking before the dispatch would leave additions a
+	 * failed full dispatch never delivered eligible for the
+	 * removal-only resend path) and drop the retry flag.
+	 */
+	LWLockAcquire(diskquota_locks.reject_map_lock, LW_EXCLUSIVE);
+	foreach (cell, sent_keys)
+	{
+		bool found;
+
+		rejectmap_entry = hash_search(disk_quota_reject_map, (RejectMapEntry *)lfirst(cell), HASH_FIND, &found);
+		if (found && rejectmap_entry) rejectmap_entry->dispatched = true;
+	}
+	LWLockRelease(diskquota_locks.reject_map_lock);
+	diskquota_rejectmap_retry_clear();
+	list_free_deep(sent_keys);
 
 	pfree(rows.data);
 	pfree(active_oids.data);
