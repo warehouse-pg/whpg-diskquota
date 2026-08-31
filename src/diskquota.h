@@ -95,10 +95,12 @@ typedef enum
 
 	/*
 	 * CLUSTER_QUOTA
-	 * caps the aggregate disk usage of all monitored databases
-	 *. Stored in `quota_config` with targetoid =
-	 * InvalidOid. It has no per-object key, so it never enters
-	 * quota_info_map; the limit and the aggregate usage live in
+	 * caps the aggregate disk usage of all monitored databases.
+	 * Persisted in diskquota_namespace.global_quota_config in the
+	 * launcher's database and managed by the launcher (see
+	 * CMD_SET_CLUSTER_QUOTA); rows of this type in a database's own
+	 * quota_config are ignored. It has no per-object key, so it never
+	 * enters quota_info_map; the limit and the aggregate usage live in
 	 * DiskquotaLauncherShmem instead.
 	 */
 	CLUSTER_QUOTA,

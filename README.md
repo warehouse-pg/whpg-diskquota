@@ -344,6 +344,13 @@ This is deliberate: diskquota records usage by writing to
 diskquota.table_size, so a cap that blocked those writes could never
 observe usage dropping and would stay locked forever.
 
+4. pause() disables enforcement only (changed in 2.4).
+
+Since 2.4, diskquota.pause() stops rejectmap maintenance and dispatch
+but the worker keeps refreshing table sizes, so a paused database keeps
+publishing its real total and stays correctly counted by the cluster
+quota. Before 2.4, pausing also froze size collection.
+
 # Known Issue.
 
 1. Since Greenplum doesn't support READ UNCOMMITTED isolation level,

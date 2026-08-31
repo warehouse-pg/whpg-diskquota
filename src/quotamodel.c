@@ -142,10 +142,14 @@ typedef enum
  * | ROLE_TABLESPACE_QUOTA 		| 		2		|
  * | TABLESPACE_QUOTA 			| 		1		|
  * |----------------------------|---------------|
+ * CLUSTER_QUOTA and DATABASE_QUOTA have no per-object key (0 keys)
+ * and never enter quota_info_map; their limits live in launcher
+ * shared memory.
  */
-uint16 quota_key_num[NUM_QUOTA_TYPES]                            = {1, 1, 2, 2, 1};
+uint16 quota_key_num[NUM_QUOTA_TYPES]                            = {1, 1, 2, 2, 1, 0, 0};
 Oid    quota_key_caches[NUM_QUOTA_TYPES][MAX_NUM_KEYS_QUOTA_MAP] = {
-        {NAMESPACEOID}, {AUTHOID}, {NAMESPACEOID, TABLESPACEOID}, {AUTHOID, TABLESPACEOID}, {TABLESPACEOID}};
+        {NAMESPACEOID}, {AUTHOID}, {NAMESPACEOID, TABLESPACEOID}, {AUTHOID, TABLESPACEOID}, {TABLESPACEOID},
+        {InvalidOid},   {InvalidOid}};
 HTAB *quota_info_map;
 
 /* global rejectmap for which exceed their quota limit */
@@ -1641,7 +1645,14 @@ do_load_quotas(void)
 		}
 		if (quotaType == DATABASE_QUOTA)
 		{
-			database_quota_limit_mb = quota_limit_mb;
+			/*
+			 * Only the row whose targetoid is this database is live:
+			 * set_database_quota() keys updates and deletes on the
+			 * current database's oid, while a row restored from a dump
+			 * still carries the dump-time oid. Loading a stale row would
+			 * enforce a limit the API can no longer see or delete.
+			 */
+			if (targetOid == MyDatabaseId) database_quota_limit_mb = quota_limit_mb;
 			continue;
 		}
 

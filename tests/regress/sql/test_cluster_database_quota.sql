@@ -169,6 +169,25 @@ ROLLBACK;
 SELECT diskquota.wait_for_worker_new_epoch();
 SELECT diskquota.database_quota_limit_mb();
 
+-- === a stale quota_config row (e.g. restored from a dump) is inert ===
+-- set_database_quota manages the row keyed by this database's oid; a
+-- restored row still carries the dump-time oid and must be neither
+-- enforced nor resurrected
+-- load a few MB so the 1 MB cap below is genuinely exceeded
+INSERT INTO cdqschema.cdq_t2 SELECT g, repeat('x', 1000) FROM generate_series(1, 3000) g;
+SELECT diskquota.set_database_quota(current_database()::text, '1 MB');
+SELECT diskquota.wait_for_worker_new_epoch();
+-- expect fail: the live row enforces
+INSERT INTO cdqschema.cdq_t2 VALUES (6, 'x');
+-- simulate the dump/restore: the row survives with the old database's oid
+UPDATE diskquota.quota_config SET targetoid = 1 WHERE quotatype = 6;
+SELECT diskquota.wait_for_worker_new_epoch();
+-- the stale row is not loaded: no phantom limit, writes work
+SELECT diskquota.database_quota_limit_mb();
+INSERT INTO cdqschema.cdq_t2 VALUES (7, 'x');
+-- the API cannot see the stale row; remove it directly
+DELETE FROM diskquota.quota_config WHERE quotatype = 6;
+
 SELECT diskquota.set_cluster_quota('-1');
 SELECT diskquota.wait_for_worker_new_epoch();
 DROP TABLE cdqschema.cdq_t2;
