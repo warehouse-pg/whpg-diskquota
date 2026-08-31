@@ -173,7 +173,7 @@ struct GlobalRejectMapEntry
 	 * QD; a removal-triggered dispatch must then resend only entries
 	 * the segments have already seen.
 	 */
-	bool           dispatched;
+	bool dispatched;
 	/*
 	 * When the quota limit is exceeded on segment servers,
 	 * we need an extra auxiliary field to preserve the quota
@@ -859,7 +859,7 @@ refresh_disk_quota_usage(bool is_init)
 			 * read_only=false: take a fresh snapshot so the sum sees the
 			 * rows flush_to_table_size() wrote earlier in this transaction.
 			 */
-			int   sret = SPI_execute("select sum(size)::bigint from diskquota.table_size where segid = -1", false, 0);
+			int sret = SPI_execute("select sum(size)::bigint from diskquota.table_size where segid = -1", false, 0);
 
 			if (sret == SPI_OK_SELECT && SPI_processed == 1)
 			{
@@ -905,8 +905,7 @@ refresh_disk_quota_usage(bool is_init)
 			 * start cancelling writes for an entry the worker never published.
 			 */
 			bool full_dispatch = is_init || (diskquota_hardlimit && (reject_map_changed || hasActiveTable));
-			if (full_dispatch || reject_map_removed)
-				dispatch_rejectmap(local_active_table_stat_map, full_dispatch);
+			if (full_dispatch || reject_map_removed) dispatch_rejectmap(local_active_table_stat_map, full_dispatch);
 		}
 		hash_destroy(local_active_table_stat_map);
 	}
