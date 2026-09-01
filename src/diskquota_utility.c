@@ -387,8 +387,9 @@ send_launcher_command(MessageCommand cmd, Oid dbid, int64 payload, const char *e
 	extension_ddl_message->result  = ERR_PENDING;
 	extension_ddl_message->dbid    = dbid;
 	extension_ddl_message->payload = payload;
-	launcher_pid                   = extension_ddl_message->launcher_pid;
-	rc                             = kill(launcher_pid, SIGUSR2);
+	extension_ddl_message->seq++;
+	launcher_pid = extension_ddl_message->launcher_pid;
+	rc           = kill(launcher_pid, SIGUSR2);
 	LWLockRelease(diskquota_locks.extension_ddl_message_lock);
 	if (rc == 0)
 	{

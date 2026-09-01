@@ -190,6 +190,8 @@ struct ExtensionDDLMessage
 	                   * extensionstatement */
 	int64 payload;    /* command payload: the cluster quota limit
 	                   * in MB for CMD_SET_CLUSTER_QUOTA */
+	uint64 seq;       /* bumped by the sender on every arming; the
+	                   * launcher answers only the arming it copied */
 };
 
 enum MessageCommand

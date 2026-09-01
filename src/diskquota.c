@@ -1229,9 +1229,29 @@ process_extension_ddl_message()
 
 	/* Send createdrop extension diskquota result back to QD */
 	LWLockAcquire(diskquota_locks.extension_ddl_message_lock, LW_EXCLUSIVE);
-	memset(extension_ddl_message, 0, sizeof(ExtensionDDLMessage));
-	extension_ddl_message->launcher_pid = MyProcPid;
-	extension_ddl_message->result       = (int)code;
+	/*
+	 * Answer only the arming this pass copied. A new seq means the
+	 * requester withdrew a timed-out message and a later backend armed
+	 * a new one while the old command was still running here:
+	 * overwriting that would destroy the pending message and hand its
+	 * sender this command's verdict (a CREATE EXTENSION reported OK
+	 * without ever being processed, leaving the database silently
+	 * unmonitored). The new message needs no help from this pass: its
+	 * sender's SIGUSR2 is already pending, so the next loop pass picks
+	 * it up.
+	 */
+	if (extension_ddl_message->seq == local_extension_ddl_message.seq)
+	{
+		uint64 seq = extension_ddl_message->seq;
+
+		memset(extension_ddl_message, 0, sizeof(ExtensionDDLMessage));
+		extension_ddl_message->launcher_pid = MyProcPid;
+		extension_ddl_message->result       = (int)code;
+		extension_ddl_message->seq          = seq;
+	}
+	else
+		ereport(LOG, (errmsg("[diskquota launcher] discarding the result of a withdrawn message (cmd=%d)",
+		                     local_extension_ddl_message.cmd)));
 	LWLockRelease(diskquota_locks.extension_ddl_message_lock);
 }
 
