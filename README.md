@@ -25,10 +25,11 @@ quota rows and drops the cluster cap from the launcher's
 later upgrade back to 2.4). Then point `shared_preload_libraries`
 back at `diskquota-2.3` and restart, then run `ALTER EXTENSION
 diskquota UPDATE TO '2.3'`. The 2.3 worker does not understand the
-2.4-only quota rows and hits undefined behavior on every refresh
-cycle if any still exist when it boots; the DDL script deletes
-leftovers as a safety net, but it can only run after the flip, which
-is too late to protect the first refresh.
+2.4-only quota rows and hits undefined behavior on every refresh if
+any still exist. In place this cannot happen: the 2.3 worker idles
+behind a version gate until the ALTER commits, and the same
+transaction deletes the leftover rows atomically with the version
+flip.
 
 Skipping the preparation is caught twice over: running the ALTER while
 the 2.4 library is still loaded fails early when a cluster quota is
