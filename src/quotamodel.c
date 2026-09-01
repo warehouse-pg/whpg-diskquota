@@ -218,6 +218,7 @@ static QuotaInfoEntry *put_quota_map_entry(QuotaInfoEntryKey *key, bool *found);
 static void  refresh_disk_quota_usage(bool is_init);
 static void  calculate_table_disk_usage(bool is_init, HTAB *local_active_table_stat_map);
 static int64 flush_to_table_size(void);
+static void  flush_to_table_size_after_commit(void);
 static bool  flush_local_reject_map(bool *entries_removed);
 static void  dispatch_rejectmap(HTAB *local_active_table_stat_map, bool include_undispatched);
 static bool  load_quotas(void);
@@ -858,6 +859,7 @@ refresh_disk_quota_usage(bool is_init)
 		refresh_quota_info_map();
 		/* flush local table_size_map to user table table_size */
 		int64 db_total = flush_to_table_size();
+		SIMPLE_FAULT_INJECTOR("diskquota_refresh_after_flush");
 		/*
 		 * Publish this database's total size (sum over segments) to
 		 * launcher shmem; the cluster-wide quota check reads the sum
@@ -930,7 +932,10 @@ refresh_disk_quota_usage(bool is_init)
 	if (connected) SPI_finish();
 	if (pushed_active_snap) PopActiveSnapshot();
 	if (ret)
+	{
 		CommitTransactionCommand();
+		flush_to_table_size_after_commit();
+	}
 	else
 		AbortCurrentTransaction();
 
@@ -1341,14 +1346,7 @@ flush_to_table_size(void)
 					resetStringInfo(&insert_statement);
 					insert_entries_num = 0;
 				}
-
-				TableSizeEntryResetFlushFlag(tsentry, i);
 			}
-		}
-		if (!get_table_size_entry_flag(tsentry, TABLE_EXIST))
-		{
-			hash_search(table_size_map, &tsentry->key, HASH_REMOVE, NULL);
-			pg_atomic_fetch_sub_u32(diskquota_table_size_entry_num, 1);
 		}
 	}
 
@@ -1361,6 +1359,38 @@ flush_to_table_size(void)
 	pfree(insert_statement.data);
 
 	return db_total;
+}
+
+/*
+ * Second half of flush_to_table_size(), run only after its transaction
+ * committed: reset the flush flags and drop the entries of vanished
+ * tables. The flags and the map are not transactional, so consuming
+ * them while the DML can still abort would lose the pending changes --
+ * the rows would never be re-flushed (a dropped table's rows never
+ * change size again), and a worker or cluster restart re-warms the
+ * model from the stale table and then enforces wrong totals. Nothing
+ * sets flush flags between the flush and this cleanup: both run in the
+ * same worker cycle.
+ */
+static void
+flush_to_table_size_after_commit(void)
+{
+	HASH_SEQ_STATUS iter;
+	TableSizeEntry *tsentry = NULL;
+
+	hash_seq_init(&iter, table_size_map);
+	while ((tsentry = hash_seq_search(&iter)) != NULL)
+	{
+		int seg_st = TableSizeEntrySegidStart(tsentry);
+		int seg_ed = TableSizeEntrySegidEnd(tsentry);
+
+		for (int i = seg_st; i < seg_ed; i++) TableSizeEntryResetFlushFlag(tsentry, i);
+		if (!get_table_size_entry_flag(tsentry, TABLE_EXIST))
+		{
+			hash_search(table_size_map, &tsentry->key, HASH_REMOVE, NULL);
+			pg_atomic_fetch_sub_u32(diskquota_table_size_entry_num, 1);
+		}
+	}
 }
 
 /*

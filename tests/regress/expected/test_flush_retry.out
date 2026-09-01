@@ -1,0 +1,34 @@
+-- An aborted refresh cycle must not consume the flush bookkeeping:
+-- the flush flags and the vanished-table map entries are cleared only
+-- after the flush transaction commits, so the next cycle retries the
+-- same rows. Abort a few cycles with an injected error right after
+-- the flush, create a table under them, and its row must still reach
+-- diskquota.table_size once the fault is spent.
+CREATE TABLE fr_t (i INT, t TEXT) DISTRIBUTED BY (i);
+-- arm: the next three refresh cycles abort right after the flush
+SELECT gp_inject_fault('diskquota_refresh_after_flush', 'error', '', '', '', 1, 3, 0, dbid)
+  FROM gp_segment_configuration WHERE role = 'p' AND content = -1;
+ gp_inject_fault 
+-----------------
+ Success:
+(1 row)
+
+INSERT INTO fr_t SELECT g, 'x' FROM generate_series(1, 100) g;
+-- bounded wait: the flush of fr_t aborts at least once, then the
+-- retried flush lands the row
+\! for i in $(seq 1 60); do n=$(psql -d contrib_regression -Atc "select count(*) from diskquota.table_size where tableid = 'fr_t'::regclass and segid = -1"); [ "$n" = "1" ] && { echo FLUSHED-AFTER-RETRY; break; }; sleep 1; done
+FLUSHED-AFTER-RETRY
+SELECT gp_inject_fault('diskquota_refresh_after_flush', 'reset', dbid)
+  FROM gp_segment_configuration WHERE role = 'p' AND content = -1;
+ gp_inject_fault 
+-----------------
+ Success:
+(1 row)
+
+DROP TABLE fr_t;
+SELECT diskquota.wait_for_worker_new_epoch();
+ wait_for_worker_new_epoch 
+---------------------------
+ t
+(1 row)
+
