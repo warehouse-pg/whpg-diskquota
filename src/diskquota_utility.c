@@ -853,6 +853,8 @@ set_cluster_quota(PG_FUNCTION_ARGS)
 	extension_ddl_message->req_pid = MyProcPid;
 	extension_ddl_message->cmd     = CMD_SET_CLUSTER_QUOTA;
 	extension_ddl_message->result  = ERR_PENDING;
+	/* this command carries no database; do not leave a stale one in the slot */
+	extension_ddl_message->dbid    = InvalidOid;
 	extension_ddl_message->payload = quota_limit_mb;
 	launcher_pid                   = extension_ddl_message->launcher_pid;
 	rc                             = kill(launcher_pid, SIGUSR2);

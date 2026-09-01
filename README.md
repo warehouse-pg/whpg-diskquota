@@ -196,6 +196,12 @@ create extension diskquota;
 ```
 select diskquota.init_table_size_table();
 ```
+Note: on a database that is already being monitored, re-running
+`init_table_size_table()` repairs the persisted `diskquota.table_size`
+but does not reach the running worker's in-memory model: published
+totals (the cluster/database quota views) and enforcement keep the
+pre-repair numbers until the tables become active again or the worker
+is restarted (re-create the extension, or restart the cluster).
 
 ## clang-format
 

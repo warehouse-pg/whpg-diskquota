@@ -659,9 +659,18 @@ disk_quota_worker_main(Datum main_arg)
 			 * a stale mark would make the next incarnation skip the
 			 * readiness gate and the initial size load, leaving its
 			 * in-memory model empty until tables become active again.
+			 * Checked and written under dblist_lock, so the check cannot
+			 * interleave with a concurrent slot claim.
 			 */
+			LWLockAcquire(diskquota_locks.dblist_lock, LW_SHARED);
 			if (dbentry_binding_current(MyWorkerInfo->dbEntry)) MyWorkerInfo->dbEntry->inited = true;
-			worker_increase_epoch(MyWorkerInfo->dbEntry->dbid);
+			LWLockRelease(diskquota_locks.dblist_lock);
+			/*
+			 * The epoch belongs to this worker's database, which is fixed
+			 * for the life of the process; the slot's dbid may already be
+			 * another database's after a rebind.
+			 */
+			worker_increase_epoch(MyDatabaseId);
 
 			// GPDB6 opend a MemoryAccount for us without asking us.
 			// and GPDB6 did not release the MemoryAccount after SPI finish.
