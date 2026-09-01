@@ -840,7 +840,7 @@ set_cluster_quota(PG_FUNCTION_ARGS)
 	{
 		ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE), errmsg("disk quota can not be set to 0 MB")));
 	}
-	/* the limit travels in the message's int-sized dbid field */
+	/* keep quota_limit_mb * (1 << 20) inside int64; same cap as the database quota */
 	if (quota_limit_mb > INT_MAX)
 	{
 		ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
@@ -853,7 +853,7 @@ set_cluster_quota(PG_FUNCTION_ARGS)
 	extension_ddl_message->req_pid = MyProcPid;
 	extension_ddl_message->cmd     = CMD_SET_CLUSTER_QUOTA;
 	extension_ddl_message->result  = ERR_PENDING;
-	extension_ddl_message->dbid    = (int)quota_limit_mb;
+	extension_ddl_message->payload = quota_limit_mb;
 	launcher_pid                   = extension_ddl_message->launcher_pid;
 	rc                             = kill(launcher_pid, SIGUSR2);
 	LWLockRelease(diskquota_locks.extension_ddl_message_lock);

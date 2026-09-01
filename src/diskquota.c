@@ -1238,8 +1238,7 @@ do_process_extension_ddl_message(MessageResult *code, ExtensionDDLMessage local_
 				*code = ERR_OK;
 				break;
 			case CMD_SET_CLUSTER_QUOTA:
-				/* the dbid field carries the limit in MB for this command */
-				on_set_cluster_quota((int64)(int)local_extension_ddl_message.dbid);
+				on_set_cluster_quota(local_extension_ddl_message.payload);
 				*code = ERR_OK;
 				break;
 			default:
@@ -1306,7 +1305,7 @@ do_process_extension_ddl_message(MessageResult *code, ExtensionDDLMessage local_
 					 * distributed, so the commit itself can abort, and a
 					 * rolled-back change must never reach enforcement.
 					 */
-					diskquota_set_cluster_limit_mb((int64)(int)local_extension_ddl_message.dbid);
+					diskquota_set_cluster_limit_mb(local_extension_ddl_message.payload);
 					break;
 				default:
 					ereport(LOG, (errmsg("[diskquota launcher]:received unsupported message cmd=%d",

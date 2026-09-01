@@ -188,6 +188,8 @@ struct ExtensionDDLMessage
 	                   * MessageResult */
 	int dbid;         /* dbid of create/drop diskquota
 	                   * extensionstatement */
+	int64 payload;    /* command payload: the cluster quota limit
+	                   * in MB for CMD_SET_CLUSTER_QUOTA */
 };
 
 enum MessageCommand
@@ -196,8 +198,8 @@ enum MessageCommand
 	CMD_DROP_EXTENSION,
 
 	/*
-	 * Set or delete the cluster-wide quota. The message's dbid field
-	 * carries the limit in MB (negative = delete). Handled by the
+	 * Set or delete the cluster-wide quota. The message's payload
+	 * field carries the limit in MB (negative = delete). Handled by the
 	 * launcher so that the value persists in
 	 * diskquota_namespace.global_quota_config in the launcher's
 	 * database, independent of which database the setter ran in.
