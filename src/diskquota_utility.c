@@ -368,6 +368,15 @@ send_launcher_command(MessageCommand cmd, Oid dbid, int64 payload, const char *e
 	int rc, launcher_pid;
 
 	/*
+	 * The launcher and its message box live on the coordinator; on a
+	 * segment there is nothing to talk to, and the callers' SPI work
+	 * rolls back with this error.
+	 */
+	if (!IS_QUERY_DISPATCHER())
+		ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+		                errmsg("diskquota launcher commands can only be issued on the coordinator")));
+
+	/*
 	 * Lock on extension_ddl_lock so concurrent commands do not fight
 	 * over the single message box.
 	 */

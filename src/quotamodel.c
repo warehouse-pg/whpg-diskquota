@@ -1386,7 +1386,13 @@ flush_to_table_size(void)
  * would otherwise be missing from the first post-resume dispatch and
  * its table would escape segment-side hardlimit enforcement until its
  * next extension. Worker-local; handed to the first unpaused
- * dispatch.
+ * dispatch. Process memory bounds the guarantee: a dynamic worker
+ * exits after every cycle, so in dynamic-worker mode (and across a
+ * worker restart) a paused cycle's drained oids die with the
+ * process and the first post-resume dispatch misses them -- the
+ * pre-fix exposure, bounded by the table's next extension. The
+ * fetch cannot simply be skipped while paused: it also feeds the
+ * size accounting, which deliberately continues.
  */
 static HTAB *paused_active_backlog = NULL;
 
