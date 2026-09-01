@@ -300,7 +300,7 @@ FROM
   quota_usage ON pg_roles.oid = relowner AND pg_tablespace.oid = reltablespace;
 
 CREATE VIEW diskquota.show_segment_ratio_quota_view AS
-SELECT 
+SELECT
   spcname as tablespace_name,
   pg_tablespace.oid as tablespace_oid,
   segratio as per_seg_quota_ratio
