@@ -610,12 +610,10 @@ DROP DATABASE t9;
 DROP DATABASE t10;
 DROP DATABASE t11;
 DROP DATABASE t12;
-\! gpconfig -r diskquota.worker_timeout;
-20220719:17:19:18:023651 gpconfig:wxiaoran-a01:xiwang-[INFO]:-completed successfully with parameters '-r diskquota.worker_timeout'
-\! gpconfig -r diskquota.naptime;
-20220719:17:19:20:023738 gpconfig:wxiaoran-a01:xiwang-[INFO]:-completed successfully with parameters '-r diskquota.naptime'
-\! gpconfig -r diskquota.max_workers;
-20220719:17:19:23:023824 gpconfig:wxiaoran-a01:xiwang-[INFO]:-completed successfully with parameters '-r diskquota.max_workers'
+-- Restore the schedule contract, not the factory default: the suite
+-- runs with diskquota.max_workers = 1 (see config), and later tests
+-- depend on the dynamic-worker mode it implies.
+\! gpconfig -c diskquota.max_workers -v 1;
 \! gpstop -arf;
 20220719:17:19:23:023913 gpstop:wxiaoran-a01:xiwang-[INFO]:-Starting gpstop with args: -arf
 20220719:17:19:23:023913 gpstop:wxiaoran-a01:xiwang-[INFO]:-Gathering information and validating the environment...
