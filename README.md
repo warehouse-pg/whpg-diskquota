@@ -345,6 +345,13 @@ If DBA created diskquota extension in a database, there will be a connection
 to this database from diskquota worker process. DBA need to firstly the drop diskquota
 extension in this database, and then database could be dropped successfully.
 
+Since 2.4, a monitored database that does get dropped without the
+extension being dropped first (possible when workers rotate across
+more databases than diskquota.max_workers, so no worker is connected
+at that moment) is cleaned up automatically: the launcher notices the
+dropped database, releases its bookkeeping, and purges its leftover
+rejectmap entries from every segment.
+
 2. Temp table.
 
 Diskquota supports to limit the disk usage of temp table as well. 
