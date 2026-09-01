@@ -2398,6 +2398,17 @@ diskquota_get_cluster_limit_mb(void)
  */
 static uint32 my_dbentry_generation = 0;
 
+/*
+ * True while the binding this worker captured at startup still holds:
+ * the slot is in use, bound to this database, and in the generation
+ * the worker was started for. Callers must hold dblist_lock.
+ */
+static bool
+dbentry_binding_current(DiskquotaDBEntry *dbEntry)
+{
+	return dbEntry->in_use && dbEntry->dbid == MyDatabaseId && dbEntry->generation == my_dbentry_generation;
+}
+
 void
 diskquota_worker_capture_generation(void)
 {
@@ -2425,8 +2436,7 @@ diskquota_publish_db_total(int64 total)
 
 	if (dbEntry == NULL) return;
 	LWLockAcquire(diskquota_locks.dblist_lock, LW_SHARED);
-	if (dbEntry->in_use && dbEntry->dbid == MyDatabaseId && dbEntry->generation == my_dbentry_generation)
-		pg_atomic_write_u64(&dbEntry->total_size, (total > 0) ? (uint64)total : 0);
+	if (dbentry_binding_current(dbEntry)) pg_atomic_write_u64(&dbEntry->total_size, (total > 0) ? (uint64)total : 0);
 	LWLockRelease(diskquota_locks.dblist_lock);
 }
 
@@ -2441,15 +2451,36 @@ diskquota_publish_db_limit(int64 limit_mb)
 
 	if (dbEntry == NULL) return;
 	LWLockAcquire(diskquota_locks.dblist_lock, LW_SHARED);
-	if (dbEntry->in_use && dbEntry->dbid == MyDatabaseId && dbEntry->generation == my_dbentry_generation)
+	if (dbentry_binding_current(dbEntry))
 		pg_atomic_write_u64(&dbEntry->db_quota_limit_mb, (limit_mb > 0) ? (uint64)limit_mb : 0);
 	LWLockRelease(diskquota_locks.dblist_lock);
 }
 
 /*
+ * Whether the calling worker may still act for its slot. A worker
+ * whose binding moved on (DROP EXTENSION plus re-CREATE while a
+ * refresh was in flight) must not touch shared state the new
+ * incarnation owns. Processes without a slot have no binding to lose.
+ */
+bool
+diskquota_worker_binding_valid(void)
+{
+	DiskquotaDBEntry *dbEntry = (MyWorkerInfo != NULL) ? MyWorkerInfo->dbEntry : NULL;
+	bool              valid;
+
+	if (dbEntry == NULL) return true;
+	LWLockAcquire(diskquota_locks.dblist_lock, LW_SHARED);
+	valid = dbentry_binding_current(dbEntry);
+	LWLockRelease(diskquota_locks.dblist_lock);
+	return valid;
+}
+
+/*
  * Rejectmap dispatch-retry bookkeeping for the calling worker's
- * database (see the field comments in DiskquotaDBEntry). No lock:
- * only the database's current worker reads or writes the flags.
+ * database (see the field comments in DiskquotaDBEntry). Guarded like
+ * the publishes above: a worker of a released incarnation must not
+ * set a spurious retry -- or worse, clear one the current worker has
+ * pending -- on a slot it no longer owns.
  */
 void
 diskquota_rejectmap_retry_set(bool full)
@@ -2457,8 +2488,13 @@ diskquota_rejectmap_retry_set(bool full)
 	DiskquotaDBEntry *dbEntry = (MyWorkerInfo != NULL) ? MyWorkerInfo->dbEntry : NULL;
 
 	if (dbEntry == NULL) return;
-	dbEntry->rejectmap_retry = true;
-	if (full) dbEntry->rejectmap_retry_full = true;
+	LWLockAcquire(diskquota_locks.dblist_lock, LW_SHARED);
+	if (dbentry_binding_current(dbEntry))
+	{
+		dbEntry->rejectmap_retry = true;
+		if (full) dbEntry->rejectmap_retry_full = true;
+	}
+	LWLockRelease(diskquota_locks.dblist_lock);
 }
 
 void
@@ -2467,18 +2503,30 @@ diskquota_rejectmap_retry_clear(void)
 	DiskquotaDBEntry *dbEntry = (MyWorkerInfo != NULL) ? MyWorkerInfo->dbEntry : NULL;
 
 	if (dbEntry == NULL) return;
-	dbEntry->rejectmap_retry      = false;
-	dbEntry->rejectmap_retry_full = false;
+	LWLockAcquire(diskquota_locks.dblist_lock, LW_SHARED);
+	if (dbentry_binding_current(dbEntry))
+	{
+		dbEntry->rejectmap_retry      = false;
+		dbEntry->rejectmap_retry_full = false;
+	}
+	LWLockRelease(diskquota_locks.dblist_lock);
 }
 
 bool
 diskquota_rejectmap_retry_pending(bool *full)
 {
 	DiskquotaDBEntry *dbEntry = (MyWorkerInfo != NULL) ? MyWorkerInfo->dbEntry : NULL;
+	bool              pending = false;
 
 	if (dbEntry == NULL) return false;
-	if (full) *full = dbEntry->rejectmap_retry_full;
-	return dbEntry->rejectmap_retry;
+	LWLockAcquire(diskquota_locks.dblist_lock, LW_SHARED);
+	if (dbentry_binding_current(dbEntry))
+	{
+		if (full) *full = dbEntry->rejectmap_retry_full;
+		pending = dbEntry->rejectmap_retry;
+	}
+	LWLockRelease(diskquota_locks.dblist_lock);
+	return pending;
 }
 
 /* Sum of the published totals of all monitored databases. */

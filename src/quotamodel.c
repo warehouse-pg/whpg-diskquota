@@ -1457,6 +1457,16 @@ dispatch_rejectmap(HTAB *local_active_table_stat_map, bool include_undispatched)
 	StringInfoData             active_oids;
 	StringInfoData             sql;
 
+	/*
+	 * A worker whose slot binding moved on (DROP EXTENSION plus
+	 * re-CREATE while this refresh was in flight) must not talk to the
+	 * segments: the new incarnation owns their state, and a late
+	 * dispatch would overwrite it with entries computed before the
+	 * drop. Its retry bookkeeping is discarded for the same reason
+	 * (see diskquota_rejectmap_retry_set).
+	 */
+	if (!diskquota_worker_binding_valid()) return;
+
 	initStringInfo(&rows);
 	initStringInfo(&active_oids);
 	initStringInfo(&sql);

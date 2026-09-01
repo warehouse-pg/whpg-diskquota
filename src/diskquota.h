@@ -304,7 +304,8 @@ struct DiskquotaDBEntry
 	 * entries. The next worker cycle resends the map.
 	 * rejectmap_retry_full remembers whether the unconfirmed dispatch
 	 * carried not-yet-dispatched additions. Only the database's
-	 * current worker touches these fields.
+	 * current worker touches these fields; the accessors enforce that
+	 * under dblist_lock with the generation check the publishes use.
 	 */
 	bool rejectmap_retry;
 	bool rejectmap_retry_full;
@@ -401,6 +402,7 @@ extern bool  diskquota_am_launcher(void);
 extern void  diskquota_set_cluster_limit_mb(int64 limit_mb);
 extern int64 diskquota_get_cluster_limit_mb(void);
 extern void  diskquota_worker_capture_generation(void);
+extern bool  diskquota_worker_binding_valid(void);
 extern void  diskquota_publish_db_total(int64 total);
 extern void  diskquota_publish_db_limit(int64 limit_mb);
 extern void  diskquota_rejectmap_retry_set(bool full);
