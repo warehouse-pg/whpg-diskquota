@@ -349,6 +349,16 @@ CREATE FUNCTION diskquota.prepare_downgrade() RETURNS void AS $$
 BEGIN
 	DELETE FROM diskquota.quota_config WHERE quotatype IN (5, 6);
 	PERFORM diskquota.set_cluster_quota('-1');
+	-- Mark this database prepared (state 2): the downgrade script
+	-- requires the mark, because the cluster cap lives in the
+	-- launcher's own database, where the script cannot verify it with
+	-- plain SQL once the 2.4 library is no longer loaded. The mark
+	-- reads as "not ready" to a freshly started worker; the downgrade
+	-- script restores the ready state, and so does
+	-- diskquota.init_table_size_table() to cancel a prepared
+	-- downgrade. diskquota.state is not dumped, so the mark never
+	-- reaches a restore.
+	UPDATE diskquota.state SET state = 2;
 END;
 $$ LANGUAGE plpgsql;
 

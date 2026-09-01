@@ -43,6 +43,7 @@ test: test_worker_schedule
 # test: test_worker_schedule_exception
 test: test_cluster_database_quota
 test: test_launcher_restart
+test: test_downgrade_guard
 test: test_dbname_encoding
 test: test_drop_any_extension
 test: test_drop_extension

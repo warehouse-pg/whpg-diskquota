@@ -1,16 +1,22 @@
 -- remove objects introduced in 2.4
 -- A configured cluster quota must be removed while 2.4 is still the
 -- loaded library (diskquota.prepare_downgrade() does that): it lives
--- in the launcher's global_quota_config, which none of the objects
--- this script leaves behind can reach. Running this script under the
--- 2.4 library would fail anyway when the 2.3 function bodies below
--- force-load the not-preloaded 2.3 library, but that abort is
--- confusing; fail early with an actionable message instead. The check
--- calls a 2.4-library function, so it must be skipped when another
--- library is already loaded (the shipped downgrade order flips
--- shared_preload_libraries first).
+-- in the launcher's own database, which this script -- running in an
+-- arbitrary database, possibly without the 2.4 library -- can neither
+-- read nor clean. So the downgrade requires the mark
+-- prepare_downgrade() leaves in diskquota.state; along the shipped
+-- order (flip shared_preload_libraries first, then ALTER) that mark
+-- is the only evidence the cap was cleared, and skipping the
+-- preparation would let the cap survive in global_quota_config and
+-- silently re-arm on a later upgrade back to 2.4. While the 2.4
+-- library is still loaded, a still-configured cap is additionally
+-- reported directly.
 DO $$
 BEGIN
+	IF (SELECT state FROM diskquota.state) IS DISTINCT FROM 2 THEN
+		RAISE EXCEPTION 'this database is not prepared for downgrade'
+		      USING HINT = 'run SELECT diskquota.prepare_downgrade() in every monitored database before downgrading';
+	END IF;
 	IF current_setting('shared_preload_libraries') LIKE '%diskquota-2.4%' THEN
 		IF diskquota.cluster_quota_limit_mb() > 0 THEN
 			RAISE EXCEPTION 'a cluster quota is still configured'
@@ -19,6 +25,8 @@ BEGIN
 	END IF;
 END
 $$;
+-- the mark served its purpose; hand 2.3 a ready state
+UPDATE diskquota.state SET state = 1;
 -- The 2.3 worker feeds every quota_config row into a lookup indexed
 -- by quotatype and only knows types 0..4; a leftover CLUSTER_QUOTA(5)
 -- or DATABASE_QUOTA(6) row would make it read past that lookup on

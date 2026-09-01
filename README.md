@@ -31,11 +31,16 @@ behind a version gate until the ALTER commits, and the same
 transaction deletes the leftover rows atomically with the version
 flip.
 
-Skipping the preparation is caught twice over: running the ALTER while
-the 2.4 library is still loaded fails early when a cluster quota is
-still configured, and the 2.3 function bodies it installs refuse to
-load a library that is not preloaded, rolling the whole ALTER back
-atomically. The path with no gate is dump/restore: a dump of a 2.4
+Skipping the preparation is refused outright: the downgrade script
+requires the mark prepare_downgrade() leaves in the database,
+whichever library is loaded (the cluster cap lives in the launcher's
+own database, out of the script's reach, so the mark is the script's
+only evidence the cap was cleared). While the 2.4 library is still
+loaded, a still-configured cap is additionally reported directly, and
+the 2.3 function bodies refuse to load a library that is not
+preloaded, rolling the whole ALTER back atomically. To cancel a
+prepared downgrade, run init_table_size_table(); until then the mark
+reads as "not ready" to a freshly started worker. The path with no gate is dump/restore: a dump of a 2.4
 database restored into a 2.3 cluster recreates the 2.4-only
 quota_config rows behind the 2.3 worker's back. Run
 prepare_downgrade() (or delete the quota_config rows with

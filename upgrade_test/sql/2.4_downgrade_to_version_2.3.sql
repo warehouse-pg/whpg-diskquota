@@ -1,11 +1,10 @@
 \c
 -- Prepare the downgrade while 2.4 is still loaded: the helper removes
 -- this database's 2.4-only quota rows (the 2.3 worker must never see
--- quotatype > 4) and drops the cluster cap from the launcher's
+-- quotatype > 4), drops the cluster cap from the launcher's
 -- global_quota_config, which a plain per-database cleanup would leave
--- behind to re-arm on a later upgrade. (The 2.4--2.3 DDL script also
--- deletes leftover rows as a safety net, but it runs after the binary
--- flip -- too late to protect the 2.3 worker's first refresh.)
+-- behind to re-arm on a later upgrade, and leaves the mark the
+-- 2.4--2.3 DDL script requires before it agrees to run.
 set client_min_messages = error;
 select diskquota.prepare_downgrade();
 reset client_min_messages;

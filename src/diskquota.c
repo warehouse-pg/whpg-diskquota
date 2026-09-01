@@ -2203,6 +2203,11 @@ load_global_quota_config(void)
 	PopActiveSnapshot();
 	CommitTransactionCommand();
 
+	/* breadcrumb: lets an operator trace where a re-armed cap came from */
+	if (limit_mb > 0)
+		ereport(LOG, (errmsg("[diskquota launcher] cluster quota limit of " INT64_FORMAT
+		                     " MB loaded from diskquota_namespace.global_quota_config",
+		                     limit_mb)));
 	diskquota_set_cluster_limit_mb(limit_mb);
 }
 
