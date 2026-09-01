@@ -4,6 +4,10 @@
 -- verify it, and an unprepared downgrade would leave the cap armed
 -- there, to silently re-arm on a later upgrade back to 2.4.
 
+-- expect fail: refuses transaction blocks under its own name
+BEGIN;
+SELECT diskquota.prepare_downgrade();
+ROLLBACK;
 -- expect fail: not prepared
 ALTER EXTENSION diskquota UPDATE TO '2.3';
 SELECT diskquota.prepare_downgrade();

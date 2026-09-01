@@ -64,13 +64,16 @@ SELECT
   diskquota.database_total_size() AS total_size_in_bytes;
 
 -- Downgrade preparation: run in EVERY monitored database before
--- switching shared_preload_libraries back to diskquota-2.3. The 2.3
--- worker crashes on quota_config rows with quotatype > 4, and a
--- leftover cluster cap in diskquota_namespace.global_quota_config
--- would silently re-arm on a later upgrade back to 2.4.
-CREATE FUNCTION diskquota.prepare_downgrade() RETURNS void AS $$
-BEGIN
-	DELETE FROM diskquota.quota_config WHERE quotatype IN (5, 6);
-	PERFORM diskquota.set_cluster_quota('-1');
-END;
-$$ LANGUAGE plpgsql;
+-- switching shared_preload_libraries back to diskquota-2.3. It
+-- deletes the 2.4-only quota rows (the 2.3 worker must never see
+-- quotatype > 4), clears the cluster cap from the launcher-side
+-- global_quota_config (which would otherwise silently re-arm on a
+-- later upgrade back to 2.4), and leaves the mark (diskquota.state 2)
+-- the 2.4--2.3 script requires before it agrees to run. The mark
+-- reads as "not ready" to a freshly started worker; the downgrade
+-- script restores the ready state, and so does
+-- diskquota.init_table_size_table() to cancel a prepared downgrade.
+-- diskquota.state is not dumped, so the mark never reaches a restore.
+-- Implemented in C so the transaction-block check reports this
+-- function's own name.
+CREATE FUNCTION diskquota.prepare_downgrade() RETURNS void STRICT AS '$libdir/diskquota-2.4.so' LANGUAGE C;

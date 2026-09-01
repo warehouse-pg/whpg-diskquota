@@ -1280,8 +1280,8 @@ do_process_extension_ddl_message(MessageResult *code, ExtensionDDLMessage local_
 				*code = ERR_OK;
 				break;
 			case CMD_SET_CLUSTER_QUOTA:
+				/* the result is decided only after the post-commit publish */
 				on_set_cluster_quota(local_extension_ddl_message.payload);
-				*code = ERR_OK;
 				break;
 			default:
 				ereport(LOG, (errmsg("[diskquota launcher]:received unsupported message cmd=%d",
@@ -1309,7 +1309,21 @@ do_process_extension_ddl_message(MessageResult *code, ExtensionDDLMessage local_
 	else
 		AbortCurrentTransaction();
 	/* update something in memory after transaction committed */
-	if (ret)
+	if (ret && local_extension_ddl_message.cmd == CMD_SET_CLUSTER_QUOTA)
+	{
+		/*
+		 * Publish the live limit only now that the change to
+		 * global_quota_config is committed (the table is distributed,
+		 * so the commit itself can abort), and decide the result only
+		 * after the publish. The publish is a pure atomic write that
+		 * cannot fail, so a client is never told OK for a limit that
+		 * was persisted but never armed -- and never told OK before
+		 * enforcement actually sees it.
+		 */
+		diskquota_set_cluster_limit_mb(local_extension_ddl_message.payload);
+		*code = ERR_OK;
+	}
+	else if (ret)
 	{
 		PG_TRY();
 		{
@@ -1339,15 +1353,6 @@ do_process_extension_ddl_message(MessageResult *code, ExtensionDDLMessage local_
 					update_monitor_db_mpp(dbid, REMOVE_DB_FROM_BEING_MONITORED, LAUNCHER_SCHEMA);
 					/* clear the out-of-quota rejectmap in shared memory */
 					invalidate_database_rejectmap(dbid);
-					break;
-				case CMD_SET_CLUSTER_QUOTA:
-					/*
-					 * Publish the live limit only now that the change to
-					 * global_quota_config is committed: the table is
-					 * distributed, so the commit itself can abort, and a
-					 * rolled-back change must never reach enforcement.
-					 */
-					diskquota_set_cluster_limit_mb(local_extension_ddl_message.payload);
 					break;
 				default:
 					ereport(LOG, (errmsg("[diskquota launcher]:received unsupported message cmd=%d",

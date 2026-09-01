@@ -60,6 +60,7 @@
 /* disk quota helper function */
 
 PG_FUNCTION_INFO_V1(init_table_size_table);
+PG_FUNCTION_INFO_V1(prepare_downgrade);
 PG_FUNCTION_INFO_V1(diskquota_start_worker);
 PG_FUNCTION_INFO_V1(diskquota_pause);
 PG_FUNCTION_INFO_V1(diskquota_resume);
@@ -352,29 +353,33 @@ pull_all_table_size(PG_FUNCTION_ARGS)
 	SRF_RETURN_DONE(funcctx);
 }
 /*
- * Trigger to start diskquota worker when create extension diskquota.
- * This function is called at backend side, and will send message to
- * diskquota launcher. Launcher process is responsible for starting the real
- * diskquota worker process.
+ * Send one command to the launcher through the shared message box and
+ * wait for the verdict; a failure is reported via report_ddl_err with
+ * the locks released. On timeout the still-pending message is
+ * withdrawn under the lock: left armed, a launcher stalled for the
+ * whole wait would execute the command later, after this backend
+ * already reported failure. A message the launcher has already copied
+ * cannot be recalled; that exposure is one launcher pass, not the
+ * whole wait.
  */
-Datum
-diskquota_start_worker(PG_FUNCTION_ARGS)
+static void
+send_launcher_command(MessageCommand cmd, Oid dbid, int64 payload, const char *err_prefix)
 {
 	int rc, launcher_pid;
 
 	/*
-	 * Lock on extension_ddl_lock to avoid multiple backend create diskquota
-	 * extension at the same time.
+	 * Lock on extension_ddl_lock so concurrent commands do not fight
+	 * over the single message box.
 	 */
 	LWLockAcquire(diskquota_locks.extension_ddl_lock, LW_EXCLUSIVE);
 	LWLockAcquire(diskquota_locks.extension_ddl_message_lock, LW_EXCLUSIVE);
 	extension_ddl_message->req_pid = MyProcPid;
-	extension_ddl_message->cmd     = CMD_CREATE_EXTENSION;
+	extension_ddl_message->cmd     = cmd;
 	extension_ddl_message->result  = ERR_PENDING;
-	extension_ddl_message->dbid    = MyDatabaseId;
+	extension_ddl_message->dbid    = dbid;
+	extension_ddl_message->payload = payload;
 	launcher_pid                   = extension_ddl_message->launcher_pid;
-	/* setup sig handler to diskquota launcher process */
-	rc = kill(launcher_pid, SIGUSR2);
+	rc                             = kill(launcher_pid, SIGUSR2);
 	LWLockRelease(diskquota_locks.extension_ddl_message_lock);
 	if (rc == 0)
 	{
@@ -402,15 +407,35 @@ diskquota_start_worker(PG_FUNCTION_ARGS)
 			LWLockRelease(diskquota_locks.extension_ddl_message_lock);
 		}
 	}
-	LWLockAcquire(diskquota_locks.extension_ddl_message_lock, LW_SHARED);
+	LWLockAcquire(diskquota_locks.extension_ddl_message_lock, LW_EXCLUSIVE);
 	if (extension_ddl_message->result != ERR_OK)
 	{
+		ExtensionDDLMessage local;
+
+		memcpy(&local, extension_ddl_message, sizeof(local));
+		if (extension_ddl_message->result == ERR_PENDING && extension_ddl_message->req_pid == MyProcPid)
+		{
+			extension_ddl_message->req_pid = 0;
+			extension_ddl_message->cmd     = 0;
+		}
 		LWLockRelease(diskquota_locks.extension_ddl_message_lock);
 		LWLockRelease(diskquota_locks.extension_ddl_lock);
-		report_ddl_err(extension_ddl_message, "[diskquota] failed to create diskquota extension");
+		report_ddl_err((&local), err_prefix);
 	}
 	LWLockRelease(diskquota_locks.extension_ddl_message_lock);
 	LWLockRelease(diskquota_locks.extension_ddl_lock);
+}
+
+/*
+ * Trigger to start diskquota worker when create extension diskquota.
+ * This function is called at backend side, and will send message to
+ * diskquota launcher. Launcher process is responsible for starting the real
+ * diskquota worker process.
+ */
+Datum
+diskquota_start_worker(PG_FUNCTION_ARGS)
+{
+	send_launcher_command(CMD_CREATE_EXTENSION, MyDatabaseId, 0, "[diskquota] failed to create diskquota extension");
 
 	/* notify DBA to run init_table_size_table() when db is not empty */
 	if (!is_database_empty())
@@ -544,61 +569,12 @@ is_database_empty(void)
 void
 diskquota_stop_worker(void)
 {
-	int rc, launcher_pid;
-
 	if (!IS_QUERY_DISPATCHER())
 	{
 		return;
 	}
 
-	/*
-	 * Lock on extension_ddl_lock to avoid multiple backend create diskquota
-	 * extension at the same time.
-	 */
-	LWLockAcquire(diskquota_locks.extension_ddl_lock, LW_EXCLUSIVE);
-	LWLockAcquire(diskquota_locks.extension_ddl_message_lock, LW_EXCLUSIVE);
-	extension_ddl_message->req_pid = MyProcPid;
-	extension_ddl_message->cmd     = CMD_DROP_EXTENSION;
-	extension_ddl_message->result  = ERR_PENDING;
-	extension_ddl_message->dbid    = MyDatabaseId;
-	launcher_pid                   = extension_ddl_message->launcher_pid;
-	rc                             = kill(launcher_pid, SIGUSR2);
-	LWLockRelease(diskquota_locks.extension_ddl_message_lock);
-	if (rc == 0)
-	{
-		int count = WAIT_TIME_COUNT;
-
-		while (count-- > 0)
-		{
-			CHECK_FOR_INTERRUPTS();
-			rc = DiskquotaWaitLatch(&MyProc->procLatch, WL_LATCH_SET | WL_TIMEOUT | WL_POSTMASTER_DEATH, 100L);
-			if (rc & WL_POSTMASTER_DEATH) break;
-			ResetLatch(&MyProc->procLatch);
-
-			ereportif(kill(launcher_pid, 0) == -1 && errno == ESRCH, // do existence check
-			          ERROR,
-			          (errmsg("[diskquota] diskquota launcher pid = %d no longer exists", launcher_pid),
-			           errhint("The diskquota launcher process has been terminated for some reasons. Consider to "
-			                   "restart the cluster to start it.")));
-
-			LWLockAcquire(diskquota_locks.extension_ddl_message_lock, LW_SHARED);
-			if (extension_ddl_message->result != ERR_PENDING)
-			{
-				LWLockRelease(diskquota_locks.extension_ddl_message_lock);
-				break;
-			}
-			LWLockRelease(diskquota_locks.extension_ddl_message_lock);
-		}
-	}
-	LWLockAcquire(diskquota_locks.extension_ddl_message_lock, LW_SHARED);
-	if (extension_ddl_message->result != ERR_OK)
-	{
-		LWLockRelease(diskquota_locks.extension_ddl_message_lock);
-		LWLockRelease(diskquota_locks.extension_ddl_lock);
-		report_ddl_err(extension_ddl_message, "[diskquota] failed to drop diskquota extension");
-	}
-	LWLockRelease(diskquota_locks.extension_ddl_message_lock);
-	LWLockRelease(diskquota_locks.extension_ddl_lock);
+	send_launcher_command(CMD_DROP_EXTENSION, MyDatabaseId, 0, "[diskquota] failed to drop diskquota extension");
 }
 
 /*
@@ -805,7 +781,6 @@ warn_uncounted_databases(void)
 Datum
 set_cluster_quota(PG_FUNCTION_ARGS)
 {
-	int   rc, launcher_pid;
 	char *sizestr;
 	int64 quota_limit_mb;
 
@@ -848,54 +823,51 @@ set_cluster_quota(PG_FUNCTION_ARGS)
 	}
 	if (quota_limit_mb < 0) quota_limit_mb = -1;
 
-	LWLockAcquire(diskquota_locks.extension_ddl_lock, LW_EXCLUSIVE);
-	LWLockAcquire(diskquota_locks.extension_ddl_message_lock, LW_EXCLUSIVE);
-	extension_ddl_message->req_pid = MyProcPid;
-	extension_ddl_message->cmd     = CMD_SET_CLUSTER_QUOTA;
-	extension_ddl_message->result  = ERR_PENDING;
-	/* this command carries no database; do not leave a stale one in the slot */
-	extension_ddl_message->dbid    = InvalidOid;
-	extension_ddl_message->payload = quota_limit_mb;
-	launcher_pid                   = extension_ddl_message->launcher_pid;
-	rc                             = kill(launcher_pid, SIGUSR2);
-	LWLockRelease(diskquota_locks.extension_ddl_message_lock);
-	if (rc == 0)
-	{
-		int count = WAIT_TIME_COUNT;
-
-		while (count-- > 0)
-		{
-			CHECK_FOR_INTERRUPTS();
-			rc = DiskquotaWaitLatch(&MyProc->procLatch, WL_LATCH_SET | WL_TIMEOUT | WL_POSTMASTER_DEATH, 100L);
-			if (rc & WL_POSTMASTER_DEATH) break;
-			ResetLatch(&MyProc->procLatch);
-
-			ereportif(kill(launcher_pid, 0) == -1 && errno == ESRCH, // do existence check
-			          ERROR,
-			          (errmsg("[diskquota] diskquota launcher pid = %d no longer exists", launcher_pid),
-			           errhint("The diskquota launcher process has been terminated for some reasons. Consider to "
-			                   "restart the cluster to start it.")));
-
-			LWLockAcquire(diskquota_locks.extension_ddl_message_lock, LW_SHARED);
-			if (extension_ddl_message->result != ERR_PENDING)
-			{
-				LWLockRelease(diskquota_locks.extension_ddl_message_lock);
-				break;
-			}
-			LWLockRelease(diskquota_locks.extension_ddl_message_lock);
-		}
-	}
-	LWLockAcquire(diskquota_locks.extension_ddl_message_lock, LW_SHARED);
-	if (extension_ddl_message->result != ERR_OK)
-	{
-		LWLockRelease(diskquota_locks.extension_ddl_message_lock);
-		LWLockRelease(diskquota_locks.extension_ddl_lock);
-		report_ddl_err(extension_ddl_message, "[diskquota] failed to set cluster quota");
-	}
-	LWLockRelease(diskquota_locks.extension_ddl_message_lock);
-	LWLockRelease(diskquota_locks.extension_ddl_lock);
+	send_launcher_command(CMD_SET_CLUSTER_QUOTA, InvalidOid, quota_limit_mb, "[diskquota] failed to set cluster quota");
 
 	if (quota_limit_mb > 0) warn_uncounted_databases();
+	PG_RETURN_VOID();
+}
+
+/*
+ * Downgrade preparation: run in every monitored database before
+ * ALTER EXTENSION diskquota UPDATE TO '2.3'. Deletes this database's
+ * 2.4-only quota rows (the 2.3 worker must never see quotatype > 4),
+ * clears the launcher-side cluster cap, and leaves the mark
+ * (diskquota.state = 2) the 2.4--2.3 script requires before it agrees
+ * to run. Implemented in C so the transaction-block check reports
+ * this function's own name.
+ */
+Datum
+prepare_downgrade(PG_FUNCTION_ARGS)
+{
+	int ret;
+
+	if (!superuser())
+	{
+		ereport(ERROR, (errcode(ERRCODE_INSUFFICIENT_PRIVILEGE), errmsg("must be superuser to prepare a downgrade")));
+	}
+	/*
+	 * The launcher persists the cap removal in its own transaction, so
+	 * a ROLLBACK in the caller would not undo it: refuse to run inside
+	 * an explicit transaction block.
+	 */
+#if GP_VERSION_NUM < 70000
+	PreventTransactionChain(true, "diskquota.prepare_downgrade()");
+#else
+	PreventInTransactionBlock(true, "diskquota.prepare_downgrade()");
+#endif
+
+	SPI_connect();
+	ret = SPI_execute("delete from diskquota.quota_config where quotatype in (5, 6)", false, 0);
+	if (ret != SPI_OK_DELETE) elog(ERROR, "cannot delete 2.4-only quota_config rows: error code %d", ret);
+	/* the mark the 2.4--2.3 script requires; see the DDL comment */
+	ret = SPI_execute("update diskquota.state set state = 2", false, 0);
+	if (ret != SPI_OK_UPDATE) elog(ERROR, "cannot update state table: error code %d", ret);
+	SPI_finish();
+
+	/* clear the cluster cap in the launcher-side global_quota_config */
+	send_launcher_command(CMD_SET_CLUSTER_QUOTA, InvalidOid, -1, "[diskquota] failed to clear the cluster quota");
 	PG_RETURN_VOID();
 }
 
