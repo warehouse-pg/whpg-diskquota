@@ -192,6 +192,60 @@ INSERT INTO cdqschema.cdq_t2 VALUES (7, 'x');
 -- the API cannot see the stale row; remove it directly
 DELETE FROM diskquota.quota_config WHERE quotatype = 6;
 
+-- === dropping a table must shed its usage from the published totals ===
+-- the worker publishes the database total from its in-memory model;
+-- a dropped table's slice has to leave that total, or a cap would
+-- keep blocking writes after the space was freed
+CREATE TABLE cdqschema.cdq_big (i INT, t TEXT) DISTRIBUTED BY (i);
+INSERT INTO cdqschema.cdq_big SELECT g, repeat('x', 1000) FROM generate_series(1, 15000) g;
+SELECT diskquota.set_database_quota(current_database()::text, '10 MB');
+SELECT diskquota.wait_for_worker_new_epoch();
+-- the load shows in the database total
+SELECT total_size_in_bytes > 10 * 1048576 AS load_counted
+FROM diskquota.show_database_quota_view;
+-- expect fail: over the database cap
+INSERT INTO cdqschema.cdq_big VALUES (0, 'x');
+DROP TABLE cdqschema.cdq_big;
+SELECT diskquota.wait_for_worker_new_epoch();
+SELECT diskquota.wait_for_worker_new_epoch();
+-- the dropped table's usage left the total; writes resume
+SELECT total_size_in_bytes < 10 * 1048576 AS drop_shed_from_total
+FROM diskquota.show_database_quota_view;
+INSERT INTO cdqschema.cdq_t2 VALUES (8, 'x');
+SELECT diskquota.set_database_quota(current_database()::text, '-1');
+SELECT diskquota.wait_for_worker_new_epoch();
+
+-- === the extension schema oid must be re-read after re-creation ===
+-- backends cache the diskquota schema oid for the object-independent
+-- quota exemption; DROP + CREATE EXTENSION changes the oid, and a
+-- stale cache would let the cluster cap block diskquota's own
+-- bookkeeping in this session
+-- go over the cluster cap and let this session cache the schema oid
+INSERT INTO cdqschema.cdq_t2 SELECT g, repeat('x', 1000) FROM generate_series(1, 15000) g;
+SELECT diskquota.wait_for_worker_new_epoch();
+-- expect fail: over the cluster cap (this also warms the cache)
+INSERT INTO cdqschema.cdq_t2 VALUES (9, 'x');
+-- re-create the extension in this same session: new schema oid
+-- (reset search_path first: CREATE EXTENSION records the first schema
+-- on the search_path as the extension home, and it must not be
+-- recorded as living in cdqschema)
+RESET search_path;
+DROP EXTENSION diskquota;
+CREATE EXTENSION diskquota;
+SET search_path TO cdqschema;
+SELECT diskquota.init_table_size_table();
+-- bounded wait: the first refresh after initialization is a full
+-- recalculation, so plain epoch waits can return before the worker
+-- republishes the totals
+DO $$ BEGIN FOR i IN 1..600 LOOP EXIT WHEN diskquota.cluster_total_size() > 10 * 1048576; PERFORM pg_sleep(0.1); END LOOP; END $$;
+SELECT total_size_in_bytes > 10 * 1048576 AS republished_over_cap
+FROM diskquota.show_cluster_quota_view;
+-- expect fail: still over the cluster cap after re-creation
+INSERT INTO cdqschema.cdq_t2 VALUES (10, 'x');
+-- diskquota's own bookkeeping stays exempt under the new schema oid:
+-- a repair write into diskquota.table_size must pass the cap check
+SELECT diskquota.init_table_size_table();
+
 SELECT diskquota.set_cluster_quota('-1');
 SELECT diskquota.wait_for_worker_new_epoch();
 DROP TABLE cdqschema.cdq_t2;
