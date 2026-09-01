@@ -619,6 +619,30 @@ disk_quota_worker_main(Datum main_arg)
 		int rc;
 
 		/*
+		 * The slot binding can be gone: DROP EXTENSION after a launcher
+		 * restart cannot signal this worker (the termination handles
+		 * live in launcher process memory), it only releases the slot.
+		 * A worker whose binding is gone must exit on its own, or it
+		 * would loop forever -- its per-cycle SQL errors are swallowed
+		 * -- and never return its DiskQuotaWorkerEntry, starving a
+		 * later CREATE EXTENSION of workers.
+		 */
+		{
+			bool stale;
+
+			LWLockAcquire(diskquota_locks.dblist_lock, LW_SHARED);
+			stale = !dbentry_binding_current(MyWorkerInfo->dbEntry);
+			LWLockRelease(diskquota_locks.dblist_lock);
+			if (stale)
+			{
+				ereport(LOG, (errmsg("[diskquota] bgworker for \"%s\" exits: its database is "
+				                     "no longer monitored",
+				                     dbname)));
+				break;
+			}
+		}
+
+		/*
 		 * The log printed from the bgworker does not contain the database name
 		 * but contains the bgworker's pid. We should print the database name
 		 * every BGWORKER_LOG_TIME to ensure that we can find the database name

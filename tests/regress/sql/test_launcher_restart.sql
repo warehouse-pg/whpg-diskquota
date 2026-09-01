@@ -36,6 +36,17 @@ SELECT diskquota.wait_for_worker_new_epoch();
 SELECT gp_inject_fault('diskquota_reap_dropped_databases', 'reset', dbid)
   FROM gp_segment_configuration WHERE role = 'p' AND content = -1;
 
+-- === a worker whose binding is gone exits and frees its slot ===
+-- the launcher restart above lost the process-local termination
+-- handles, so this DROP cannot signal the worker: it must notice the
+-- released binding itself and exit, or it would loop forever and pin
+-- its worker slot, starving any later CREATE EXTENSION
+DROP EXTENSION diskquota;
+\! for i in $(seq 1 30); do n=$(pgrep -fc "bgworker: \[diskquota\] [c]ontrib_regression" || true); [ "$n" = "0" ] && { echo WORKER-EXITED; break; }; sleep 1; done
+-- the freed slot serves a new extension
+CREATE EXTENSION diskquota;
+\! for i in $(seq 1 30); do e=$(psql -d contrib_regression -Atc "select diskquota.show_worker_epoch()" 2>/dev/null); [ -n "$e" ] && [ "$e" != "0" ] && { echo NEW-WORKER-SERVING; break; }; sleep 1; done
+
 -- remove the spent fault entry so a rerun can inject again
 SELECT gp_inject_fault('diskquota_launcher_main', 'reset', dbid)
   FROM gp_segment_configuration WHERE role = 'p' AND content = -1;
