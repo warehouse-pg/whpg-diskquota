@@ -157,6 +157,25 @@ diskquota_is_paused()
 }
 
 /*
+ * One-probe variant for the per-write quota check: returns whether
+ * dbid is monitored, and fills *paused with its paused flag (false
+ * when not monitored).
+ */
+bool
+diskquota_db_monitored_and_paused(Oid dbid, bool *paused)
+{
+	bool           found;
+	MonitorDBEntry entry;
+
+	*paused = false;
+	LWLockAcquire(diskquota_locks.monitored_dbid_cache_lock, LW_SHARED);
+	entry = hash_search(monitored_dbid_cache, &dbid, HASH_FIND, &found);
+	if (found) *paused = entry->paused;
+	LWLockRelease(diskquota_locks.monitored_dbid_cache_lock);
+	return found;
+}
+
+/*
  * True when dbid is a diskquota-monitored database, i.e. the
  * extension is installed there and the launcher tracks it. The
  * object-independent quotas cover monitored databases only: an

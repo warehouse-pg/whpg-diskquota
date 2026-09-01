@@ -1879,37 +1879,70 @@ prepare_rejectmap_search_key(RejectMapEntry *keyitem, QuotaType type, Oid relown
 	keyitem->targettype  = type;
 }
 
+static Oid  diskquota_nsoid_cache               = InvalidOid;
+static bool diskquota_nsoid_callback_registered = false;
+
+static void
+diskquota_nsoid_cache_reset(Datum arg, int cacheid, uint32 hashvalue)
+{
+	diskquota_nsoid_cache = InvalidOid;
+}
+
 /*
- * Given table oid, check whether quota limit
- * of table's schema or table's owner are reached.
- * Do enforcement if quota exceeds.
+ * Oid of the "diskquota" schema, cached per backend: the write hot
+ * path consults it on every quota check. Any pg_namespace change
+ * resets the cache; the schema oid only changes when the extension
+ * is dropped and re-created.
+ */
+static Oid
+get_diskquota_nsoid(void)
+{
+	if (!diskquota_nsoid_callback_registered)
+	{
+		CacheRegisterSyscacheCallback(NAMESPACENAME, diskquota_nsoid_cache_reset, (Datum)0);
+		diskquota_nsoid_callback_registered = true;
+	}
+	if (!OidIsValid(diskquota_nsoid_cache)) diskquota_nsoid_cache = get_namespace_oid("diskquota", true /*missing_ok*/);
+	return diskquota_nsoid_cache;
+}
+
+/*
+ * The object-independent quotas (CLUSTER_QUOTA / DATABASE_QUOTA)
+ * match every relation of the database, so they must explicitly
+ * spare catalog relations and diskquota's own bookkeeping schema:
+ * blocking diskquota.table_size would prevent usage from ever being
+ * recorded as decreasing once a cap is hit, wedging the cap
+ * permanently.
  */
 static bool
-check_rejectmap_by_reloid(Oid reloid)
+objectwide_quota_exempt_ns(Oid relnamespace)
 {
-	Oid                   ownerOid      = InvalidOid;
-	Oid                   nsOid         = InvalidOid;
-	Oid                   tablespaceoid = InvalidOid;
+	return relnamespace == PG_CATALOG_NAMESPACE || relnamespace == get_diskquota_nsoid();
+}
+
+/*
+ * Same rule for the dispatcher's per-write check, where diskquota's
+ * own processes (workers and the launcher) are exempt as well, or
+ * they could not maintain the bookkeeping that lets usage decrease.
+ */
+static bool
+objectwide_quota_exempt(Oid relnamespace)
+{
+	return diskquota_am_bgworker() || diskquota_am_launcher() || objectwide_quota_exempt_ns(relnamespace);
+}
+
+/*
+ * Rejectmap probe for a relation whose owner, schema and tablespace
+ * are already resolved. The exemption predicate may read the catalog
+ * on a cache miss, so it is evaluated before taking the lock.
+ */
+static bool
+check_rejectmap_resolved(Oid ownerOid, Oid nsOid, Oid tablespaceoid)
+{
 	bool                  found;
 	RejectMapEntry        keyitem;
 	GlobalRejectMapEntry *entry;
-
-	bool found_rel = get_rel_owner_schema_tablespace(reloid, &ownerOid, &nsOid, &tablespaceoid);
-	if (!found_rel)
-	{
-		return true;
-	}
-
-	/*
-	 * The object-independent quotas match every relation; spare
-	 * diskquota's own processes (workers and the launcher), catalog
-	 * relations and diskquota's bookkeeping schema, or usage could
-	 * never be recorded as decreasing once the cap is hit (see
-	 * refresh_rejectmap()). Resolved before taking the lock:
-	 * get_namespace_oid() may read the catalog.
-	 */
-	bool objectwide_exempt = diskquota_am_bgworker() || diskquota_am_launcher() || nsOid == PG_CATALOG_NAMESPACE ||
-	                         nsOid == get_namespace_oid("diskquota", true /*missing_ok*/);
+	bool                  objectwide_exempt = objectwide_quota_exempt(nsOid);
 
 	LWLockAcquire(diskquota_locks.reject_map_lock, LW_SHARED);
 	for (QuotaType type = 0; type < NUM_QUOTA_TYPES; ++type)
@@ -1929,6 +1962,22 @@ check_rejectmap_by_reloid(Oid reloid)
 }
 
 /*
+ * Given table oid, check whether quota limit
+ * of table's schema or table's owner are reached.
+ * Do enforcement if quota exceeds.
+ */
+static bool
+check_rejectmap_by_reloid(Oid reloid)
+{
+	Oid ownerOid      = InvalidOid;
+	Oid nsOid         = InvalidOid;
+	Oid tablespaceoid = InvalidOid;
+
+	if (!get_rel_owner_schema_tablespace(reloid, &ownerOid, &nsOid, &tablespaceoid)) return true;
+	return check_rejectmap_resolved(ownerOid, nsOid, tablespaceoid);
+}
+
+/*
  * Given relation's oid or relfilenode, check whether the
  * quota limits of schema or owner are reached. Do enforcement
  * if the quota exceeds.
@@ -1937,10 +1986,14 @@ bool
 quota_check_common(Oid reloid, RelFileNode *relfilenode)
 {
 	bool enable_hardlimit;
+	bool paused;
+	bool monitored;
 
 	if (!IsTransactionState()) return true;
 
-	if (diskquota_is_paused()) return true;
+	/* one cache probe fetches both facts needed below */
+	monitored = diskquota_db_monitored_and_paused(MyDatabaseId, &paused);
+	if (paused) return true;
 
 	/*
 	 * Cluster-wide quota: reject the write when the aggregate size of
@@ -1957,7 +2010,7 @@ quota_check_common(Oid reloid, RelFileNode *relfilenode)
 	 * monitored (CREATE EXTENSION) while the cluster is over quota.
 	 */
 	if (OidIsValid(reloid) && IS_QUERY_DISPATCHER() && !diskquota_am_bgworker() && !diskquota_am_launcher() &&
-	    diskquota_is_monitored_dbid(MyDatabaseId))
+	    monitored)
 	{
 		int64 db_total    = 0;
 		int64 db_limit_mb = 0;
@@ -1983,9 +2036,8 @@ quota_check_common(Oid reloid, RelFileNode *relfilenode)
 		 * cap permanently. Same rule as on segments in
 		 * refresh_rejectmap().
 		 */
-		if (!get_rel_owner_schema_tablespace(reloid, &ownerOid, &nsOid, &spcOid) || nsOid == PG_CATALOG_NAMESPACE ||
-		    nsOid == get_namespace_oid("diskquota", true /*missing_ok*/))
-			return check_rejectmap_by_reloid(reloid);
+		if (!get_rel_owner_schema_tablespace(reloid, &ownerOid, &nsOid, &spcOid)) return true;
+		if (objectwide_quota_exempt(nsOid)) return check_rejectmap_resolved(ownerOid, nsOid, spcOid);
 
 		if (db_limit_mb > 0 && db_total >= db_limit_mb * (int64)(1 << 20))
 			ereport(ERROR,
@@ -2005,6 +2057,8 @@ quota_check_common(Oid reloid, RelFileNode *relfilenode)
 				                        " MB; free disk space or raise diskquota.set_cluster_quota()",
 				                        total / (1 << 20), limit_mb)));
 		}
+
+		return check_rejectmap_resolved(ownerOid, nsOid, spcOid);
 	}
 
 	if (OidIsValid(reloid)) return check_rejectmap_by_reloid(reloid);
@@ -2239,14 +2293,6 @@ refresh_rejectmap(PG_FUNCTION_ARGS)
 	get_typlenbyvalalign(active_oid_elem_type, &elem_width, &elem_type_by_val, &elem_alignment_code);
 	deconstruct_array(active_oid_array_type, active_oid_elem_type, elem_width, elem_type_by_val, elem_alignment_code,
 	                  &datums, &nulls, &active_array_count);
-	/*
-	 * The object-independent quotas (CLUSTER_QUOTA / DATABASE_QUOTA)
-	 * match every relation of the database, so they must explicitly
-	 * spare catalog relations and diskquota's own bookkeeping tables:
-	 * blocking diskquota.table_size would prevent the worker from ever
-	 * recording that usage dropped, wedging the cap permanently.
-	 */
-	Oid diskquota_nsoid = get_namespace_oid("diskquota", true /*missing_ok*/);
 	for (int i = 0; i < active_array_count; ++i)
 	{
 		Oid       active_oid = InvalidOid;
@@ -2274,8 +2320,7 @@ refresh_rejectmap(PG_FUNCTION_ARGS)
 
 			for (QuotaType type = 0; type < NUM_QUOTA_TYPES; ++type)
 			{
-				if ((type == CLUSTER_QUOTA || type == DATABASE_QUOTA) &&
-				    (relnamespace == PG_CATALOG_NAMESPACE || relnamespace == diskquota_nsoid))
+				if ((type == CLUSTER_QUOTA || type == DATABASE_QUOTA) && objectwide_quota_exempt_ns(relnamespace))
 					continue;
 				/* Check that if the current relation should be blocked. */
 				prepare_rejectmap_search_key(&keyitem, type, relowner, relnamespace, reltablespace);
@@ -2380,8 +2425,7 @@ refresh_rejectmap(PG_FUNCTION_ARGS)
 				RejectMapEntry keyitem;
 				for (QuotaType type = 0; type < NUM_QUOTA_TYPES; ++type)
 				{
-					if ((type == CLUSTER_QUOTA || type == DATABASE_QUOTA) &&
-					    (relnamespace == PG_CATALOG_NAMESPACE || relnamespace == diskquota_nsoid))
+					if ((type == CLUSTER_QUOTA || type == DATABASE_QUOTA) && objectwide_quota_exempt_ns(relnamespace))
 						continue;
 					/* Check that if the current relation should be blocked. */
 					prepare_rejectmap_search_key(&keyitem, type, relowner, relnamespace, reltablespace);
