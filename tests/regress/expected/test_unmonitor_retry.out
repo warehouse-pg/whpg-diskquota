@@ -1,0 +1,38 @@
+-- A failed segment-side unmonitor dispatch during DROP EXTENSION must
+-- be retried by the launcher: the database still exists, so the
+-- dropped-database reaper never revisits it, and the segments would
+-- otherwise keep bookkeeping for an unmonitored database until their
+-- postmasters restart.
+SELECT gp_inject_fault('diskquota_drop_unmonitor', 'error', dbid)
+  FROM gp_segment_configuration WHERE role = 'p' AND content = -1;
+ gp_inject_fault 
+-----------------
+ Success:
+(1 row)
+
+DROP EXTENSION diskquota;
+-- the dispatch really failed (the DROP itself still succeeds)
+SELECT gp_wait_until_triggered_fault('diskquota_drop_unmonitor', 1, dbid)
+  FROM gp_segment_configuration WHERE role = 'p' AND content = -1;
+ gp_wait_until_triggered_fault 
+-------------------------------
+ Success:
+(1 row)
+
+-- bounded wait: the launcher retries and the segments forget the db
+\! for i in $(seq 1 30); do n=$(psql -d contrib_regression -Atc "SELECT count(*) FROM (SELECT (diskquota_test.db_status()).* FROM gp_dist_random('gp_id')) s WHERE datname = current_database()"); [ "$n" = "0" ] && { echo UNMONITOR-RETRIED; break; }; sleep 1; done
+UNMONITOR-RETRIED
+SELECT gp_inject_fault('diskquota_drop_unmonitor', 'reset', dbid)
+  FROM gp_segment_configuration WHERE role = 'p' AND content = -1;
+ gp_inject_fault 
+-----------------
+ Success:
+(1 row)
+
+CREATE EXTENSION diskquota;
+SELECT diskquota.wait_for_worker_new_epoch();
+ wait_for_worker_new_epoch 
+---------------------------
+ t
+(1 row)
+

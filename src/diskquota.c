@@ -147,6 +147,8 @@ static void init_database_list(void);
 static DiskquotaDBEntry       *next_db(DiskquotaDBEntry *curDB);
 static DiskQuotaWorkerEntry   *next_worker(void);
 static bool                    dbentry_binding_current(DiskquotaDBEntry *dbEntry);
+static void                    queue_pending_unmonitor(Oid dbid);
+static void                    retry_pending_unmonitor(void);
 static DiskquotaDBEntry       *add_db_entry(Oid dbid);
 static bool                    release_db_entry(Oid dbid);
 static char                   *get_db_name(Oid dbid);
@@ -1325,6 +1327,8 @@ do_process_extension_ddl_message(MessageResult *code, ExtensionDDLMessage local_
 	}
 	else if (ret)
 	{
+		connected          = false;
+		pushed_active_snap = false;
 		PG_TRY();
 		{
 			/* update_monitor_db_mpp runs sql to distribute dbid to segments */
@@ -1338,6 +1342,7 @@ do_process_extension_ddl_message(MessageResult *code, ExtensionDDLMessage local_
 				ereport(ERROR, (errcode(ERRCODE_INTERNAL_ERROR),
 				                errmsg("unable to connect to execute internal query. return code: %d.", ret_code)));
 			}
+			connected = true;
 			switch (local_extension_ddl_message.cmd)
 			{
 				case CMD_CREATE_EXTENSION:
@@ -1350,6 +1355,7 @@ do_process_extension_ddl_message(MessageResult *code, ExtensionDDLMessage local_
 					if (num_db <= diskquota_max_workers) DiskquotaLauncherShmem->isDynamicWorker = false;
 					/* terminate bgworker in release_db_entry rountine */
 					release_db_entry(dbid);
+					SIMPLE_FAULT_INJECTOR("diskquota_drop_unmonitor");
 					update_monitor_db_mpp(dbid, REMOVE_DB_FROM_BEING_MONITORED, LAUNCHER_SCHEMA);
 					/* clear the out-of-quota rejectmap in shared memory */
 					invalidate_database_rejectmap(dbid);
@@ -1359,9 +1365,6 @@ do_process_extension_ddl_message(MessageResult *code, ExtensionDDLMessage local_
 					                     local_extension_ddl_message.cmd)));
 					break;
 			}
-			SPI_finish();
-			if (pushed_active_snap) PopActiveSnapshot();
-			CommitTransactionCommand();
 		}
 		PG_CATCH();
 		{
@@ -1369,9 +1372,30 @@ do_process_extension_ddl_message(MessageResult *code, ExtensionDDLMessage local_
 			HOLD_INTERRUPTS();
 			EmitErrorReport();
 			FlushErrorState();
+			/*
+			 * The segment-side unmonitor dispatch is the only step
+			 * here whose loss is unrepairable (the database still
+			 * exists, so the reaper never revisits it); hand it to
+			 * the launcher loop to retry.
+			 */
+			if (local_extension_ddl_message.cmd == CMD_DROP_EXTENSION)
+				queue_pending_unmonitor((Oid)local_extension_ddl_message.dbid);
+			ret = false;
 			RESUME_INTERRUPTS();
 		}
 		PG_END_TRY();
+		/*
+		 * The cleanup must run outside the PG_TRY: a swallowed error
+		 * used to leave the started transaction behind, and the next
+		 * StartTransactionCommand anywhere in the launcher died with
+		 * "unexpected state STARTED", taking the launcher down.
+		 */
+		if (connected) SPI_finish();
+		if (pushed_active_snap) PopActiveSnapshot();
+		if (ret)
+			CommitTransactionCommand();
+		else
+			AbortCurrentTransaction();
 	}
 	DisconnectAndDestroyAllGangs(false);
 }
@@ -1959,6 +1983,78 @@ add_db_entry(Oid dbid)
 }
 
 /*
+ * Databases whose segment-side unmonitor dispatch failed during DROP
+ * EXTENSION. A database that still exists is invisible to the
+ * dropped-database reaper, so without a retry the segments would keep
+ * a monitored_dbid_cache slot and the activity hooks running for it
+ * until their postmasters restart. Process-local: a launcher restart
+ * loses the queue, which at worst restores the old behavior.
+ */
+static Oid *pending_unmonitor   = NULL;
+static int  n_pending_unmonitor = 0;
+
+static void
+queue_pending_unmonitor(Oid dbid)
+{
+	if (pending_unmonitor == NULL)
+		pending_unmonitor = MemoryContextAlloc(TopMemoryContext, sizeof(Oid) * diskquota_max_monitored_databases);
+	for (int i = 0; i < n_pending_unmonitor; i++)
+		if (pending_unmonitor[i] == dbid) return;
+	if (n_pending_unmonitor < diskquota_max_monitored_databases) pending_unmonitor[n_pending_unmonitor++] = dbid;
+}
+
+/*
+ * Retry the queued unmonitor dispatches, one transaction each so one
+ * still-failing database does not block the rest.
+ */
+static void
+retry_pending_unmonitor(void)
+{
+	for (int i = 0; i < n_pending_unmonitor;)
+	{
+		Oid  dbid               = pending_unmonitor[i];
+		bool connected          = false;
+		bool pushed_active_snap = false;
+		bool ok                 = true;
+
+		StartTransactionCommand();
+		PG_TRY();
+		{
+			if (SPI_OK_CONNECT != SPI_connect())
+				ereport(ERROR, (errcode(ERRCODE_INTERNAL_ERROR),
+				                errmsg("[diskquota launcher] unable to connect to execute internal query")));
+			connected = true;
+			PushActiveSnapshot(GetTransactionSnapshot());
+			pushed_active_snap = true;
+			update_monitor_db_mpp(dbid, REMOVE_DB_FROM_BEING_MONITORED, LAUNCHER_SCHEMA);
+		}
+		PG_CATCH();
+		{
+			error_context_stack = NULL;
+			HOLD_INTERRUPTS();
+			EmitErrorReport();
+			FlushErrorState();
+			ok = false;
+			RESUME_INTERRUPTS();
+		}
+		PG_END_TRY();
+		if (connected) SPI_finish();
+		if (pushed_active_snap) PopActiveSnapshot();
+		if (ok)
+		{
+			CommitTransactionCommand();
+			invalidate_database_rejectmap(dbid);
+			pending_unmonitor[i] = pending_unmonitor[--n_pending_unmonitor];
+		}
+		else
+		{
+			AbortCurrentTransaction();
+			i++;
+		}
+	}
+}
+
+/*
  * Returns whether a dbArray slot was actually bound to dbid and
  * released: callers that maintain num_db must not decrement for a
  * database that never held a slot.
@@ -2262,6 +2358,13 @@ reap_dropped_databases(void)
 	 * report per naptime.
 	 */
 	static int reap_backoff = 0;
+	/*
+	 * The launcher loop wakes far more often than once per naptime (a
+	 * SIGUSR1 arrives on every worker start and stop); throttle the
+	 * sweep, which dispatches a SELECT to every segment, to naptime
+	 * cadence.
+	 */
+	static TimestampTz last_sweep = 0;
 
 	/* both are modified inside PG_TRY and read after PG_CATCH */
 	Oid *volatile dead = palloc(sizeof(Oid) * diskquota_max_monitored_databases);
@@ -2273,6 +2376,12 @@ reap_dropped_databases(void)
 		pfree(dead);
 		return;
 	}
+	if (last_sweep != 0 && !TimestampDifferenceExceeds(last_sweep, GetCurrentTimestamp(), diskquota_naptime * 1000))
+	{
+		pfree(dead);
+		return;
+	}
+	last_sweep = GetCurrentTimestamp();
 
 	/* SearchSysCache in is_valid_dbid requires a transaction */
 	StartTransactionCommand();
@@ -2419,7 +2528,14 @@ reap_dropped_databases(void)
 		}
 	}
 
-	if (ndead > 0) DisconnectAndDestroyAllGangs(false);
+	retry_pending_unmonitor();
+
+	/*
+	 * The sweep (and any retries above) dispatched to every segment;
+	 * drop the gangs rather than pinning one idle QE per primary
+	 * between sweeps.
+	 */
+	DisconnectAndDestroyAllGangs(false);
 	pfree(dead);
 }
 
