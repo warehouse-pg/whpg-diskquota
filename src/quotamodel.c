@@ -41,6 +41,7 @@
 
 #include "cdb/cdbvars.h"
 #include "cdb/cdbdisp_query.h"
+#include "cdb/cdbgang.h"
 #include "cdb/cdbdispatchresult.h"
 #include "cdb/cdbutil.h"
 
@@ -218,6 +219,8 @@ static QuotaInfoEntry *put_quota_map_entry(QuotaInfoEntryKey *key, bool *found);
 static void  refresh_disk_quota_usage(bool is_init);
 static void  calculate_table_disk_usage(bool is_init, HTAB *local_active_table_stat_map);
 static int64 flush_to_table_size(void);
+static void  stash_paused_active_oids(HTAB *active_map);
+static bool  merge_paused_active_backlog(HTAB *active_map);
 static void  flush_to_table_size_after_commit(void);
 static bool  flush_local_reject_map(bool *entries_removed);
 static void  dispatch_rejectmap(HTAB *local_active_table_stat_map, bool include_undispatched);
@@ -890,6 +893,7 @@ refresh_disk_quota_usage(bool is_init)
 		 */
 		if (!diskquota_is_paused())
 		{
+			bool had_backlog = merge_paused_active_backlog(local_active_table_stat_map);
 			/* copy local reject map back to shared reject map */
 			bool reject_map_removed = false;
 			bool reject_map_changed = flush_local_reject_map(&reject_map_removed);
@@ -911,10 +915,15 @@ refresh_disk_quota_usage(bool is_init)
 			 */
 			bool retry_full    = false;
 			bool retry_pending = diskquota_rejectmap_retry_pending(&retry_full);
-			bool full_dispatch = is_init || (diskquota_hardlimit && (reject_map_changed || hasActiveTable)) ||
+			bool full_dispatch = is_init ||
+			                     (diskquota_hardlimit && (reject_map_changed || hasActiveTable || had_backlog)) ||
 			                     (retry_pending && retry_full);
 			if (full_dispatch || reject_map_removed || retry_pending)
 				dispatch_rejectmap(local_active_table_stat_map, full_dispatch);
+		}
+		else
+		{
+			stash_paused_active_oids(local_active_table_stat_map);
 		}
 		hash_destroy(local_active_table_stat_map);
 	}
@@ -938,6 +947,15 @@ refresh_disk_quota_usage(bool is_init)
 	}
 	else
 		AbortCurrentTransaction();
+
+	/*
+	 * A paused database is still counted every naptime -- that is
+	 * deliberate -- but its worker must not pin per-segment gangs
+	 * between cycles while enforcement is off; the next cycle
+	 * re-creates them. Outside the transaction: the commit above can
+	 * be distributed.
+	 */
+	if (diskquota_is_paused()) DisconnectAndDestroyAllGangs(false);
 
 	return;
 }
@@ -1359,6 +1377,70 @@ flush_to_table_size(void)
 	pfree(insert_statement.data);
 
 	return db_total;
+}
+
+/*
+ * Active-table oids drained by paused refresh cycles. The fetch
+ * consumes (removes) the segments' active entries, and a paused cycle
+ * skips the dispatch, so a relfilenode that changed during the pause
+ * would otherwise be missing from the first post-resume dispatch and
+ * its table would escape segment-side hardlimit enforcement until its
+ * next extension. Worker-local; handed to the first unpaused
+ * dispatch.
+ */
+static HTAB *paused_active_backlog = NULL;
+
+static void
+stash_paused_active_oids(HTAB *active_map)
+{
+	HASH_SEQ_STATUS            iter;
+	DiskQuotaActiveTableEntry *entry;
+
+	if (paused_active_backlog == NULL)
+	{
+		HASHCTL ctl;
+
+		memset(&ctl, 0, sizeof(ctl));
+		ctl.keysize   = sizeof(Oid);
+		ctl.entrysize = sizeof(Oid);
+		ctl.hcxt      = TopMemoryContext;
+		paused_active_backlog =
+		        diskquota_hash_create("paused active backlog", 64, &ctl, HASH_ELEM | HASH_CONTEXT, DISKQUOTA_TAG_HASH);
+	}
+	hash_seq_init(&iter, active_map);
+	while ((entry = hash_seq_search(&iter)) != NULL)
+		(void)hash_search(paused_active_backlog, &entry->reloid, HASH_ENTER, NULL);
+}
+
+/* Returns whether anything was owed to this dispatch. */
+static bool
+merge_paused_active_backlog(HTAB *active_map)
+{
+	HASH_SEQ_STATUS iter;
+	Oid            *oid;
+	bool            merged = false;
+
+	if (paused_active_backlog == NULL) return false;
+	hash_seq_init(&iter, paused_active_backlog);
+	while ((oid = hash_seq_search(&iter)) != NULL)
+	{
+		TableEntryKey              key;
+		DiskQuotaActiveTableEntry *entry;
+		bool                       found;
+
+		key.reloid = *oid;
+		key.segid  = -1;
+		entry      = hash_search(active_map, &key, HASH_ENTER, &found);
+		if (!found)
+		{
+			entry->reloid    = *oid;
+			entry->segid     = -1;
+			entry->tablesize = 0;
+		}
+		merged = true;
+		hash_search(paused_active_backlog, oid, HASH_REMOVE, NULL);
+	}
+	return merged;
 }
 
 /*

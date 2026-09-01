@@ -2744,23 +2744,48 @@ diskquota_get_cluster_total_size(void)
  * Fetch a monitored database's published total and DATABASE_QUOTA
  * limit. Returns false when the database has no dbArray slot (not
  * monitored, or not on the dispatcher).
+ *
+ * This runs on every INSERT/UPDATE permission check, so the slot is
+ * cached per backend and revalidated by the slot generation; the
+ * O(max_monitored_databases) scan is paid only on a miss (first use,
+ * or the slot was released or re-claimed since).
  */
 bool
 diskquota_get_database_status(Oid dbid, int64 *total_size, int64 *limit_mb)
 {
+	static int    cached_idx        = -1;
+	static Oid    cached_dbid       = InvalidOid;
+	static uint32 cached_generation = 0;
+
 	bool found = false;
 
 	if (DiskquotaLauncherShmem == NULL || DiskquotaLauncherShmem->dbArray == NULL) return false;
 	LWLockAcquire(diskquota_locks.dblist_lock, LW_SHARED);
+	if (cached_idx >= 0 && cached_dbid == dbid)
+	{
+		DiskquotaDBEntry *dbEntry = &DiskquotaLauncherShmem->dbArray[cached_idx];
+
+		if (dbEntry->in_use && dbEntry->dbid == dbid && dbEntry->generation == cached_generation)
+		{
+			*total_size = (int64)pg_atomic_read_u64(&dbEntry->total_size);
+			*limit_mb   = (int64)pg_atomic_read_u64(&dbEntry->db_quota_limit_mb);
+			LWLockRelease(diskquota_locks.dblist_lock);
+			return true;
+		}
+		cached_idx = -1;
+	}
 	for (int i = 0; i < diskquota_max_monitored_databases; i++)
 	{
 		DiskquotaDBEntry *dbEntry = &DiskquotaLauncherShmem->dbArray[i];
 
 		if (dbEntry->in_use && dbEntry->dbid == dbid)
 		{
-			*total_size = (int64)pg_atomic_read_u64(&dbEntry->total_size);
-			*limit_mb   = (int64)pg_atomic_read_u64(&dbEntry->db_quota_limit_mb);
-			found       = true;
+			*total_size       = (int64)pg_atomic_read_u64(&dbEntry->total_size);
+			*limit_mb         = (int64)pg_atomic_read_u64(&dbEntry->db_quota_limit_mb);
+			found             = true;
+			cached_idx        = i;
+			cached_dbid       = dbid;
+			cached_generation = dbEntry->generation;
 			break;
 		}
 	}
