@@ -215,13 +215,13 @@ static void transfer_table_for_quota(int64 totalsize, QuotaType type, Oid *old_k
 static QuotaInfoEntry *put_quota_map_entry(QuotaInfoEntryKey *key, bool *found);
 
 /* functions to refresh disk quota model*/
-static void refresh_disk_quota_usage(bool is_init);
-static void calculate_table_disk_usage(bool is_init, HTAB *local_active_table_stat_map);
-static void flush_to_table_size(void);
-static bool flush_local_reject_map(bool *entries_removed);
-static void dispatch_rejectmap(HTAB *local_active_table_stat_map, bool include_undispatched);
-static bool load_quotas(void);
-static void do_load_quotas(void);
+static void  refresh_disk_quota_usage(bool is_init);
+static void  calculate_table_disk_usage(bool is_init, HTAB *local_active_table_stat_map);
+static int64 flush_to_table_size(void);
+static bool  flush_local_reject_map(bool *entries_removed);
+static void  dispatch_rejectmap(HTAB *local_active_table_stat_map, bool include_undispatched);
+static bool  load_quotas(void);
+static void  do_load_quotas(void);
 
 static Size DiskQuotaShmemSize(void);
 static void disk_quota_shmem_startup(void);
@@ -857,7 +857,7 @@ refresh_disk_quota_usage(bool is_init)
 		/* refresh quota_info_map */
 		refresh_quota_info_map();
 		/* flush local table_size_map to user table table_size */
-		flush_to_table_size();
+		int64 db_total = flush_to_table_size();
 		/*
 		 * Publish this database's total size (sum over segments) to
 		 * launcher shmem; the cluster-wide quota check reads the sum
@@ -867,21 +867,8 @@ refresh_disk_quota_usage(bool is_init)
 		 * segments too (hardlimit) and clears it once usage drops.
 		 */
 		{
-			int64 db_total = 0;
 			int64 db_limit_mb, cluster_limit_mb;
-			/*
-			 * read_only=false: take a fresh snapshot so the sum sees the
-			 * rows flush_to_table_size() wrote earlier in this transaction.
-			 */
-			int sret = SPI_execute("select sum(size)::bigint from diskquota.table_size where segid = -1", false, 0);
 
-			if (sret == SPI_OK_SELECT && SPI_processed == 1)
-			{
-				bool  isnull = true;
-				Datum d      = SPI_getbinval(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 1, &isnull);
-
-				if (!isnull) db_total = DatumGetInt64(d);
-			}
 			diskquota_publish_db_total(db_total);
 
 			if (diskquota_get_database_status(MyDatabaseId, &db_total, &db_limit_mb) && db_limit_mb > 0 &&
@@ -1282,7 +1269,7 @@ insert_into_table_size_map(char *str)
  * entries in table table_size. And then insert new table size entries into
  * table table_size.
  */
-static void
+static int64
 flush_to_table_size(void)
 {
 	HASH_SEQ_STATUS iter;
@@ -1291,6 +1278,7 @@ flush_to_table_size(void)
 	StringInfoData  insert_statement;
 	int             delete_entries_num = 0;
 	int             insert_entries_num = 0;
+	int64           db_total           = 0;
 
 	/* TODO: Add flush_size_interval to avoid flushing size info in every loop */
 
@@ -1306,6 +1294,16 @@ flush_to_table_size(void)
 	{
 		int seg_st = TableSizeEntrySegidStart(tsentry);
 		int seg_ed = TableSizeEntrySegidEnd(tsentry);
+
+		/*
+		 * The segid = -1 slice is the table's cross-segment total; sum
+		 * it while we are walking the map anyway, so the caller can
+		 * publish the database total without a full scan of
+		 * diskquota.table_size.
+		 */
+		if (seg_st == -1 && get_table_size_entry_flag(tsentry, TABLE_EXIST))
+			db_total += TableSizeEntryGetSize(tsentry, -1);
+
 		for (int i = seg_st; i < seg_ed; i++)
 		{
 			/* delete dropped table from both table_size_map and table table_size */
@@ -1361,6 +1359,8 @@ flush_to_table_size(void)
 
 	pfree(delete_statement.data);
 	pfree(insert_statement.data);
+
+	return db_total;
 }
 
 /*
