@@ -22,6 +22,20 @@ CREATE DATABASE lr_scratch;
 SELECT diskquota.set_cluster_quota('10 MB');
 DROP DATABASE lr_scratch;
 SELECT diskquota.set_cluster_quota('-1');
+-- === an error inside the dropped-database reaper is tolerated ===
+-- the reaper runs on every launcher loop pass; an error escaping it
+-- would take the launcher down with no top-level handler to catch it
+SELECT gp_inject_fault('diskquota_reap_dropped_databases', 'error', dbid)
+  FROM gp_segment_configuration WHERE role = 'p' AND content = -1;
+-- the launcher hits the fault on its next pass
+SELECT gp_wait_until_triggered_fault('diskquota_reap_dropped_databases', 1, dbid)
+  FROM gp_segment_configuration WHERE role = 'p' AND content = -1;
+-- the launcher survived: it still answers a round trip
+SELECT diskquota.set_cluster_quota('-1');
+SELECT diskquota.wait_for_worker_new_epoch();
+SELECT gp_inject_fault('diskquota_reap_dropped_databases', 'reset', dbid)
+  FROM gp_segment_configuration WHERE role = 'p' AND content = -1;
+
 -- remove the spent fault entry so a rerun can inject again
 SELECT gp_inject_fault('diskquota_launcher_main', 'reset', dbid)
   FROM gp_segment_configuration WHERE role = 'p' AND content = -1;

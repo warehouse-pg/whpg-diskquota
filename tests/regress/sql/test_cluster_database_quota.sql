@@ -155,6 +155,33 @@ FROM diskquota.show_cluster_quota_view;
 SELECT diskquota.wait_for_worker_new_epoch();
 INSERT INTO cdqschema.cdq_t2 VALUES (5, 'x');
 
+-- === reaper: a stale bookkeeping row must not break rotation ===
+-- a database_list row that never got a dbArray slot was never counted
+-- in num_db; reaping it must not decrement the count, or dynamic
+-- rotation switches off while more databases than workers still need
+-- a worker, freezing one database's bookkeeping
+CREATE DATABASE cdq_rot;
+\c cdq_rot
+CREATE EXTENSION diskquota;
+SELECT diskquota.wait_for_worker_new_epoch();
+\c contrib_regression
+SET search_path TO cdqschema;
+-- plant a bookkeeping row for a database oid that cannot exist
+\c diskquota
+INSERT INTO diskquota_namespace.database_list VALUES (987654321);
+\c contrib_regression
+SET search_path TO cdqschema;
+-- bounded wait: the reaper removes the stale row
+\! for i in $(seq 1 60); do n=$(psql -d diskquota -Atc "select count(*) from diskquota_namespace.database_list where dbid = 987654321"); [ "$n" = "0" ] && { echo REAPED; break; }; sleep 1; done
+-- with two monitored databases and diskquota.max_workers = 1, dynamic
+-- rotation must keep serving both: both epochs keep advancing
+\! A1=$(psql -d cdq_rot -Atc "select diskquota.show_worker_epoch()"); B1=$(psql -d contrib_regression -Atc "select diskquota.show_worker_epoch()"); sleep 10; A2=$(psql -d cdq_rot -Atc "select diskquota.show_worker_epoch()"); B2=$(psql -d contrib_regression -Atc "select diskquota.show_worker_epoch()"); { [ "$A1" != "$A2" ] && [ "$B1" != "$B2" ]; } && echo BOTH-ADVANCING || echo ROTATION-STUCK
+\c cdq_rot
+DROP EXTENSION diskquota;
+\c contrib_regression
+SET search_path TO cdqschema;
+\! for i in $(seq 1 30); do psql -d contrib_regression -Atc "DROP DATABASE cdq_rot" >/dev/null 2>&1 && { echo DROPPED; break; }; sleep 1; done
+
 -- === setter input validation ===
 -- expect fail: the limit would overflow the internal byte computation
 SELECT diskquota.set_database_quota(current_database()::text, '10000000000000 MB');

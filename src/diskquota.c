@@ -148,7 +148,7 @@ static DiskquotaDBEntry       *next_db(DiskquotaDBEntry *curDB);
 static DiskQuotaWorkerEntry   *next_worker(void);
 static bool                    dbentry_binding_current(DiskquotaDBEntry *dbEntry);
 static DiskquotaDBEntry       *add_db_entry(Oid dbid);
-static void                    release_db_entry(Oid dbid);
+static bool                    release_db_entry(Oid dbid);
 static char                   *get_db_name(Oid dbid);
 static void                    reset_worker(DiskQuotaWorkerEntry *dq_worker);
 static void                    vacuum_db_entry(DiskquotaDBEntry *db);
@@ -1929,7 +1929,12 @@ add_db_entry(Oid dbid)
 	return result;
 }
 
-static void
+/*
+ * Returns whether a dbArray slot was actually bound to dbid and
+ * released: callers that maintain num_db must not decrement for a
+ * database that never held a slot.
+ */
+static bool
 release_db_entry(Oid dbid)
 {
 	DiskquotaDBEntry *db = NULL;
@@ -1947,7 +1952,7 @@ release_db_entry(Oid dbid)
 	if (db == NULL)
 	{
 		LWLockRelease(diskquota_locks.dblist_lock);
-		return;
+		return false;
 	}
 
 	if (db->workerId != INVALID_WORKER_ID)
@@ -1965,6 +1970,7 @@ release_db_entry(Oid dbid)
 	/* should be called at last to set in_use to false */
 	vacuum_db_entry(db);
 	LWLockRelease(diskquota_locks.dblist_lock);
+	return true;
 }
 
 /*
@@ -2223,8 +2229,9 @@ reap_dropped_databases(void)
 	 */
 	static int reap_backoff = 0;
 
-	Oid *dead  = palloc(sizeof(Oid) * diskquota_max_monitored_databases);
-	int  ndead = 0;
+	/* both are modified inside PG_TRY and read after PG_CATCH */
+	Oid *volatile dead = palloc(sizeof(Oid) * diskquota_max_monitored_databases);
+	volatile int ndead = 0;
 
 	if (reap_backoff > 0)
 	{
@@ -2235,21 +2242,17 @@ reap_dropped_databases(void)
 
 	/* SearchSysCache in is_valid_dbid requires a transaction */
 	StartTransactionCommand();
-	LWLockAcquire(diskquota_locks.dblist_lock, LW_SHARED);
-	for (int i = 0; i < diskquota_max_monitored_databases; i++)
-	{
-		DiskquotaDBEntry *dbEntry = &DiskquotaLauncherShmem->dbArray[i];
-
-		if (dbEntry->in_use && !is_valid_dbid(dbEntry->dbid)) dead[ndead++] = dbEntry->dbid;
-	}
-	LWLockRelease(diskquota_locks.dblist_lock);
 
 	/*
-	 * Sweep the persistent list as well: a database_list row that never
-	 * got a dbArray slot (the monitored-database limit was reached, or
-	 * an earlier teardown failed halfway) is invisible to the slot scan
-	 * above, leaks forever, and on OID reuse would silently auto-monitor
-	 * an unrelated new database.
+	 * Scan the dbArray slots, then sweep the persistent list as well: a
+	 * database_list row that never got a dbArray slot (the
+	 * monitored-database limit was reached, or an earlier teardown
+	 * failed halfway) is invisible to the slot scan, leaks forever, and
+	 * on OID reuse would silently auto-monitor an unrelated new
+	 * database. Both run inside PG_TRY: is_valid_dbid() reads the
+	 * catalog and can throw, and an error escaping here would take the
+	 * launcher down (it has no top-level handler); the abort path
+	 * releases the LWLock.
 	 */
 	{
 		bool list_ok            = true;
@@ -2258,6 +2261,16 @@ reap_dropped_databases(void)
 
 		PG_TRY();
 		{
+			SIMPLE_FAULT_INJECTOR("diskquota_reap_dropped_databases");
+			LWLockAcquire(diskquota_locks.dblist_lock, LW_SHARED);
+			for (int i = 0; i < diskquota_max_monitored_databases; i++)
+			{
+				DiskquotaDBEntry *dbEntry = &DiskquotaLauncherShmem->dbArray[i];
+
+				if (dbEntry->in_use && !is_valid_dbid(dbEntry->dbid)) dead[ndead++] = dbEntry->dbid;
+			}
+			LWLockRelease(diskquota_locks.dblist_lock);
+
 			if (SPI_OK_CONNECT != SPI_connect())
 				ereport(ERROR, (errcode(ERRCODE_INTERNAL_ERROR),
 				                errmsg("[diskquota launcher] unable to connect to execute internal query")));
@@ -2349,10 +2362,21 @@ reap_dropped_databases(void)
 			 * committed: when the sweep aborts, the slot stays in_use so
 			 * the next pass retries the whole release.
 			 */
-			release_db_entry(dbid);
+			bool had_slot = release_db_entry(dbid);
 			invalidate_database_rejectmap(dbid);
-			if (num_db > 0) num_db--;
-			if (num_db <= diskquota_max_workers) DiskquotaLauncherShmem->isDynamicWorker = false;
+			/*
+			 * num_db counts databases holding a dbArray slot
+			 * (init_database_list skips rows that get none); a
+			 * database_list-only row was never counted, and
+			 * decrementing for it would drive num_db below the live
+			 * count and switch dynamic-worker rotation off while more
+			 * databases than workers still need it.
+			 */
+			if (had_slot)
+			{
+				if (num_db > 0) num_db--;
+				if (num_db <= diskquota_max_workers) DiskquotaLauncherShmem->isDynamicWorker = false;
+			}
 		}
 		else
 		{

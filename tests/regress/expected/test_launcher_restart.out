@@ -49,6 +49,44 @@ SELECT diskquota.set_cluster_quota('-1');
  
 (1 row)
 
+-- === an error inside the dropped-database reaper is tolerated ===
+-- the reaper runs on every launcher loop pass; an error escaping it
+-- would take the launcher down with no top-level handler to catch it
+SELECT gp_inject_fault('diskquota_reap_dropped_databases', 'error', dbid)
+  FROM gp_segment_configuration WHERE role = 'p' AND content = -1;
+ gp_inject_fault 
+-----------------
+ Success:
+(1 row)
+
+-- the launcher hits the fault on its next pass
+SELECT gp_wait_until_triggered_fault('diskquota_reap_dropped_databases', 1, dbid)
+  FROM gp_segment_configuration WHERE role = 'p' AND content = -1;
+ gp_wait_until_triggered_fault 
+-------------------------------
+ Success:
+(1 row)
+
+-- the launcher survived: it still answers a round trip
+SELECT diskquota.set_cluster_quota('-1');
+ set_cluster_quota 
+-------------------
+ 
+(1 row)
+
+SELECT diskquota.wait_for_worker_new_epoch();
+ wait_for_worker_new_epoch 
+---------------------------
+ t
+(1 row)
+
+SELECT gp_inject_fault('diskquota_reap_dropped_databases', 'reset', dbid)
+  FROM gp_segment_configuration WHERE role = 'p' AND content = -1;
+ gp_inject_fault 
+-----------------
+ Success:
+(1 row)
+
 -- remove the spent fault entry so a rerun can inject again
 SELECT gp_inject_fault('diskquota_launcher_main', 'reset', dbid)
   FROM gp_segment_configuration WHERE role = 'p' AND content = -1;
