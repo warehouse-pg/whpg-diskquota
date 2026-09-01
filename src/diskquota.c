@@ -146,6 +146,7 @@ static void FreeWorker(DiskQuotaWorkerEntry *worker);
 static void init_database_list(void);
 static DiskquotaDBEntry       *next_db(DiskquotaDBEntry *curDB);
 static DiskQuotaWorkerEntry   *next_worker(void);
+static bool                    dbentry_binding_current(DiskquotaDBEntry *dbEntry);
 static DiskquotaDBEntry       *add_db_entry(Oid dbid);
 static void                    release_db_entry(Oid dbid);
 static char                   *get_db_name(Oid dbid);
@@ -651,7 +652,15 @@ disk_quota_worker_main(Datum main_arg)
 			 * and the segment maps untouched while paused.
 			 */
 			refresh_disk_quota_model(!MyWorkerInfo->dbEntry->inited);
-			MyWorkerInfo->dbEntry->inited = true;
+			/*
+			 * A worker being terminated can finish this cycle after its
+			 * slot was released and re-claimed for the same database.
+			 * Only the current binding may mark the model initialized:
+			 * a stale mark would make the next incarnation skip the
+			 * readiness gate and the initial size load, leaving its
+			 * in-memory model empty until tables become active again.
+			 */
+			if (dbentry_binding_current(MyWorkerInfo->dbEntry)) MyWorkerInfo->dbEntry->inited = true;
 			worker_increase_epoch(MyWorkerInfo->dbEntry->dbid);
 
 			// GPDB6 opend a MemoryAccount for us without asking us.
@@ -1894,6 +1903,7 @@ add_db_entry(Oid dbid)
 		pg_atomic_write_u64(&hole->db_quota_limit_mb, 0);
 		hole->rejectmap_retry      = false;
 		hole->rejectmap_retry_full = false;
+		hole->inited               = false;
 		hole->generation++;
 		hole->dbid          = dbid;
 		hole->in_use        = true;
