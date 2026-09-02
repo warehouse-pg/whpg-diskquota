@@ -149,6 +149,7 @@ static DiskQuotaWorkerEntry   *next_worker(void);
 static bool                    dbentry_binding_current(DiskquotaDBEntry *dbEntry);
 static void                    queue_pending_unmonitor(Oid dbid);
 static void                    retry_pending_unmonitor(void);
+static void                    reap_draining_db_entries(void);
 static bool                    dbid_has_live_slot(Oid dbid);
 static DiskquotaDBEntry       *add_db_entry(Oid dbid, bool *is_new);
 static bool                    release_db_entry(Oid dbid);
@@ -953,6 +954,7 @@ disk_quota_launcher_main(Datum main_arg)
 		 * total keeps counting the dead database's last size.
 		 */
 		reap_dropped_databases();
+		reap_draining_db_entries();
 
 		/*
 		 * Try to starts a bgworker for the curDB
@@ -2006,6 +2008,17 @@ add_db_entry(Oid dbid, bool *is_new)
 		if (dbEntry->in_use && dbEntry->dbid == dbid)
 		{
 			result = dbEntry;
+			/*
+			 * Re-monitored while the previous incarnation is still
+			 * draining: reactivate the same slot once the old worker
+			 * leaves rather than freeing it, and count it as new again
+			 * (the drop already decremented num_db).
+			 */
+			if (dbEntry->draining && !dbEntry->revive)
+			{
+				dbEntry->revive = true;
+				if (is_new) *is_new = true;
+			}
 			break;
 		}
 		if (!dbEntry->in_use && hole == NULL) hole = dbEntry;
@@ -2075,7 +2088,7 @@ dbid_has_live_slot(Oid dbid)
 	for (int i = 0; i < diskquota_max_monitored_databases; i++)
 	{
 		DiskquotaDBEntry *dbEntry = &DiskquotaLauncherShmem->dbArray[i];
-		if (dbEntry->in_use && dbEntry->dbid == dbid)
+		if (dbEntry->in_use && dbEntry->dbid == dbid && (!dbEntry->draining || dbEntry->revive))
 		{
 			found = true;
 			break;
@@ -2168,7 +2181,11 @@ release_db_entry(Oid dbid)
 	for (int i = 0; i < diskquota_max_monitored_databases; i++)
 	{
 		DiskquotaDBEntry *dbEntry = &DiskquotaLauncherShmem->dbArray[i];
-		if (dbEntry->in_use && dbEntry->dbid == dbid)
+		/*
+		 * A slot already draining has been released; skip it so a
+		 * duplicate drop neither double-counts num_db nor re-terminates.
+		 */
+		if (dbEntry->in_use && !dbEntry->draining && dbEntry->dbid == dbid)
 		{
 			db = dbEntry;
 			break;
@@ -2180,22 +2197,68 @@ release_db_entry(Oid dbid)
 		return false;
 	}
 
+	/*
+	 * Start draining rather than recycle the slot now. After SIGTERM the
+	 * worker runs its current refresh cycle to completion, and until it
+	 * stops it can still flush table_size, rewrite the shared rejectmap,
+	 * and advance this database's epoch; recycling the slot under it would
+	 * let a re-CREATE's new incarnation race those writes. Bumping the
+	 * generation makes the worker's own binding go stale so it exits
+	 * promptly -- and a worker left by a previous launcher, which has no
+	 * handle here and cannot be signalled, exits the same way. The slot is
+	 * freed, or reactivated for a re-CREATE, only after the worker leaves
+	 * (workerId back to INVALID_WORKER_ID), in reap_draining_db_entries().
+	 */
+	db->generation++;
+	db->draining = true;
+	db->revive   = false;
 	if (db->workerId != INVALID_WORKER_ID)
 	{
 		BackgroundWorkerHandle *handle = get_bgworker_handle(db->workerId);
-		/*
-		 * NULL after a launcher restart: the handles live in launcher
-		 * process memory, so a previous incarnation's worker cannot be
-		 * terminated from here; it exits on its own once its database
-		 * entry is gone.
-		 */
 		if (handle != NULL) TerminateBackgroundWorker(handle);
 	}
-	vacuum_disk_quota_model(db->id);
-	/* should be called at last to set in_use to false */
-	vacuum_db_entry(db);
 	LWLockRelease(diskquota_locks.dblist_lock);
 	return true;
+}
+
+/*
+ * Recycle draining slots whose worker has actually stopped. FreeWorker
+ * clears workerId when the worker exits, so a draining slot with
+ * workerId == INVALID_WORKER_ID is safe to touch: free it to a hole, or
+ * -- if a CREATE re-monitored the database meanwhile -- reactivate it for
+ * the new incarnation (its generation was already bumped at drop). Called
+ * once per launcher loop.
+ */
+static void
+reap_draining_db_entries(void)
+{
+	LWLockAcquire(diskquota_locks.dblist_lock, LW_EXCLUSIVE);
+	for (int i = 0; i < diskquota_max_monitored_databases; i++)
+	{
+		DiskquotaDBEntry *db = &DiskquotaLauncherShmem->dbArray[i];
+		if (!db->in_use || !db->draining || db->workerId != INVALID_WORKER_ID) continue;
+
+		if (db->revive)
+		{
+			/* the new incarnation starts from a clean model, like a
+			 * fresh CREATE would */
+			vacuum_disk_quota_model(db->id);
+			pg_atomic_write_u64(&db->total_size, 0);
+			db->rejectmap_retry      = false;
+			db->rejectmap_retry_full = false;
+			db->inited               = false;
+			db->next_run_time        = GetCurrentTimestamp();
+			db->draining             = false;
+			db->revive               = false;
+		}
+		else
+		{
+			vacuum_disk_quota_model(db->id);
+			/* should be called at last to set in_use to false */
+			vacuum_db_entry(db);
+		}
+	}
+	LWLockRelease(diskquota_locks.dblist_lock);
 }
 
 /*
@@ -2224,7 +2287,9 @@ next_db(DiskquotaDBEntry *curDB)
 		if (nextSlot >= diskquota_max_monitored_databases) nextSlot = 0;
 		DiskquotaDBEntry *dbEntry = &DiskquotaLauncherShmem->dbArray[nextSlot];
 		nextSlot++;
-		if (!dbEntry->in_use || dbEntry->workerId != INVALID_WORKER_ID || dbEntry->dbid == InvalidOid) continue;
+		if (!dbEntry->in_use || dbEntry->draining || dbEntry->workerId != INVALID_WORKER_ID ||
+		    dbEntry->dbid == InvalidOid)
+			continue;
 		/* TODO: should release the invalid db related things */
 		if (!is_valid_dbid(dbEntry->dbid)) continue;
 		result = dbEntry;
@@ -2292,6 +2357,8 @@ vacuum_db_entry(DiskquotaDBEntry *db)
 	db->inited   = false;
 	db->workerId = INVALID_WORKER_ID;
 	db->in_use   = false;
+	db->draining = false;
+	db->revive   = false;
 }
 
 static void

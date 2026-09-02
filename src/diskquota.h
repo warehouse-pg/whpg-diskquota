@@ -294,6 +294,19 @@ struct DiskquotaDBEntry
 	bool inited; // this entry is inited, will set to true after the worker finish the frist run.
 	bool in_use; // this slot is in using. AKA dbid != 0
 
+	/*
+	 * Slot lifecycle across a DROP/CREATE cycle. draining: the DROP
+	 * terminated the worker but the slot is not recycled until the worker
+	 * has actually stopped (workerId back to INVALID_WORKER_ID), so a new
+	 * incarnation cannot start and race the old worker's in-flight
+	 * refresh. revive: a CREATE re-monitored the database while it was
+	 * still draining, so the slot is reactivated for the new incarnation
+	 * instead of freed once the old worker leaves. Reaped in
+	 * reap_draining_db_entries().
+	 */
+	bool draining;
+	bool revive;
+
 	TimestampTz last_log_time; // the last time log current database info.
 
 	/*
