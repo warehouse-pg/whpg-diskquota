@@ -1202,7 +1202,13 @@ init_database_list(void)
 	PopActiveSnapshot();
 	CommitTransactionCommand();
 	/* TODO: clean invalid database */
-	if (num_db > diskquota_max_workers) DiskquotaLauncherShmem->isDynamicWorker = true;
+	/*
+	 * Recompute from the authoritative count: a launcher restart that
+	 * preserves shared memory must clear a stale dynamic-worker flag as
+	 * well as set it, or a run that dropped below diskquota_max_workers
+	 * while the flag was true would keep rotating workers needlessly.
+	 */
+	DiskquotaLauncherShmem->isDynamicWorker = (num_db > diskquota_max_workers);
 }
 
 /*
