@@ -483,6 +483,9 @@ disk_quota_worker_main(Datum main_arg)
 	/* diskquota worker should has Gp_role as dispatcher */
 	Gp_role = GP_ROLE_DISPATCH;
 
+	/* let tests hold a starting worker here, before it adopts its incarnation */
+	SIMPLE_FAULT_INJECTOR("diskquota_worker_startup_fence");
+
 	/* fix the slot incarnation this worker publishes for */
 	diskquota_worker_capture_generation();
 
@@ -1614,6 +1617,8 @@ start_worker(DiskquotaDBEntry *dbEntry)
 
 	dbEntry->workerId  = dq_worker->id;
 	dq_worker->dbEntry = dbEntry;
+	/* the launcher is the only writer of dbEntry->generation */
+	dq_worker->generation = dbEntry->generation;
 
 #if DISKQUOTA_DEBUG
 	dbEntry->last_run_time = GetCurrentTimestamp();
@@ -2604,9 +2609,12 @@ diskquota_get_cluster_limit_mb(void)
 }
 
 /*
- * The slot generation this worker was started for (see the generation
- * field in DiskquotaDBEntry). Captured once at worker startup;
- * publishes against a slot whose generation moved on are discarded.
+ * The slot generation this worker was started for, stamped by the
+ * launcher into the worker entry at bind time and copied here once at
+ * startup. The live dbEntry->generation may already belong to a newer
+ * incarnation by the time the worker gets to run, so it is never read
+ * to establish this value; publishes against a slot whose generation
+ * moved on are discarded.
  */
 static uint32 my_dbentry_generation = 0;
 
@@ -2624,12 +2632,8 @@ dbentry_binding_current(DiskquotaDBEntry *dbEntry)
 void
 diskquota_worker_capture_generation(void)
 {
-	DiskquotaDBEntry *dbEntry = (MyWorkerInfo != NULL) ? MyWorkerInfo->dbEntry : NULL;
-
-	if (dbEntry == NULL) return;
-	LWLockAcquire(diskquota_locks.dblist_lock, LW_SHARED);
-	my_dbentry_generation = dbEntry->generation;
-	LWLockRelease(diskquota_locks.dblist_lock);
+	if (MyWorkerInfo == NULL) return;
+	my_dbentry_generation = MyWorkerInfo->generation;
 }
 
 /*

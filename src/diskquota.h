@@ -247,6 +247,17 @@ struct DiskQuotaWorkerEntry
 	int      id;     // starts from 0, -1 means invalid
 	NameData dbname; // the database name. It does not need to be reset, when dbEntry == NULL, dbname is not valid.
 	DiskquotaDBEntry *dbEntry; // pointer to shared memory. DiskquotaLauncherShmem->dbArray
+
+	/*
+	 * The dbEntry generation this worker was started to serve, stamped
+	 * by the launcher when it binds dbEntry, before the bgworker is
+	 * registered. The worker fences on this stamp rather than on the
+	 * live slot: the slot can be released and re-claimed (bumping its
+	 * generation) before the worker finishes starting, and a worker
+	 * reading the live value then would adopt an incarnation it was
+	 * never started for.
+	 */
+	uint32 generation;
 };
 
 typedef struct
