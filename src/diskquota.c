@@ -451,14 +451,6 @@ disk_quota_worker_main(Datum main_arg)
 	pqsignal(SIGTERM, disk_quota_sigterm);
 	pqsignal(SIGUSR1, disk_quota_sigusr1);
 
-	if (!MyWorkerInfo->dbEntry->inited)
-	{
-		MyWorkerInfo->dbEntry->last_log_time = GetCurrentTimestamp();
-		ereport(LOG, (errmsg("[diskquota] start disk quota worker process to monitor database:%s", dbname)));
-	}
-	/* To avoid last_log_time from being uninitialized. */
-	if (MyWorkerInfo->dbEntry->last_log_time > GetCurrentTimestamp())
-		MyWorkerInfo->dbEntry->last_log_time = GetCurrentTimestamp();
 	/*
 	 * The shmem exit hook is registered after registering disk_quota_sigterm.
 	 * So if the SIGTERM arrives before this statement, the shmem exit hook
@@ -488,8 +480,21 @@ disk_quota_worker_main(Datum main_arg)
 	/* let tests hold a starting worker here, before it adopts its incarnation */
 	SIMPLE_FAULT_INJECTOR("diskquota_worker_startup_fence");
 
-	/* fix the slot incarnation this worker publishes for */
+	/*
+	 * Fix the slot incarnation this worker publishes for before touching
+	 * any mutable slot state, so the fault above is a clean ownership
+	 * boundary: a worker parked there has not yet written to its dbEntry.
+	 */
 	diskquota_worker_capture_generation();
+
+	if (!MyWorkerInfo->dbEntry->inited)
+	{
+		MyWorkerInfo->dbEntry->last_log_time = GetCurrentTimestamp();
+		ereport(LOG, (errmsg("[diskquota] start disk quota worker process to monitor database:%s", dbname)));
+	}
+	/* To avoid last_log_time from being uninitialized. */
+	if (MyWorkerInfo->dbEntry->last_log_time > GetCurrentTimestamp())
+		MyWorkerInfo->dbEntry->last_log_time = GetCurrentTimestamp();
 
 	/*
 	 * Initialize diskquota related local hash map and refresh model
