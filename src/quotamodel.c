@@ -827,6 +827,7 @@ refresh_disk_quota_usage(bool is_init)
 	bool  connected                   = false;
 	bool  pushed_active_snap          = false;
 	bool  ret                         = true;
+	int64 db_total                    = 0;
 	HTAB *local_active_table_stat_map = NULL;
 
 	StartTransactionCommand();
@@ -861,22 +862,22 @@ refresh_disk_quota_usage(bool is_init)
 		/* refresh quota_info_map */
 		refresh_quota_info_map();
 		/* flush local table_size_map to user table table_size */
-		int64 db_total = flush_to_table_size();
+		db_total = flush_to_table_size();
 		SIMPLE_FAULT_INJECTOR("diskquota_refresh_after_flush");
 		/*
-		 * Publish this database's total size (sum over segments) to
-		 * launcher shmem; the cluster-wide quota check reads the sum
-		 * of these per-database totals. When a cap is exceeded, put a
-		 * block-this-database entry into the local rejectmap so that
-		 * the regular flush/dispatch pipeline enforces the cap on
-		 * segments too (hardlimit) and clears it once usage drops.
+		 * Enforce the database and cluster caps: when either is
+		 * exceeded, put a block-this-database entry into the local
+		 * rejectmap so the regular flush/dispatch pipeline carries it
+		 * to the segments (hardlimit) and clears it once usage drops.
+		 * The cluster check reads the sum of the per-database totals in
+		 * launcher shmem; this database's own total is published there
+		 * only after the transaction commits (below), so the freshly
+		 * flushed local db_total drives the per-database check.
 		 */
 		{
-			int64 db_limit_mb, cluster_limit_mb;
+			int64 db_shmem_total, db_limit_mb, cluster_limit_mb;
 
-			diskquota_publish_db_total(db_total);
-
-			if (diskquota_get_database_status(MyDatabaseId, &db_total, &db_limit_mb) && db_limit_mb > 0 &&
+			if (diskquota_get_database_status(MyDatabaseId, &db_shmem_total, &db_limit_mb) && db_limit_mb > 0 &&
 			    db_total >= db_limit_mb * (int64)(1 << 20))
 				add_quota_to_rejectmap(DATABASE_QUOTA, InvalidOid, InvalidOid, false);
 
@@ -944,6 +945,13 @@ refresh_disk_quota_usage(bool is_init)
 	{
 		CommitTransactionCommand();
 		flush_to_table_size_after_commit();
+		/*
+		 * Publish the committed total to launcher shmem only now: the
+		 * shared total feeds the cluster-wide quota, and a value from a
+		 * transaction that later aborted would leave the cluster
+		 * counting usage that was rolled back.
+		 */
+		diskquota_publish_db_total(db_total);
 	}
 	else
 		AbortCurrentTransaction();
