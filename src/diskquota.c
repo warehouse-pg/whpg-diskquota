@@ -149,6 +149,7 @@ static DiskQuotaWorkerEntry   *next_worker(void);
 static bool                    dbentry_binding_current(DiskquotaDBEntry *dbEntry);
 static void                    queue_pending_unmonitor(Oid dbid);
 static void                    retry_pending_unmonitor(void);
+static bool                    dbid_has_live_slot(Oid dbid);
 static DiskquotaDBEntry       *add_db_entry(Oid dbid, bool *is_new);
 static bool                    release_db_entry(Oid dbid);
 static char                   *get_db_name(Oid dbid);
@@ -2053,18 +2054,62 @@ queue_pending_unmonitor(Oid dbid)
 }
 
 /*
+ * Whether dbid currently holds a live launcher slot -- i.e. it is
+ * monitored right now. A queued unmonitor carries only the database
+ * oid, and a DROP EXTENSION leaves that oid unchanged, so a CREATE
+ * EXTENSION that re-monitors the same database before the retry runs
+ * would otherwise have its monitoring torn down by the stale retry.
+ */
+static bool
+dbid_has_live_slot(Oid dbid)
+{
+	bool found = false;
+
+	LWLockAcquire(diskquota_locks.dblist_lock, LW_SHARED);
+	for (int i = 0; i < diskquota_max_monitored_databases; i++)
+	{
+		DiskquotaDBEntry *dbEntry = &DiskquotaLauncherShmem->dbArray[i];
+		if (dbEntry->in_use && dbEntry->dbid == dbid)
+		{
+			found = true;
+			break;
+		}
+	}
+	LWLockRelease(diskquota_locks.dblist_lock);
+	return found;
+}
+
+/*
  * Retry the queued unmonitor dispatches, one transaction each so one
  * still-failing database does not block the rest.
  */
 static void
 retry_pending_unmonitor(void)
 {
+	/*
+	 * Test hook: 'skip' holds the retries so a regression can line up a
+	 * DROP then CREATE of the same database before they run.
+	 */
+	if (SIMPLE_FAULT_INJECTOR("diskquota_pending_unmonitor_retry") == FaultInjectorTypeSkip) return;
+
 	for (int i = 0; i < n_pending_unmonitor;)
 	{
 		Oid  dbid               = pending_unmonitor[i];
 		bool connected          = false;
 		bool pushed_active_snap = false;
 		bool ok                 = true;
+
+		/*
+		 * The database was re-monitored by a CREATE EXTENSION after
+		 * this unmonitor was queued (the oid is unchanged across
+		 * DROP/CREATE): the queued remove is obsolete and would
+		 * unmonitor the live incarnation, so drop it without dispatch.
+		 */
+		if (dbid_has_live_slot(dbid))
+		{
+			pending_unmonitor[i] = pending_unmonitor[--n_pending_unmonitor];
+			continue;
+		}
 
 		StartTransactionCommand();
 		PG_TRY();

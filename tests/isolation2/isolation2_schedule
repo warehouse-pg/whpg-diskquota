@@ -14,6 +14,7 @@ test: test_multi_worker_quota
 test: test_worker_timeout
 test: test_launcher_message_box
 test: test_launcher_numdb
+test: test_launcher_unmonitor
 test: test_per_segment_config
 test: test_relation_cache
 test: test_ereport_from_seg
