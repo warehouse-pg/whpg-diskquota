@@ -1,0 +1,84 @@
+-- A DROP after a re-CREATE, while the old worker is still draining, must
+-- cancel the pending revive: DROP -> CREATE -> DROP must free the slot once
+-- the old worker leaves, not resurrect the dropped database. The old worker
+-- is parked in its refresh loop with a fault so it cannot exit, the whole
+-- DROP/CREATE/DROP runs against the held slot, and after the worker is
+-- released the database must have no worker (the slot was freed, not
+-- reactivated).
+1: CREATE DATABASE revive_db;
+CREATE DATABASE
+1q: ... <quitting>
+2:@db_name revive_db: CREATE EXTENSION diskquota;
+CREATE EXTENSION
+2:@db_name revive_db: SELECT diskquota.wait_for_worker_new_epoch();
+ wait_for_worker_new_epoch 
+---------------------------
+ t                         
+(1 row)
+
+-- park the worker in its refresh loop so it cannot exit on a drop's SIGTERM
+SELECT gp_inject_fault_infinite('diskquota_worker_main', 'suspend', dbid) FROM gp_segment_configuration WHERE role='p' AND content=-1;
+ gp_inject_fault_infinite 
+--------------------------
+ Success:                 
+(1 row)
+SELECT gp_wait_until_triggered_fault('diskquota_worker_main', 1, dbid) FROM gp_segment_configuration WHERE role='p' AND content=-1;
+ gp_wait_until_triggered_fault 
+-------------------------------
+ Success:                      
+(1 row)
+
+-- exactly one worker: the parked old one
+2:@db_name revive_db: SELECT count(*) AS one_worker FROM pg_stat_activity WHERE backend_type LIKE 'diskquota bgworker%' AND datname = 'revive_db';
+ one_worker 
+------------
+ 1          
+(1 row)
+
+-- DROP -> CREATE -> DROP, all while the old worker cannot exit. The CREATE
+-- re-monitors the still-draining slot (revive pending); the second DROP must
+-- cancel that revive.
+2:@db_name revive_db: DROP EXTENSION diskquota;
+DROP EXTENSION
+2:@db_name revive_db: CREATE EXTENSION diskquota;
+CREATE EXTENSION
+2:@db_name revive_db: DROP EXTENSION diskquota;
+DROP EXTENSION
+
+-- wait past the point a new worker would have started: still only the parked
+-- old worker, no new incarnation on the held slot
+2:@db_name revive_db: SELECT pg_sleep(5);
+ pg_sleep 
+----------
+          
+(1 row)
+2:@db_name revive_db: SELECT count(*) AS still_one_worker FROM pg_stat_activity WHERE backend_type LIKE 'diskquota bgworker%' AND datname = 'revive_db';
+ still_one_worker 
+------------------
+ 1                
+(1 row)
+
+-- release the old worker: it exits and the launcher reaps the slot. Because
+-- the last DROP cancelled the revive, the slot is freed, so no new worker
+-- starts for revive_db.
+SELECT gp_inject_fault('diskquota_worker_main', 'reset', dbid) FROM gp_segment_configuration WHERE role='p' AND content=-1;
+ gp_inject_fault 
+-----------------
+ Success:        
+(1 row)
+2:@db_name revive_db: SELECT pg_sleep(5);
+ pg_sleep 
+----------
+          
+(1 row)
+2:@db_name revive_db: SELECT count(*) AS no_worker FROM pg_stat_activity WHERE backend_type LIKE 'diskquota bgworker%' AND datname = 'revive_db';
+ no_worker 
+-----------
+ 0         
+(1 row)
+
+-- cleanup
+2q: ... <quitting>
+1: DROP DATABASE revive_db;
+DROP DATABASE
+1q: ... <quitting>

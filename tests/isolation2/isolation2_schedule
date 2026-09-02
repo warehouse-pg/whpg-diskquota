@@ -17,6 +17,7 @@ test: test_launcher_numdb
 test: test_launcher_unmonitor
 test: test_db_total_commit
 test: test_launcher_worker_lifetime
+test: test_launcher_revive_cancel
 test: test_per_segment_config
 test: test_relation_cache
 test: test_ereport_from_seg

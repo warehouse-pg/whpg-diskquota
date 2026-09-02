@@ -280,6 +280,42 @@ typedef struct
 } DiskquotaLauncherShmemStruct;
 
 /* In shmem, only used on master */
+/*
+ * A slot's lifecycle across a DROP/CREATE cycle. Meaningful only while
+ * in_use is true.
+ *
+ *   DB_SLOT_ACTIVE   - the database is monitored and its worker may run.
+ *   DB_SLOT_DRAINING - a DROP EXTENSION terminated the worker, but the
+ *                      slot is held (not recycled) until the worker has
+ *                      actually stopped, so a new incarnation cannot start
+ *                      and race the old worker's in-flight refresh
+ *                      (table_size flush, shared rejectmap, epoch). Once
+ *                      the worker leaves, the slot is freed.
+ *   DB_SLOT_REVIVING - a CREATE EXTENSION re-monitored the database while
+ *                      it was still draining; once the old worker leaves,
+ *                      the same slot is reactivated for the new incarnation
+ *                      from a clean model instead of freed.
+ *
+ * Legal transitions, all made under dblist_lock:
+ *   ACTIVE   --DROP-->   DRAINING
+ *   DRAINING --CREATE--> REVIVING
+ *   REVIVING --DROP-->   DRAINING   (a DROP cancels a pending revive, so a
+ *                                    DROP/CREATE/DROP sequence frees the
+ *                                    slot rather than resurrecting the
+ *                                    dropped database)
+ *   DRAINING --reap-->   (slot freed)      once the worker has left
+ *   REVIVING --reap-->   ACTIVE            once the worker has left
+ * A DROP that finds the slot already DRAINING is a duplicate: it is
+ * ignored, so it neither re-terminates the worker nor re-counts num_db.
+ * Reaped in reap_draining_db_entries().
+ */
+typedef enum DiskquotaSlotLifecycle
+{
+	DB_SLOT_ACTIVE = 0,
+	DB_SLOT_DRAINING,
+	DB_SLOT_REVIVING,
+} DiskquotaSlotLifecycle;
+
 struct DiskquotaDBEntry
 {
 	int id;   // the index of DiskquotaLauncherShmem->dbArray, start from 0
@@ -295,17 +331,10 @@ struct DiskquotaDBEntry
 	bool in_use; // this slot is in using. AKA dbid != 0
 
 	/*
-	 * Slot lifecycle across a DROP/CREATE cycle. draining: the DROP
-	 * terminated the worker but the slot is not recycled until the worker
-	 * has actually stopped (workerId back to INVALID_WORKER_ID), so a new
-	 * incarnation cannot start and race the old worker's in-flight
-	 * refresh. revive: a CREATE re-monitored the database while it was
-	 * still draining, so the slot is reactivated for the new incarnation
-	 * instead of freed once the old worker leaves. Reaped in
-	 * reap_draining_db_entries().
+	 * Slot lifecycle across a DROP/CREATE cycle; see
+	 * DiskquotaSlotLifecycle. Meaningful only while in_use is true.
 	 */
-	bool draining;
-	bool revive;
+	DiskquotaSlotLifecycle lifecycle;
 
 	TimestampTz last_log_time; // the last time log current database info.
 
