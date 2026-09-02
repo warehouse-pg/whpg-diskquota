@@ -149,7 +149,7 @@ static DiskQuotaWorkerEntry   *next_worker(void);
 static bool                    dbentry_binding_current(DiskquotaDBEntry *dbEntry);
 static void                    queue_pending_unmonitor(Oid dbid);
 static void                    retry_pending_unmonitor(void);
-static DiskquotaDBEntry       *add_db_entry(Oid dbid);
+static DiskquotaDBEntry       *add_db_entry(Oid dbid, bool *is_new);
 static bool                    release_db_entry(Oid dbid);
 static char                   *get_db_name(Oid dbid);
 static void                    reset_worker(DiskQuotaWorkerEntry *dq_worker);
@@ -1172,7 +1172,7 @@ init_database_list(void)
 			                     dbid)));
 			continue;
 		}
-		dbEntry = add_db_entry(dbid);
+		dbEntry = add_db_entry(dbid, NULL);
 		if (dbEntry == NULL) continue;
 		num++;
 		/*
@@ -1268,7 +1268,6 @@ process_extension_ddl_message()
 static void
 do_process_extension_ddl_message(MessageResult *code, ExtensionDDLMessage local_extension_ddl_message)
 {
-	int  old_num_db         = num_db;
 	bool connected          = false;
 	bool pushed_active_snap = false;
 	bool ret                = true;
@@ -1295,13 +1294,20 @@ do_process_extension_ddl_message(MessageResult *code, ExtensionDDLMessage local_
 		switch (local_extension_ddl_message.cmd)
 		{
 			case CMD_CREATE_EXTENSION:
+				/*
+				 * num_db counts live dbArray slots and is maintained in
+				 * the post-commit phase from the actual slot change, not
+				 * here: on_add_db/on_del_db touch only database_list, and
+				 * a duplicate DROP (a timed-out drop's cleanup re-drops an
+				 * already-unmonitored database) deletes zero rows yet
+				 * still succeeds, so counting here would drift num_db off
+				 * the real slot count and flip worker scheduling.
+				 */
 				on_add_db(local_extension_ddl_message.dbid, code);
-				num_db++;
 				*code = ERR_OK;
 				break;
 			case CMD_DROP_EXTENSION:
 				on_del_db(local_extension_ddl_message.dbid, code);
-				if (num_db > 0) num_db--;
 				*code = ERR_OK;
 				break;
 			case CMD_SET_CLUSTER_QUOTA:
@@ -1321,8 +1327,7 @@ do_process_extension_ddl_message(MessageResult *code, ExtensionDDLMessage local_
 		HOLD_INTERRUPTS();
 		EmitErrorReport();
 		FlushErrorState();
-		ret    = false;
-		num_db = old_num_db;
+		ret = false;
 		RESUME_INTERRUPTS();
 	}
 	PG_END_TRY();
@@ -1368,16 +1373,19 @@ do_process_extension_ddl_message(MessageResult *code, ExtensionDDLMessage local_
 			connected = true;
 			switch (local_extension_ddl_message.cmd)
 			{
-				case CMD_CREATE_EXTENSION:
+				case CMD_CREATE_EXTENSION: {
+					bool is_new = false;
+					add_db_entry(dbid, &is_new);
+					if (is_new) num_db++;
 					if (num_db > diskquota_max_workers) DiskquotaLauncherShmem->isDynamicWorker = true;
-					add_db_entry(dbid);
 					/* TODO: how about this failed? */
 					update_monitor_db_mpp(dbid, ADD_DB_TO_MONITOR, LAUNCHER_SCHEMA);
 					break;
+				}
 				case CMD_DROP_EXTENSION:
-					if (num_db <= diskquota_max_workers) DiskquotaLauncherShmem->isDynamicWorker = false;
 					/* terminate bgworker in release_db_entry rountine */
-					release_db_entry(dbid);
+					if (release_db_entry(dbid) && num_db > 0) num_db--;
+					if (num_db <= diskquota_max_workers) DiskquotaLauncherShmem->isDynamicWorker = false;
 					SIMPLE_FAULT_INJECTOR("diskquota_drop_unmonitor");
 					update_monitor_db_mpp(dbid, REMOVE_DB_FROM_BEING_MONITORED, LAUNCHER_SCHEMA);
 					/* clear the out-of-quota rejectmap in shared memory */
@@ -1793,6 +1801,19 @@ fail:
 	return "";
 }
 
+PG_FUNCTION_INFO_V1(diskquota_is_dynamic_worker);
+/*
+ * Test-only: expose the launcher's shared worker-scheduling flag so a
+ * regression can assert num_db accounting stays correct (the count
+ * itself is launcher-process-local and not observable from a backend).
+ */
+Datum
+diskquota_is_dynamic_worker(PG_FUNCTION_ARGS)
+{
+	if (DiskquotaLauncherShmem == NULL) PG_RETURN_NULL();
+	PG_RETURN_BOOL(DiskquotaLauncherShmem->isDynamicWorker);
+}
+
 PG_FUNCTION_INFO_V1(diskquota_status);
 Datum
 diskquota_status(PG_FUNCTION_ARGS)
@@ -1957,10 +1978,12 @@ init_launcher_shmem()
  * allocated before.
  */
 static DiskquotaDBEntry *
-add_db_entry(Oid dbid)
+add_db_entry(Oid dbid, bool *is_new)
 {
 	DiskquotaDBEntry *result = NULL;
 	DiskquotaDBEntry *hole   = NULL;
+
+	if (is_new) *is_new = false;
 
 	LWLockAcquire(diskquota_locks.dblist_lock, LW_EXCLUSIVE);
 	/*
@@ -1996,6 +2019,7 @@ add_db_entry(Oid dbid)
 		hole->in_use        = true;
 		hole->next_run_time = GetCurrentTimestamp();
 		result              = hole;
+		if (is_new) *is_new = true;
 	}
 	if (result == NULL)
 		ereport(WARNING, (errmsg("[diskquota launcher] diskquota monitored database limit is reached, database(oid:%u) "

@@ -28,6 +28,7 @@ CREATE TYPE diskquota_test.db_status AS (
         "paused" bool
 );
 CREATE FUNCTION diskquota_test.db_status() RETURNS setof diskquota_test.db_status AS '$libdir/diskquota-2.4.so',  'db_status' LANGUAGE C VOLATILE;
+CREATE FUNCTION diskquota_test.is_dynamic_worker() RETURNS bool AS '$libdir/diskquota-2.4.so', 'diskquota_is_dynamic_worker' LANGUAGE C VOLATILE;
 CREATE FUNCTION diskquota_test.cur_db_status() RETURNS diskquota_test.db_status AS $$
 SELECT * from diskquota_test.db_status() where datname = current_database();
 $$ LANGUAGE SQL;
