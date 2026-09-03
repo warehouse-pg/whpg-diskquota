@@ -86,6 +86,9 @@ ExtensionDDLMessage *extension_ddl_message = NULL;
 // a pointer to DiskquotaLauncherShmem->workerEntries in shared memory
 static DiskQuotaWorkerEntry *volatile MyWorkerInfo = NULL;
 
+// True only in the diskquota launcher process; see diskquota_am_launcher().
+static bool am_diskquota_launcher = false;
+
 // how many database diskquota are monitoring on
 static int num_db = 0;
 
@@ -129,20 +132,29 @@ static StartWorkerState start_worker(DiskquotaDBEntry *dbEntry);
 static void             create_monitor_db_table(void);
 static void             add_dbid_to_database_list(Oid dbid);
 static void             del_dbid_from_database_list(Oid dbid);
+static void             rollback_failed_create(Oid dbid);
 static void             process_extension_ddl_message(void);
 static void do_process_extension_ddl_message(MessageResult *code, ExtensionDDLMessage local_extension_ddl_message);
 static void terminate_all_workers(void);
 static void on_add_db(Oid dbid, MessageResult *code);
 static void on_del_db(Oid dbid, MessageResult *code);
+static void on_set_cluster_quota(int64 limit_mb);
+static void load_global_quota_config(void);
+static void reap_dropped_databases(void);
 static bool is_valid_dbid(Oid dbid);
-extern void invalidate_database_rejectmap(Oid dbid);
 static void FreeWorkerOnExit(int code, Datum arg);
 static void FreeWorker(DiskQuotaWorkerEntry *worker);
 static void init_database_list(void);
 static DiskquotaDBEntry       *next_db(DiskquotaDBEntry *curDB);
 static DiskQuotaWorkerEntry   *next_worker(void);
-static DiskquotaDBEntry       *add_db_entry(Oid dbid);
-static void                    release_db_entry(Oid dbid);
+static bool                    dbentry_binding_current(DiskquotaDBEntry *dbEntry);
+static void                    queue_pending_unmonitor(Oid dbid);
+static void                    retry_pending_unmonitor(void);
+static void                    reap_draining_db_entries(void);
+static bool                    dbid_has_live_slot(Oid dbid);
+static bool                    launcher_commit_transaction(void);
+static DiskquotaDBEntry       *add_db_entry(Oid dbid, bool *is_new);
+static bool                    release_db_entry(Oid dbid);
 static char                   *get_db_name(Oid dbid);
 static void                    reset_worker(DiskQuotaWorkerEntry *dq_worker);
 static void                    vacuum_db_entry(DiskquotaDBEntry *db);
@@ -441,14 +453,6 @@ disk_quota_worker_main(Datum main_arg)
 	pqsignal(SIGTERM, disk_quota_sigterm);
 	pqsignal(SIGUSR1, disk_quota_sigusr1);
 
-	if (!MyWorkerInfo->dbEntry->inited)
-	{
-		MyWorkerInfo->dbEntry->last_log_time = GetCurrentTimestamp();
-		ereport(LOG, (errmsg("[diskquota] start disk quota worker process to monitor database:%s", dbname)));
-	}
-	/* To avoid last_log_time from being uninitialized. */
-	if (MyWorkerInfo->dbEntry->last_log_time > GetCurrentTimestamp())
-		MyWorkerInfo->dbEntry->last_log_time = GetCurrentTimestamp();
 	/*
 	 * The shmem exit hook is registered after registering disk_quota_sigterm.
 	 * So if the SIGTERM arrives before this statement, the shmem exit hook
@@ -475,6 +479,40 @@ disk_quota_worker_main(Datum main_arg)
 	/* diskquota worker should has Gp_role as dispatcher */
 	Gp_role = GP_ROLE_DISPATCH;
 
+	/* let tests hold a starting worker here, before it adopts its incarnation */
+	SIMPLE_FAULT_INJECTOR("diskquota_worker_startup_fence");
+
+	/*
+	 * Fix the slot incarnation this worker publishes for before touching
+	 * any mutable slot state, so the fault above is a clean ownership
+	 * boundary: a worker parked there has not yet written to its dbEntry.
+	 */
+	diskquota_worker_capture_generation();
+
+	/*
+	 * Validate the captured incarnation before touching any mutable slot or
+	 * model state. A worker resumed after a launcher restart plus DROP/CREATE
+	 * can hold a stale generation; it must exit here rather than initialize or
+	 * run the model for the slot the successor incarnation now owns. The
+	 * checks in the version and readiness loops below only cover a slot
+	 * drained while this worker is parked there.
+	 */
+	if (!diskquota_worker_binding_valid())
+	{
+		ereport(LOG, (errmsg("[diskquota] bgworker for \"%s\" exits at startup: its database is no longer monitored",
+		                     dbname)));
+		proc_exit(0);
+	}
+
+	if (!MyWorkerInfo->dbEntry->inited)
+	{
+		MyWorkerInfo->dbEntry->last_log_time = GetCurrentTimestamp();
+		ereport(LOG, (errmsg("[diskquota] start disk quota worker process to monitor database:%s", dbname)));
+	}
+	/* To avoid last_log_time from being uninitialized. */
+	if (MyWorkerInfo->dbEntry->last_log_time > GetCurrentTimestamp())
+		MyWorkerInfo->dbEntry->last_log_time = GetCurrentTimestamp();
+
 	/*
 	 * Initialize diskquota related local hash map and refresh model
 	 * immediately
@@ -487,6 +525,18 @@ disk_quota_worker_main(Datum main_arg)
 	while (!got_sigterm)
 	{
 		CHECK_FOR_INTERRUPTS();
+
+		/*
+		 * A worker whose slot was drained while it parked here (a DROP after
+		 * a launcher restart cannot signal it) must exit on its own, or its
+		 * slot never returns to freeWorkers.
+		 */
+		if (!diskquota_worker_binding_valid())
+		{
+			ereport(LOG,
+			        (errmsg("[diskquota] bgworker for \"%s\" exits: its database is no longer monitored", dbname)));
+			proc_exit(0);
+		}
 
 		int major = -1, minor = -1;
 		int has_error = worker_spi_get_extension_version(&major, &minor) != 0;
@@ -548,6 +598,14 @@ disk_quota_worker_main(Datum main_arg)
 
 		CHECK_FOR_INTERRUPTS();
 
+		/* see the version-check loop: a drained slot with no handle */
+		if (!diskquota_worker_binding_valid())
+		{
+			ereport(LOG,
+			        (errmsg("[diskquota] bgworker for \"%s\" exits: its database is no longer monitored", dbname)));
+			proc_exit(0);
+		}
+
 		/*
 		 * Check whether the state is in ready mode. The state would be
 		 * unknown, when you `create extension diskquota` at the first time.
@@ -590,9 +648,14 @@ disk_quota_worker_main(Datum main_arg)
 		}
 	}
 
-	if (!MyWorkerInfo->dbEntry->inited) update_monitordb_status(MyWorkerInfo->dbEntry->dbid, DB_RUNNING);
+	/*
+	 * Unconditionally, not only on the first initialization: a replayed
+	 * cache ADD (a launcher restart) can clobber the status back to
+	 * DB_INIT, and no later code path would ever correct it for an
+	 * already-inited database.
+	 */
+	update_monitordb_status(MyWorkerInfo->dbEntry->dbid, DB_RUNNING);
 
-	bool        is_gang_destroyed    = false;
 	TimestampTz loop_start_timestamp = 0;
 	TimestampTz loop_end_timestamp;
 	TimestampTz log_time;
@@ -603,6 +666,30 @@ disk_quota_worker_main(Datum main_arg)
 	while (!got_sigterm)
 	{
 		int rc;
+
+		/*
+		 * The slot binding can be gone: DROP EXTENSION after a launcher
+		 * restart cannot signal this worker (the termination handles
+		 * live in launcher process memory), it only releases the slot.
+		 * A worker whose binding is gone must exit on its own, or it
+		 * would loop forever -- its per-cycle SQL errors are swallowed
+		 * -- and never return its DiskQuotaWorkerEntry, starving a
+		 * later CREATE EXTENSION of workers.
+		 */
+		{
+			bool stale;
+
+			LWLockAcquire(diskquota_locks.dblist_lock, LW_SHARED);
+			stale = !dbentry_binding_current(MyWorkerInfo->dbEntry);
+			LWLockRelease(diskquota_locks.dblist_lock);
+			if (stale)
+			{
+				ereport(LOG, (errmsg("[diskquota] bgworker for \"%s\" exits: its database is "
+				                     "no longer monitored",
+				                     dbname)));
+				break;
+			}
+		}
 
 		/*
 		 * The log printed from the bgworker does not contain the database name
@@ -630,19 +717,33 @@ disk_quota_worker_main(Datum main_arg)
 		if (sleep_time >= diskquota_naptime * 1000)
 		{
 			SIMPLE_FAULT_INJECTOR("diskquota_worker_main");
-			if (!diskquota_is_paused())
-			{
-				/* Refresh quota model with init mode */
-				refresh_disk_quota_model(!MyWorkerInfo->dbEntry->inited);
-				MyWorkerInfo->dbEntry->inited = true;
-				is_gang_destroyed             = false;
-			}
-			else if (!is_gang_destroyed)
-			{
-				DisconnectAndDestroyAllGangs(false);
-				is_gang_destroyed = true;
-			}
-			worker_increase_epoch(MyWorkerInfo->dbEntry->dbid);
+			/*
+			 * Refresh even when paused: a paused database is still
+			 * counted -- its published total keeps feeding the
+			 * cluster-wide quota -- it is only not enforced.
+			 * refresh_disk_quota_usage() leaves the shared rejectmap
+			 * and the segment maps untouched while paused.
+			 */
+			refresh_disk_quota_model(!MyWorkerInfo->dbEntry->inited);
+			/*
+			 * A worker being terminated can finish this cycle after its
+			 * slot was released and re-claimed for the same database.
+			 * Only the current binding may mark the model initialized:
+			 * a stale mark would make the next incarnation skip the
+			 * readiness gate and the initial size load, leaving its
+			 * in-memory model empty until tables become active again.
+			 * Checked and written under dblist_lock, so the check cannot
+			 * interleave with a concurrent slot claim.
+			 */
+			LWLockAcquire(diskquota_locks.dblist_lock, LW_SHARED);
+			if (dbentry_binding_current(MyWorkerInfo->dbEntry)) MyWorkerInfo->dbEntry->inited = true;
+			LWLockRelease(diskquota_locks.dblist_lock);
+			/*
+			 * The epoch belongs to this worker's database, which is fixed
+			 * for the life of the process; the slot's dbid may already be
+			 * another database's after a rebind.
+			 */
+			worker_increase_epoch(MyDatabaseId);
 
 			// GPDB6 opend a MemoryAccount for us without asking us.
 			// and GPDB6 did not release the MemoryAccount after SPI finish.
@@ -726,6 +827,8 @@ disk_quota_launcher_main(Datum main_arg)
 		proc_exit(0);
 	}
 
+	am_diskquota_launcher = true;
+
 	MemoryContextSwitchTo(TopMemoryContext);
 	init_bgworker_handles();
 
@@ -763,6 +866,7 @@ disk_quota_launcher_main(Datum main_arg)
 	create_monitor_db_table();
 
 	init_database_list();
+	load_global_quota_config();
 	DisconnectAndDestroyAllGangs(false);
 
 	loop_end = time(NULL);
@@ -781,6 +885,7 @@ disk_quota_launcher_main(Datum main_arg)
 	{
 		int rc;
 		CHECK_FOR_INTERRUPTS();
+		SIMPLE_FAULT_INJECTOR("diskquota_launcher_main");
 		/* pick a db to run */
 		if (advance_one_db)
 		{
@@ -886,6 +991,14 @@ disk_quota_launcher_main(Datum main_arg)
 		}
 
 		/*
+		 * A database dropped without DROP EXTENSION leaves its
+		 * bookkeeping behind; release it, or the cluster-wide quota
+		 * total keeps counting the dead database's last size.
+		 */
+		reap_dropped_databases();
+		reap_draining_db_entries();
+
+		/*
 		 * Try to starts a bgworker for the curDB
 		 *
 		 */
@@ -968,6 +1081,8 @@ create_monitor_db_table(void)
 	 */
 	sql = "create schema if not exists diskquota_namespace;"
 	      "create table if not exists diskquota_namespace.database_list(dbid oid not null unique);"
+	      "create table if not exists diskquota_namespace.global_quota_config(quotatype int not null unique, "
+	      "quotalimitmb bigint not null);"
 	      "DROP SCHEMA IF EXISTS " LAUNCHER_SCHEMA
 	      " CASCADE;"
 	      "CREATE SCHEMA " LAUNCHER_SCHEMA
@@ -1102,7 +1217,7 @@ init_database_list(void)
 			                     dbid)));
 			continue;
 		}
-		dbEntry = add_db_entry(dbid);
+		dbEntry = add_db_entry(dbid, NULL);
 		if (dbEntry == NULL) continue;
 		num++;
 		/*
@@ -1129,9 +1244,15 @@ init_database_list(void)
 	}
 	SPI_finish();
 	PopActiveSnapshot();
-	CommitTransactionCommand();
+	(void)launcher_commit_transaction();
 	/* TODO: clean invalid database */
-	if (num_db > diskquota_max_workers) DiskquotaLauncherShmem->isDynamicWorker = true;
+	/*
+	 * Recompute from the authoritative count: a launcher restart that
+	 * preserves shared memory must clear a stale dynamic-worker flag as
+	 * well as set it, or a run that dropped below diskquota_max_workers
+	 * while the flag was true would keep rotating workers needlessly.
+	 */
+	DiskquotaLauncherShmem->isDynamicWorker = (num_db > diskquota_max_workers);
 }
 
 /*
@@ -1162,10 +1283,56 @@ process_extension_ddl_message()
 
 	/* Send createdrop extension diskquota result back to QD */
 	LWLockAcquire(diskquota_locks.extension_ddl_message_lock, LW_EXCLUSIVE);
-	memset(extension_ddl_message, 0, sizeof(ExtensionDDLMessage));
-	extension_ddl_message->launcher_pid = MyProcPid;
-	extension_ddl_message->result       = (int)code;
+	/*
+	 * Answer only the arming this pass copied. A new seq means the
+	 * requester withdrew a timed-out message and a later backend armed
+	 * a new one while the old command was still running here:
+	 * overwriting that would destroy the pending message and hand its
+	 * sender this command's verdict (a CREATE EXTENSION reported OK
+	 * without ever being processed, leaving the database silently
+	 * unmonitored). The new message needs no help from this pass: its
+	 * sender's SIGUSR2 is already pending, so the next loop pass picks
+	 * it up.
+	 */
+	if (extension_ddl_message->seq == local_extension_ddl_message.seq)
+	{
+		uint64 seq = extension_ddl_message->seq;
+
+		memset(extension_ddl_message, 0, sizeof(ExtensionDDLMessage));
+		extension_ddl_message->launcher_pid = MyProcPid;
+		extension_ddl_message->result       = (int)code;
+		extension_ddl_message->seq          = seq;
+	}
+	else
+		ereport(LOG, (errmsg("[diskquota launcher] discarding the result of a withdrawn message (cmd=%d)",
+		                     local_extension_ddl_message.cmd)));
 	LWLockRelease(diskquota_locks.extension_ddl_message_lock);
+}
+
+/*
+ * Undo a CREATE EXTENSION whose post-commit phase failed: release the slot
+ * add_db_entry() may have claimed (draining any worker and decrementing
+ * num_db), then queue the durable teardown of the committed phase-1
+ * database_list row and the segment monitoring. See rollback body for why the
+ * teardown goes through the retry queue.
+ */
+static void
+rollback_failed_create(Oid dbid)
+{
+	if (release_db_entry(dbid) && num_db > 0) num_db--;
+	if (num_db <= diskquota_max_workers) DiskquotaLauncherShmem->isDynamicWorker = false;
+
+	/*
+	 * Drive the durable teardown -- deleting the committed phase-1
+	 * database_list row and stopping segment monitoring -- through the
+	 * pending-unmonitor queue rather than a single coupled transaction. The
+	 * retry does both idempotently and keeps the entry until they commit, so
+	 * a transient failure of either cannot leave the row behind for the
+	 * launcher's startup replay to resurrect. Run it now for promptness; if
+	 * it cannot complete, the launcher's main loop retries it.
+	 */
+	queue_pending_unmonitor(dbid);
+	retry_pending_unmonitor();
 }
 
 /*
@@ -1178,7 +1345,6 @@ process_extension_ddl_message()
 static void
 do_process_extension_ddl_message(MessageResult *code, ExtensionDDLMessage local_extension_ddl_message)
 {
-	int  old_num_db         = num_db;
 	bool connected          = false;
 	bool pushed_active_snap = false;
 	bool ret                = true;
@@ -1205,14 +1371,25 @@ do_process_extension_ddl_message(MessageResult *code, ExtensionDDLMessage local_
 		switch (local_extension_ddl_message.cmd)
 		{
 			case CMD_CREATE_EXTENSION:
+				/*
+				 * num_db counts live dbArray slots and is maintained in
+				 * the post-commit phase from the actual slot change, not
+				 * here: on_add_db/on_del_db touch only database_list, and
+				 * a duplicate DROP (a timed-out drop's cleanup re-drops an
+				 * already-unmonitored database) deletes zero rows yet
+				 * still succeeds, so counting here would drift num_db off
+				 * the real slot count and flip worker scheduling.
+				 */
 				on_add_db(local_extension_ddl_message.dbid, code);
-				num_db++;
 				*code = ERR_OK;
 				break;
 			case CMD_DROP_EXTENSION:
 				on_del_db(local_extension_ddl_message.dbid, code);
-				if (num_db > 0) num_db--;
 				*code = ERR_OK;
+				break;
+			case CMD_SET_CLUSTER_QUOTA:
+				/* the result is decided only after the post-commit publish */
+				on_set_cluster_quota(local_extension_ddl_message.payload);
 				break;
 			default:
 				ereport(LOG, (errmsg("[diskquota launcher]:received unsupported message cmd=%d",
@@ -1227,8 +1404,7 @@ do_process_extension_ddl_message(MessageResult *code, ExtensionDDLMessage local_
 		HOLD_INTERRUPTS();
 		EmitErrorReport();
 		FlushErrorState();
-		ret    = false;
-		num_db = old_num_db;
+		ret = false;
 		RESUME_INTERRUPTS();
 	}
 	PG_END_TRY();
@@ -1236,12 +1412,28 @@ do_process_extension_ddl_message(MessageResult *code, ExtensionDDLMessage local_
 	if (connected) SPI_finish();
 	if (pushed_active_snap) PopActiveSnapshot();
 	if (ret)
-		CommitTransactionCommand();
+		ret = launcher_commit_transaction();
 	else
 		AbortCurrentTransaction();
 	/* update something in memory after transaction committed */
-	if (ret)
+	if (ret && local_extension_ddl_message.cmd == CMD_SET_CLUSTER_QUOTA)
 	{
+		/*
+		 * Publish the live limit only now that the change to
+		 * global_quota_config is committed (the table is distributed,
+		 * so the commit itself can abort), and decide the result only
+		 * after the publish. The publish is a pure atomic write that
+		 * cannot fail, so a client is never told OK for a limit that
+		 * was persisted but never armed -- and never told OK before
+		 * enforcement actually sees it.
+		 */
+		diskquota_set_cluster_limit_mb(local_extension_ddl_message.payload);
+		*code = ERR_OK;
+	}
+	else if (ret)
+	{
+		connected          = false;
+		pushed_active_snap = false;
 		PG_TRY();
 		{
 			/* update_monitor_db_mpp runs sql to distribute dbid to segments */
@@ -1255,18 +1447,45 @@ do_process_extension_ddl_message(MessageResult *code, ExtensionDDLMessage local_
 				ereport(ERROR, (errcode(ERRCODE_INTERNAL_ERROR),
 				                errmsg("unable to connect to execute internal query. return code: %d.", ret_code)));
 			}
+			connected = true;
 			switch (local_extension_ddl_message.cmd)
 			{
-				case CMD_CREATE_EXTENSION:
+				case CMD_CREATE_EXTENSION: {
+					bool              is_new = false;
+					DiskquotaDBEntry *entry;
+					/* test hook: fail the CREATE's post-commit monitor step */
+					SIMPLE_FAULT_INJECTOR("diskquota_create_monitor");
+					entry = add_db_entry(dbid, &is_new);
+					if (entry == NULL)
+					{
+						/*
+						 * No free dbArray slot. The phase-1 num_db guard can
+						 * pass while a draining slot still occupies the array,
+						 * so the shortage only surfaces here. Undo the
+						 * committed phase-1 database_list row and report
+						 * failure rather than dispatch ADD_DB_TO_MONITOR_FRESH,
+						 * which would enable segment-side enforcement for a
+						 * database that has no coordinator slot, worker, or
+						 * accounting.
+						 */
+						del_dbid_from_database_list(dbid);
+						*code = ERR_EXCEED;
+						break;
+					}
+					if (is_new) num_db++;
 					if (num_db > diskquota_max_workers) DiskquotaLauncherShmem->isDynamicWorker = true;
-					add_db_entry(dbid);
-					/* TODO: how about this failed? */
-					update_monitor_db_mpp(dbid, ADD_DB_TO_MONITOR, LAUNCHER_SCHEMA);
+					/* test hook: fail the CREATE after the slot is claimed but
+					 * before the segments are told to monitor */
+					SIMPLE_FAULT_INJECTOR("diskquota_create_post_slot");
+					/* create-or-reset: clears a stale paused from a failed unmonitor */
+					update_monitor_db_mpp(dbid, ADD_DB_TO_MONITOR_FRESH, LAUNCHER_SCHEMA);
 					break;
+				}
 				case CMD_DROP_EXTENSION:
-					if (num_db <= diskquota_max_workers) DiskquotaLauncherShmem->isDynamicWorker = false;
 					/* terminate bgworker in release_db_entry rountine */
-					release_db_entry(dbid);
+					if (release_db_entry(dbid) && num_db > 0) num_db--;
+					if (num_db <= diskquota_max_workers) DiskquotaLauncherShmem->isDynamicWorker = false;
+					SIMPLE_FAULT_INJECTOR("diskquota_drop_unmonitor");
 					update_monitor_db_mpp(dbid, REMOVE_DB_FROM_BEING_MONITORED, LAUNCHER_SCHEMA);
 					/* clear the out-of-quota rejectmap in shared memory */
 					invalidate_database_rejectmap(dbid);
@@ -1276,9 +1495,6 @@ do_process_extension_ddl_message(MessageResult *code, ExtensionDDLMessage local_
 					                     local_extension_ddl_message.cmd)));
 					break;
 			}
-			SPI_finish();
-			if (pushed_active_snap) PopActiveSnapshot();
-			CommitTransactionCommand();
 		}
 		PG_CATCH();
 		{
@@ -1286,9 +1502,63 @@ do_process_extension_ddl_message(MessageResult *code, ExtensionDDLMessage local_
 			HOLD_INTERRUPTS();
 			EmitErrorReport();
 			FlushErrorState();
+			/*
+			 * The segment-side unmonitor dispatch is the only step
+			 * here whose loss is unrepairable (the database still
+			 * exists, so the reaper never revisits it); hand it to
+			 * the launcher loop to retry.
+			 */
+			if (local_extension_ddl_message.cmd == CMD_DROP_EXTENSION)
+				queue_pending_unmonitor((Oid)local_extension_ddl_message.dbid);
+			ret = false;
 			RESUME_INTERRUPTS();
 		}
 		PG_END_TRY();
+		/*
+		 * The cleanup must run outside the PG_TRY: a swallowed error
+		 * used to leave the started transaction behind, and the next
+		 * StartTransactionCommand anywhere in the launcher died with
+		 * "unexpected state STARTED", taking the launcher down.
+		 */
+		if (connected) SPI_finish();
+		if (pushed_active_snap) PopActiveSnapshot();
+		bool phase2_committed = false;
+		if (ret)
+		{
+			phase2_committed = launcher_commit_transaction();
+			/*
+			 * The segment-side unmonitor dispatch is the only step whose loss
+			 * is unrepairable (the database still exists, so the reaper never
+			 * revisits it); hand a failed DROP commit to the launcher loop.
+			 */
+			if (!phase2_committed && local_extension_ddl_message.cmd == CMD_DROP_EXTENSION)
+				queue_pending_unmonitor((Oid)local_extension_ddl_message.dbid);
+		}
+		else
+			AbortCurrentTransaction();
+		/*
+		 * Phase 1 already pre-set ERR_OK. A CREATE whose post-commit phase
+		 * (shmem slot and segment monitoring) did not commit must report
+		 * failure, not a false success: it has no async retry, so a silent OK
+		 * would leave the caller believing an unmonitored database is
+		 * monitored. A failed DROP keeps its success -- queue_pending_unmonitor()
+		 * above retries its segment unmonitor. The committed phase-1
+		 * database_list row is reconciled by the launcher restart replay.
+		 */
+		if (!phase2_committed && local_extension_ddl_message.cmd == CMD_CREATE_EXTENSION)
+		{
+			*code = ERR_UNKNOWN;
+			/*
+			 * The post-commit phase failed after add_db_entry() may already
+			 * have claimed a slot -- add_db_entry() mutates shared memory,
+			 * which the aborted transaction does not undo. Tear the
+			 * half-created monitoring down like a DROP (slot, num_db, the
+			 * committed phase-1 database_list row, and the segment
+			 * registration) so the database is not left monitored after
+			 * CREATE EXTENSION itself reported failure.
+			 */
+			rollback_failed_create((Oid)local_extension_ddl_message.dbid);
+		}
 	}
 	DisconnectAndDestroyAllGangs(false);
 }
@@ -1487,6 +1757,8 @@ start_worker(DiskquotaDBEntry *dbEntry)
 
 	dbEntry->workerId  = dq_worker->id;
 	dq_worker->dbEntry = dbEntry;
+	/* the launcher is the only writer of dbEntry->generation */
+	dq_worker->generation = dbEntry->generation;
 
 #if DISKQUOTA_DEBUG
 	dbEntry->last_run_time = GetCurrentTimestamp();
@@ -1661,6 +1933,19 @@ fail:
 	return "";
 }
 
+PG_FUNCTION_INFO_V1(diskquota_is_dynamic_worker);
+/*
+ * Test-only: expose the launcher's shared worker-scheduling flag so a
+ * regression can assert num_db accounting stays correct (the count
+ * itself is launcher-process-local and not observable from a backend).
+ */
+Datum
+diskquota_is_dynamic_worker(PG_FUNCTION_ARGS)
+{
+	if (DiskquotaLauncherShmem == NULL) PG_RETURN_NULL();
+	PG_RETURN_BOOL(DiskquotaLauncherShmem->isDynamicWorker);
+}
+
 PG_FUNCTION_INFO_V1(diskquota_status);
 Datum
 diskquota_status(PG_FUNCTION_ARGS)
@@ -1764,9 +2049,9 @@ init_launcher_shmem()
 	bool found;
 	DiskquotaLauncherShmem = (DiskquotaLauncherShmemStruct *)ShmemInitStruct("Diskquota launcher Data",
 	                                                                         diskquota_launcher_shmem_size(), &found);
-	memset(DiskquotaLauncherShmem, 0, diskquota_launcher_shmem_size());
 	if (!found)
 	{
+		memset(DiskquotaLauncherShmem, 0, diskquota_launcher_shmem_size());
 		dlist_init(&DiskquotaLauncherShmem->freeWorkers);
 		dlist_init(&DiskquotaLauncherShmem->runningWorkers);
 
@@ -1800,7 +2085,10 @@ init_launcher_shmem()
 			memset(&DiskquotaLauncherShmem->dbArray[i], 0, sizeof(DiskquotaDBEntry));
 			DiskquotaLauncherShmem->dbArray[i].id       = i;
 			DiskquotaLauncherShmem->dbArray[i].workerId = INVALID_WORKER_ID;
+			pg_atomic_init_u64(&DiskquotaLauncherShmem->dbArray[i].total_size, 0);
+			pg_atomic_init_u64(&DiskquotaLauncherShmem->dbArray[i].db_quota_limit_mb, 0);
 		}
+		pg_atomic_init_u64(&DiskquotaLauncherShmem->cluster_quota_limit_mb, 0);
 	}
 	/* init TableSizeEntry counter */
 	diskquota_table_size_entry_num =
@@ -1822,27 +2110,64 @@ init_launcher_shmem()
  * allocated before.
  */
 static DiskquotaDBEntry *
-add_db_entry(Oid dbid)
+add_db_entry(Oid dbid, bool *is_new)
 {
 	DiskquotaDBEntry *result = NULL;
+	DiskquotaDBEntry *hole   = NULL;
+
+	if (is_new) *is_new = false;
+
+	/* test hook: simulate a full dbArray -- add_db_entry() finds no slot */
+	if (SIMPLE_FAULT_INJECTOR("diskquota_add_db_entry_full") == FaultInjectorTypeSkip) return NULL;
 
 	LWLockAcquire(diskquota_locks.dblist_lock, LW_EXCLUSIVE);
-	/* if there is already dbEntry's dbid equals dbid, returning the existing one */
+	/*
+	 * An existing binding for dbid always wins, so scan the whole array
+	 * before claiming anything: claiming a hole first would leave it
+	 * behind as an orphaned duplicate when a later slot turns out to
+	 * hold the binding, and first-match readers would then see the
+	 * orphan's zeros instead of the published values.
+	 */
 	for (int i = 0; i < diskquota_max_monitored_databases; i++)
 	{
 		DiskquotaDBEntry *dbEntry = &DiskquotaLauncherShmem->dbArray[i];
-		if (!dbEntry->in_use && result == NULL)
-		{
-			dbEntry->dbid          = dbid;
-			dbEntry->in_use        = true;
-			dbEntry->next_run_time = GetCurrentTimestamp();
-			result                 = dbEntry;
-		}
-		else if (dbEntry->in_use && dbEntry->dbid == dbid)
+		if (dbEntry->in_use && dbEntry->dbid == dbid)
 		{
 			result = dbEntry;
+			/*
+			 * Re-monitored while the previous incarnation is still
+			 * draining: reactivate the same slot once the old worker
+			 * leaves rather than freeing it, and count it as new again
+			 * (the drop already decremented num_db). A second CREATE on
+			 * an already-reviving slot is idempotent.
+			 */
+			if (dbEntry->lifecycle == DB_SLOT_DRAINING)
+			{
+				dbEntry->lifecycle = DB_SLOT_REVIVING;
+				if (is_new) *is_new = true;
+			}
 			break;
 		}
+		if (!dbEntry->in_use && hole == NULL) hole = dbEntry;
+	}
+	if (result == NULL && hole != NULL)
+	{
+		/*
+		 * A freed slot keeps its last occupant's published numbers;
+		 * clear them so they are never attributed to this database.
+		 */
+		pg_atomic_write_u64(&hole->total_size, 0);
+		pg_atomic_write_u64(&hole->db_quota_limit_mb, 0);
+		hole->rejectmap_retry      = false;
+		hole->rejectmap_retry_full = false;
+		hole->inited               = false;
+		hole->generation++;
+		hole->dbid          = dbid;
+		hole->lifecycle     = DB_SLOT_ACTIVE;
+		hole->in_use        = true;
+		hole->next_run_time = GetCurrentTimestamp();
+		result              = hole;
+		if (is_new) *is_new = true;
 	}
 	if (result == NULL)
 		ereport(WARNING, (errmsg("[diskquota launcher] diskquota monitored database limit is reached, database(oid:%u) "
@@ -1854,14 +2179,196 @@ add_db_entry(Oid dbid)
 	return result;
 }
 
+/*
+ * Databases whose segment-side unmonitor dispatch failed during DROP
+ * EXTENSION. A database that still exists is invisible to the
+ * dropped-database reaper, so without a retry the segments would keep
+ * a monitored_dbid_cache slot and the activity hooks running for it
+ * until their postmasters restart. Process-local: a launcher restart
+ * loses the queue, which at worst restores the old behavior.
+ */
+static Oid *pending_unmonitor   = NULL;
+static int  n_pending_unmonitor = 0;
+
 static void
-release_db_entry(Oid dbid)
+queue_pending_unmonitor(Oid dbid)
 {
-	DiskquotaDBEntry *db = NULL;
+	if (pending_unmonitor == NULL)
+		pending_unmonitor = MemoryContextAlloc(TopMemoryContext, sizeof(Oid) * diskquota_max_monitored_databases);
+	for (int i = 0; i < n_pending_unmonitor; i++)
+		if (pending_unmonitor[i] == dbid) return;
+	if (n_pending_unmonitor < diskquota_max_monitored_databases) pending_unmonitor[n_pending_unmonitor++] = dbid;
+}
+
+/*
+ * Whether dbid currently holds a live launcher slot -- i.e. it is
+ * monitored right now. A queued unmonitor carries only the database
+ * oid, and a DROP EXTENSION leaves that oid unchanged, so a CREATE
+ * EXTENSION that re-monitors the same database before the retry runs
+ * would otherwise have its monitoring torn down by the stale retry.
+ */
+static bool
+dbid_has_live_slot(Oid dbid)
+{
+	bool found = false;
+
+	LWLockAcquire(diskquota_locks.dblist_lock, LW_SHARED);
 	for (int i = 0; i < diskquota_max_monitored_databases; i++)
 	{
 		DiskquotaDBEntry *dbEntry = &DiskquotaLauncherShmem->dbArray[i];
-		if (dbEntry->in_use && dbEntry->dbid == dbid)
+		if (dbEntry->in_use && dbEntry->dbid == dbid && dbEntry->lifecycle != DB_SLOT_DRAINING)
+		{
+			found = true;
+			break;
+		}
+	}
+	LWLockRelease(diskquota_locks.dblist_lock);
+	return found;
+}
+
+/*
+ * Retry the queued unmonitor dispatches, one transaction each so one
+ * still-failing database does not block the rest.
+ */
+static void
+retry_pending_unmonitor(void)
+{
+	/*
+	 * Test hook: 'skip' holds the retries so a regression can line up a
+	 * DROP then CREATE of the same database before they run.
+	 */
+	if (SIMPLE_FAULT_INJECTOR("diskquota_pending_unmonitor_retry") == FaultInjectorTypeSkip) return;
+
+	for (int i = 0; i < n_pending_unmonitor;)
+	{
+		Oid  dbid               = pending_unmonitor[i];
+		bool connected          = false;
+		bool pushed_active_snap = false;
+		bool ok                 = true;
+
+		/*
+		 * The database was re-monitored by a CREATE EXTENSION after
+		 * this teardown was queued (the oid is unchanged across
+		 * DROP/CREATE): the queued teardown is obsolete and would delete
+		 * the live incarnation's database_list row and unmonitor it, so
+		 * drop it without dispatch.
+		 */
+		if (dbid_has_live_slot(dbid))
+		{
+			pending_unmonitor[i] = pending_unmonitor[--n_pending_unmonitor];
+			continue;
+		}
+
+		StartTransactionCommand();
+		PG_TRY();
+		{
+			if (SPI_OK_CONNECT != SPI_connect())
+				ereport(ERROR, (errcode(ERRCODE_INTERNAL_ERROR),
+				                errmsg("[diskquota launcher] unable to connect to execute internal query")));
+			connected = true;
+			PushActiveSnapshot(GetTransactionSnapshot());
+			pushed_active_snap = true;
+			/*
+			 * Remove the database_list row and stop segment monitoring
+			 * together. For a failed DROP the row is already gone (deleted
+			 * in phase 1), so the delete is a no-op; for a failed CREATE
+			 * teardown it undoes the committed phase-1 row. Coupling them
+			 * is safe because the whole entry is retried until both commit,
+			 * so a transient failure never leaves the row behind.
+			 */
+			del_dbid_from_database_list(dbid);
+			update_monitor_db_mpp(dbid, REMOVE_DB_FROM_BEING_MONITORED, LAUNCHER_SCHEMA);
+		}
+		PG_CATCH();
+		{
+			error_context_stack = NULL;
+			HOLD_INTERRUPTS();
+			EmitErrorReport();
+			FlushErrorState();
+			ok = false;
+			RESUME_INTERRUPTS();
+		}
+		PG_END_TRY();
+		if (connected) SPI_finish();
+		if (pushed_active_snap) PopActiveSnapshot();
+		if (ok && launcher_commit_transaction())
+		{
+			invalidate_database_rejectmap(dbid);
+			pending_unmonitor[i] = pending_unmonitor[--n_pending_unmonitor];
+		}
+		else
+		{
+			/*
+			 * A distributed commit can fail with a segment down; route it
+			 * through launcher_commit_transaction() so the failure cannot
+			 * escape and kill the handler-less launcher. On any failure keep
+			 * the entry and retry it on a later pass -- the SPI-error path
+			 * still needs an explicit abort, while a failed commit was
+			 * already aborted by the helper.
+			 */
+			if (!ok) AbortCurrentTransaction();
+			i++;
+		}
+	}
+}
+
+/*
+ * Returns whether a dbArray slot was actually bound to dbid and
+ * released: callers that maintain num_db must not decrement for a
+ * database that never held a slot.
+ */
+/*
+ * Commit the launcher's current transaction without letting a failed
+ * distributed 2PC (a segment down at commit) escape into the handler-less
+ * launcher main loop and kill the launcher. Returns false and leaves the
+ * transaction aborted on failure.
+ */
+static bool
+launcher_commit_transaction(void)
+{
+	bool ok = true;
+
+	PG_TRY();
+	{
+		/*
+		 * Test hook: model a distributed commit failure (a segment down at
+		 * 2PC commit) so a regression can prove a failed launcher commit is
+		 * caught here instead of escaping to terminate the launcher.
+		 */
+		SIMPLE_FAULT_INJECTOR("diskquota_launcher_commit_fail");
+		CommitTransactionCommand();
+	}
+	PG_CATCH();
+	{
+		error_context_stack = NULL;
+		HOLD_INTERRUPTS();
+		EmitErrorReport();
+		FlushErrorState();
+		ok = false;
+		RESUME_INTERRUPTS();
+	}
+	PG_END_TRY();
+	if (!ok) AbortCurrentTransaction();
+	return ok;
+}
+
+static bool
+release_db_entry(Oid dbid)
+{
+	DiskquotaDBEntry *db = NULL;
+
+	LWLockAcquire(diskquota_locks.dblist_lock, LW_EXCLUSIVE);
+	for (int i = 0; i < diskquota_max_monitored_databases; i++)
+	{
+		DiskquotaDBEntry *dbEntry = &DiskquotaLauncherShmem->dbArray[i];
+		/*
+		 * Match a slot that still represents live monitoring of dbid:
+		 * ACTIVE (drop it) or REVIVING (a DROP after a re-CREATE cancels
+		 * the pending revive). A slot already DRAINING was released by an
+		 * earlier drop; skip it so a duplicate drop neither double-counts
+		 * num_db nor re-terminates.
+		 */
+		if (dbEntry->in_use && dbEntry->dbid == dbid && dbEntry->lifecycle != DB_SLOT_DRAINING)
 		{
 			db = dbEntry;
 			break;
@@ -1869,18 +2376,81 @@ release_db_entry(Oid dbid)
 	}
 	if (db == NULL)
 	{
-		return;
+		LWLockRelease(diskquota_locks.dblist_lock);
+		return false;
 	}
 
-	LWLockAcquire(diskquota_locks.dblist_lock, LW_EXCLUSIVE);
-	if (db->workerId != INVALID_WORKER_ID)
+	/*
+	 * Start draining rather than recycle the slot now. After SIGTERM the
+	 * worker runs its current refresh cycle to completion, and until it
+	 * stops it can still flush table_size, rewrite the shared rejectmap,
+	 * and advance this database's epoch; recycling the slot under it would
+	 * let a re-CREATE's new incarnation race those writes. Bumping the
+	 * generation makes the worker's own binding go stale so it exits
+	 * promptly -- and a worker left by a previous launcher, which has no
+	 * handle here and cannot be signalled, exits the same way. The slot is
+	 * freed, or reactivated for a re-CREATE, only after the worker leaves
+	 * (workerId back to INVALID_WORKER_ID), in reap_draining_db_entries().
+	 */
+	if (db->lifecycle == DB_SLOT_ACTIVE)
 	{
-		BackgroundWorkerHandle *handle = get_bgworker_handle(db->workerId);
-		TerminateBackgroundWorker(handle);
+		db->generation++;
+		if (db->workerId != INVALID_WORKER_ID)
+		{
+			BackgroundWorkerHandle *handle = get_bgworker_handle(db->workerId);
+			if (handle != NULL) TerminateBackgroundWorker(handle);
+		}
 	}
-	vacuum_disk_quota_model(db->id);
-	/* should be called at last to set in_use to false */
-	vacuum_db_entry(db);
+	/*
+	 * ACTIVE -> DRAINING, or REVIVING -> DRAINING to cancel a pending
+	 * revive. A REVIVING slot is already draining from its first drop --
+	 * generation already stale, worker already terminated -- so this drop
+	 * only moves it back to DRAINING; the old worker still exits and the
+	 * slot is then freed, not revived.
+	 */
+	db->lifecycle = DB_SLOT_DRAINING;
+	LWLockRelease(diskquota_locks.dblist_lock);
+	return true;
+}
+
+/*
+ * Recycle draining slots whose worker has actually stopped. FreeWorker
+ * clears workerId when the worker exits, so a draining slot with
+ * workerId == INVALID_WORKER_ID is safe to touch: free it to a hole, or
+ * -- if a CREATE re-monitored the database meanwhile -- reactivate it for
+ * the new incarnation (its generation was already bumped at drop). Called
+ * once per launcher loop.
+ */
+static void
+reap_draining_db_entries(void)
+{
+	LWLockAcquire(diskquota_locks.dblist_lock, LW_EXCLUSIVE);
+	for (int i = 0; i < diskquota_max_monitored_databases; i++)
+	{
+		DiskquotaDBEntry *db = &DiskquotaLauncherShmem->dbArray[i];
+		/* only a drained slot (worker gone) that is DRAINING or REVIVING */
+		if (!db->in_use || db->lifecycle == DB_SLOT_ACTIVE || db->workerId != INVALID_WORKER_ID) continue;
+
+		if (db->lifecycle == DB_SLOT_REVIVING)
+		{
+			/* the new incarnation starts from a clean model, like a
+			 * fresh CREATE would */
+			vacuum_disk_quota_model(db->id);
+			pg_atomic_write_u64(&db->total_size, 0);
+			pg_atomic_write_u64(&db->db_quota_limit_mb, 0);
+			db->rejectmap_retry      = false;
+			db->rejectmap_retry_full = false;
+			db->inited               = false;
+			db->next_run_time        = GetCurrentTimestamp();
+			db->lifecycle            = DB_SLOT_ACTIVE;
+		}
+		else
+		{
+			vacuum_disk_quota_model(db->id);
+			/* should be called at last to set in_use to false */
+			vacuum_db_entry(db);
+		}
+	}
 	LWLockRelease(diskquota_locks.dblist_lock);
 }
 
@@ -1910,7 +2480,9 @@ next_db(DiskquotaDBEntry *curDB)
 		if (nextSlot >= diskquota_max_monitored_databases) nextSlot = 0;
 		DiskquotaDBEntry *dbEntry = &DiskquotaLauncherShmem->dbArray[nextSlot];
 		nextSlot++;
-		if (!dbEntry->in_use || dbEntry->workerId != INVALID_WORKER_ID || dbEntry->dbid == InvalidOid) continue;
+		if (!dbEntry->in_use || dbEntry->lifecycle != DB_SLOT_ACTIVE || dbEntry->workerId != INVALID_WORKER_ID ||
+		    dbEntry->dbid == InvalidOid)
+			continue;
 		/* TODO: should release the invalid db related things */
 		if (!is_valid_dbid(dbEntry->dbid)) continue;
 		result = dbEntry;
@@ -1974,10 +2546,11 @@ static void
 vacuum_db_entry(DiskquotaDBEntry *db)
 {
 	if (db == NULL) return;
-	db->dbid     = InvalidOid;
-	db->inited   = false;
-	db->workerId = INVALID_WORKER_ID;
-	db->in_use   = false;
+	db->dbid      = InvalidOid;
+	db->inited    = false;
+	db->workerId  = INVALID_WORKER_ID;
+	db->in_use    = false;
+	db->lifecycle = DB_SLOT_ACTIVE;
 }
 
 static void
@@ -2042,3 +2615,590 @@ WaitForBackgroundWorkerShutdown(BackgroundWorkerHandle *handle)
 	return status;
 }
 #endif /* GP_VERSION_NUM */
+
+/*
+ * Persist the cluster-wide quota in the launcher's database. Runs in
+ * the launcher with SPI already connected (see
+ * do_process_extension_ddl_message); errors are caught by the caller.
+ * A non-positive limit deletes the configuration. The live limit in
+ * shmem is published by the caller's post-commit block:
+ * global_quota_config is a distributed table, so the commit can still
+ * abort, and a rolled-back change must never reach enforcement.
+ */
+static void
+on_set_cluster_quota(int64 limit_mb)
+{
+	int ret;
+
+	if (limit_mb > 0)
+	{
+		ret = SPI_execute_with_args(
+		        "update diskquota_namespace.global_quota_config set quotalimitmb = $1 where quotatype = $2", 2,
+		        (Oid[]){INT8OID, INT4OID}, (Datum[]){Int64GetDatum(limit_mb), Int32GetDatum(CLUSTER_QUOTA)}, NULL,
+		        false, 0);
+		if (ret != SPI_OK_UPDATE)
+			ereport(ERROR, (errmsg("[diskquota launcher] cannot update global_quota_config, error code %d", ret)));
+		if (SPI_processed == 0)
+		{
+			ret = SPI_execute_with_args(
+			        "insert into diskquota_namespace.global_quota_config values($1, $2)", 2, (Oid[]){INT4OID, INT8OID},
+			        (Datum[]){Int32GetDatum(CLUSTER_QUOTA), Int64GetDatum(limit_mb)}, NULL, false, 0);
+			if (ret != SPI_OK_INSERT)
+				ereport(ERROR, (errmsg("[diskquota launcher] cannot insert global_quota_config, error code %d", ret)));
+		}
+	}
+	else
+	{
+		ret = SPI_execute_with_args("delete from diskquota_namespace.global_quota_config where quotatype = $1", 1,
+		                            (Oid[]){INT4OID}, (Datum[]){Int32GetDatum(CLUSTER_QUOTA)}, NULL, false, 0);
+		if (ret != SPI_OK_DELETE)
+			ereport(ERROR, (errmsg("[diskquota launcher] cannot delete global_quota_config, error code %d", ret)));
+	}
+}
+
+/*
+ * Load the persisted cluster-wide quota into shmem at launcher
+ * startup. Runs in the launcher, connected to the launcher's
+ * database.
+ */
+static void
+load_global_quota_config(void)
+{
+	int   ret;
+	int64 limit_mb           = 0;
+	bool  ok                 = true;
+	bool  connected          = false;
+	bool  pushed_active_snap = false;
+
+	StartTransactionCommand();
+	/*
+	 * Tolerate a transient failure here (a segment down, a distributed query
+	 * error) the way the other launcher-startup SPI steps do. This runs
+	 * before the main loop, so an uncaught error would kill the launcher and
+	 * the postmaster would restart it straight back into the same failure --
+	 * a crash loop. Leave the cap unloaded (0) for this pass; a later
+	 * set_cluster_quota or launcher restart re-arms it.
+	 */
+	PG_TRY();
+	{
+		PushActiveSnapshot(GetTransactionSnapshot());
+		pushed_active_snap = true;
+		/* test hook: force a transient cap-load failure at launcher startup */
+		SIMPLE_FAULT_INJECTOR("diskquota_load_global_quota_config");
+		ret = SPI_connect();
+		if (ret != SPI_OK_CONNECT)
+			ereport(ERROR, (errmsg("[diskquota launcher] SPI connect error, return code: %d.", ret)));
+		connected = true;
+		ret       = SPI_execute_with_args(
+		              "select quotalimitmb from diskquota_namespace.global_quota_config where quotatype = $1", 1,
+		              (Oid[]){INT4OID}, (Datum[]){Int32GetDatum(CLUSTER_QUOTA)}, NULL, true, 0);
+		if (ret != SPI_OK_SELECT)
+			ereport(ERROR, (errmsg("[diskquota launcher] cannot select global_quota_config, return code: %d.", ret)));
+		if (SPI_processed == 1)
+		{
+			bool  isnull = true;
+			Datum d      = SPI_getbinval(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 1, &isnull);
+
+			/*
+			 * Clamp a persisted value beyond the setter's range -- an old
+			 * version, a dump/restore, or a manual catalog edit can seed one
+			 * -- to match the database-quota loader in quotamodel.c, so the
+			 * later MB->byte scaling cannot overflow.
+			 */
+			if (!isnull)
+			{
+				limit_mb = DatumGetInt64(d);
+				if (limit_mb > INT_MAX) limit_mb = INT_MAX;
+			}
+		}
+	}
+	PG_CATCH();
+	{
+		error_context_stack = NULL;
+		HOLD_INTERRUPTS();
+		EmitErrorReport();
+		FlushErrorState();
+		ok       = false;
+		limit_mb = 0;
+		RESUME_INTERRUPTS();
+	}
+	PG_END_TRY();
+
+	if (connected) SPI_finish();
+	if (pushed_active_snap) PopActiveSnapshot();
+	if (ok)
+		ok = launcher_commit_transaction();
+	else
+		AbortCurrentTransaction();
+	/*
+	 * A failed load -- an SPI error caught above or a failed distributed
+	 * commit -- leaves the cap unloaded for this pass rather than publishing
+	 * a value that was read but not committed.
+	 */
+	if (!ok) limit_mb = 0;
+
+	/* breadcrumb: lets an operator trace where a re-armed cap came from */
+	if (limit_mb > 0)
+		ereport(LOG, (errmsg("[diskquota launcher] cluster quota limit of " INT64_FORMAT
+		                     " MB loaded from diskquota_namespace.global_quota_config",
+		                     limit_mb)));
+	diskquota_set_cluster_limit_mb(limit_mb);
+}
+
+/*
+ * Release the bookkeeping of monitored databases that no longer
+ * exist.
+ *
+ * DROP DATABASE does not go through diskquota's DROP EXTENSION
+ * teardown, so a monitored database can vanish while its dbArray
+ * slot, its database_list row and the segment monitor caches live
+ * on. The stale slot keeps the database's last published total_size,
+ * inflating the cluster-wide quota total with data that is gone.
+ * Sweep the slots and tear down each dead one the same way a DROP
+ * EXTENSION message would. Runs in the launcher once per main-loop
+ * pass.
+ */
+static void
+reap_dropped_databases(void)
+{
+	/*
+	 * A failed sweep (e.g. a segment down) is retried, but not on every
+	 * pass: back off so a persistent failure does not emit an error
+	 * report per naptime.
+	 */
+	static int reap_backoff = 0;
+	/*
+	 * The launcher loop wakes far more often than once per naptime (a
+	 * SIGUSR1 arrives on every worker start and stop); throttle the
+	 * sweep, which dispatches a SELECT to every segment, to naptime
+	 * cadence.
+	 */
+	static TimestampTz last_sweep = 0;
+
+	/* both are modified inside PG_TRY and read after PG_CATCH */
+	Oid *volatile dead = palloc(sizeof(Oid) * diskquota_max_monitored_databases);
+	volatile int ndead = 0;
+
+	if (reap_backoff > 0)
+	{
+		reap_backoff--;
+		pfree(dead);
+		return;
+	}
+	if (last_sweep != 0 && !TimestampDifferenceExceeds(last_sweep, GetCurrentTimestamp(), diskquota_naptime * 1000))
+	{
+		pfree(dead);
+		return;
+	}
+	last_sweep = GetCurrentTimestamp();
+
+	/* SearchSysCache in is_valid_dbid requires a transaction */
+	StartTransactionCommand();
+
+	/*
+	 * Scan the dbArray slots, then sweep the persistent list as well: a
+	 * database_list row that never got a dbArray slot (the
+	 * monitored-database limit was reached, or an earlier teardown
+	 * failed halfway) is invisible to the slot scan, leaks forever, and
+	 * on OID reuse would silently auto-monitor an unrelated new
+	 * database. Both run inside PG_TRY: is_valid_dbid() reads the
+	 * catalog and can throw, and an error escaping here would take the
+	 * launcher down (it has no top-level handler); the abort path
+	 * releases the LWLock.
+	 */
+	{
+		bool list_ok            = true;
+		bool connected          = false;
+		bool pushed_active_snap = false;
+
+		PG_TRY();
+		{
+			SIMPLE_FAULT_INJECTOR("diskquota_reap_dropped_databases");
+			LWLockAcquire(diskquota_locks.dblist_lock, LW_SHARED);
+			for (int i = 0; i < diskquota_max_monitored_databases; i++)
+			{
+				DiskquotaDBEntry *dbEntry = &DiskquotaLauncherShmem->dbArray[i];
+
+				if (dbEntry->in_use && !is_valid_dbid(dbEntry->dbid)) dead[ndead++] = dbEntry->dbid;
+			}
+			LWLockRelease(diskquota_locks.dblist_lock);
+
+			if (SPI_OK_CONNECT != SPI_connect())
+				ereport(ERROR, (errcode(ERRCODE_INTERNAL_ERROR),
+				                errmsg("[diskquota launcher] unable to connect to execute internal query")));
+			connected = true;
+			PushActiveSnapshot(GetTransactionSnapshot());
+			pushed_active_snap = true;
+
+			int ret = SPI_execute("select dbid from diskquota_namespace.database_list", true, 0);
+			if (ret != SPI_OK_SELECT)
+				ereport(ERROR, (errmsg("[diskquota launcher] cannot select database_list, error code %d", ret)));
+			if (SPI_processed > 0) dead = repalloc(dead, sizeof(Oid) * (ndead + SPI_processed));
+			for (uint64 row = 0; row < SPI_processed; row++)
+			{
+				bool isnull = true;
+				Oid  dbid = DatumGetObjectId(SPI_getbinval(SPI_tuptable->vals[row], SPI_tuptable->tupdesc, 1, &isnull));
+				bool known = false;
+
+				if (isnull || is_valid_dbid(dbid)) continue;
+				for (int j = 0; j < ndead; j++)
+					if (dead[j] == dbid) known = true;
+				if (!known) dead[ndead++] = dbid;
+			}
+		}
+		PG_CATCH();
+		{
+			error_context_stack = NULL;
+			HOLD_INTERRUPTS();
+			EmitErrorReport();
+			FlushErrorState();
+			list_ok      = false;
+			reap_backoff = 10;
+			RESUME_INTERRUPTS();
+		}
+		PG_END_TRY();
+		if (connected) SPI_finish();
+		if (pushed_active_snap) PopActiveSnapshot();
+		if (list_ok)
+		{
+			if (!launcher_commit_transaction()) reap_backoff = 10;
+		}
+		else
+			AbortCurrentTransaction();
+	}
+
+	for (int i = 0; i < ndead; i++)
+	{
+		Oid  dbid               = dead[i];
+		bool connected          = false;
+		bool pushed_active_snap = false;
+		bool ret                = true;
+
+		ereport(LOG, (errmsg("[diskquota launcher] database(oid:%u) was dropped, "
+		                     "releasing its diskquota bookkeeping",
+		                     dbid)));
+
+		StartTransactionCommand();
+		/*
+		 * A failure (e.g. a segment is down) must not take the
+		 * launcher out: the slot then stays in use and the next
+		 * loop pass retries the release.
+		 */
+		PG_TRY();
+		{
+			if (SPI_OK_CONNECT != SPI_connect())
+				ereport(ERROR, (errcode(ERRCODE_INTERNAL_ERROR),
+				                errmsg("[diskquota launcher] unable to connect to execute internal query")));
+			connected = true;
+			PushActiveSnapshot(GetTransactionSnapshot());
+			pushed_active_snap = true;
+
+			del_dbid_from_database_list(dbid);
+			update_monitor_db_mpp(dbid, REMOVE_DB_FROM_BEING_MONITORED, LAUNCHER_SCHEMA);
+		}
+		PG_CATCH();
+		{
+			error_context_stack = NULL;
+			HOLD_INTERRUPTS();
+			EmitErrorReport();
+			FlushErrorState();
+			ret = false;
+			RESUME_INTERRUPTS();
+		}
+		PG_END_TRY();
+		if (connected) SPI_finish();
+		if (pushed_active_snap) PopActiveSnapshot();
+		if (ret && launcher_commit_transaction())
+		{
+			/*
+			 * Release the shmem slot only after the transactional steps
+			 * committed: when the sweep aborts, the slot stays in_use so
+			 * the next pass retries the whole release.
+			 */
+			bool had_slot = release_db_entry(dbid);
+			invalidate_database_rejectmap(dbid);
+			/*
+			 * num_db counts databases holding a dbArray slot
+			 * (init_database_list skips rows that get none); a
+			 * database_list-only row was never counted, and
+			 * decrementing for it would drive num_db below the live
+			 * count and switch dynamic-worker rotation off while more
+			 * databases than workers still need it.
+			 */
+			if (had_slot)
+			{
+				if (num_db > 0) num_db--;
+				if (num_db <= diskquota_max_workers) DiskquotaLauncherShmem->isDynamicWorker = false;
+			}
+		}
+		else
+		{
+			/* launcher_commit_transaction() already aborted a failed commit */
+			if (!ret) AbortCurrentTransaction();
+			reap_backoff = 10;
+		}
+	}
+
+	retry_pending_unmonitor();
+
+	/*
+	 * The sweep (and any retries above) dispatched to every segment;
+	 * drop the gangs rather than pinning one idle QE per primary
+	 * between sweeps.
+	 */
+	DisconnectAndDestroyAllGangs(false);
+	pfree(dead);
+}
+
+/*
+ * Cluster-wide quota.
+ *
+ * The cluster quota limit and the per-database totals live in
+ * DiskquotaLauncherShmem, which is only initialized on the
+ * dispatcher; every accessor below degrades to a no-op / zero on
+ * processes where that shmem is absent (segments), so callers may
+ * use them unconditionally.
+ */
+
+/* True when the current process is a diskquota bgworker. */
+bool
+diskquota_am_bgworker(void)
+{
+	return MyWorkerInfo != NULL;
+}
+
+/*
+ * True when the current process is the diskquota launcher. Like the
+ * per-database workers, the launcher runs only diskquota bookkeeping
+ * SQL (diskquota_namespace.database_list on CREATE/DROP EXTENSION,
+ * diskquota_namespace.global_quota_config on set_cluster_quota), so
+ * the object-independent quota checks must not apply to it.
+ */
+bool
+diskquota_am_launcher(void)
+{
+	return am_diskquota_launcher;
+}
+
+void
+diskquota_set_cluster_limit_mb(int64 limit_mb)
+{
+	if (DiskquotaLauncherShmem == NULL) return;
+	pg_atomic_write_u64(&DiskquotaLauncherShmem->cluster_quota_limit_mb, (limit_mb > 0) ? (uint64)limit_mb : 0);
+}
+
+int64
+diskquota_get_cluster_limit_mb(void)
+{
+	if (DiskquotaLauncherShmem == NULL) return 0;
+	return (int64)pg_atomic_read_u64(&DiskquotaLauncherShmem->cluster_quota_limit_mb);
+}
+
+/*
+ * The slot generation this worker was started for, stamped by the
+ * launcher into the worker entry at bind time and copied here once at
+ * startup. The live dbEntry->generation may already belong to a newer
+ * incarnation by the time the worker gets to run, so it is never read
+ * to establish this value; publishes against a slot whose generation
+ * moved on are discarded.
+ */
+static uint32 my_dbentry_generation = 0;
+
+/*
+ * True while the binding this worker captured at startup still holds:
+ * the slot is in use, bound to this database, and in the generation
+ * the worker was started for. Callers must hold dblist_lock.
+ */
+static bool
+dbentry_binding_current(DiskquotaDBEntry *dbEntry)
+{
+	return dbEntry->in_use && dbEntry->dbid == MyDatabaseId && dbEntry->generation == my_dbentry_generation;
+}
+
+void
+diskquota_worker_capture_generation(void)
+{
+	if (MyWorkerInfo == NULL) return;
+	my_dbentry_generation = MyWorkerInfo->generation;
+}
+
+/*
+ * Publish the calling worker's database total for the quota checks.
+ *
+ * The slot can be released (DROP EXTENSION, the dropped-database sweep)
+ * and rebound to another database while a refresh is in flight, so the
+ * binding is revalidated under dblist_lock before every write; a
+ * binding of the same database in a newer slot generation (DROP
+ * EXTENSION plus immediate re-CREATE) is not this worker's to write.
+ */
+void
+diskquota_publish_db_total(int64 total)
+{
+	DiskquotaDBEntry *dbEntry = (MyWorkerInfo != NULL) ? MyWorkerInfo->dbEntry : NULL;
+
+	if (dbEntry == NULL) return;
+	LWLockAcquire(diskquota_locks.dblist_lock, LW_SHARED);
+	if (dbentry_binding_current(dbEntry)) pg_atomic_write_u64(&dbEntry->total_size, (total > 0) ? (uint64)total : 0);
+	LWLockRelease(diskquota_locks.dblist_lock);
+}
+
+/*
+ * Publish the calling worker's DATABASE_QUOTA limit (0 = unset).
+ * Same slot-binding rule as diskquota_publish_db_total().
+ */
+void
+diskquota_publish_db_limit(int64 limit_mb)
+{
+	DiskquotaDBEntry *dbEntry = (MyWorkerInfo != NULL) ? MyWorkerInfo->dbEntry : NULL;
+
+	if (dbEntry == NULL) return;
+	LWLockAcquire(diskquota_locks.dblist_lock, LW_SHARED);
+	if (dbentry_binding_current(dbEntry))
+		pg_atomic_write_u64(&dbEntry->db_quota_limit_mb, (limit_mb > 0) ? (uint64)limit_mb : 0);
+	LWLockRelease(diskquota_locks.dblist_lock);
+}
+
+/*
+ * Whether the calling worker may still act for its slot. A worker
+ * whose binding moved on (DROP EXTENSION plus re-CREATE while a
+ * refresh was in flight) must not touch shared state the new
+ * incarnation owns. Processes without a slot have no binding to lose.
+ */
+bool
+diskquota_worker_binding_valid(void)
+{
+	DiskquotaDBEntry *dbEntry = (MyWorkerInfo != NULL) ? MyWorkerInfo->dbEntry : NULL;
+	bool              valid;
+
+	if (dbEntry == NULL) return true;
+	LWLockAcquire(diskquota_locks.dblist_lock, LW_SHARED);
+	valid = dbentry_binding_current(dbEntry);
+	LWLockRelease(diskquota_locks.dblist_lock);
+	return valid;
+}
+
+/*
+ * Rejectmap dispatch-retry bookkeeping for the calling worker's
+ * database (see the field comments in DiskquotaDBEntry). Guarded like
+ * the publishes above: a worker of a released incarnation must not
+ * set a spurious retry -- or worse, clear one the current worker has
+ * pending -- on a slot it no longer owns.
+ */
+void
+diskquota_rejectmap_retry_set(bool full)
+{
+	DiskquotaDBEntry *dbEntry = (MyWorkerInfo != NULL) ? MyWorkerInfo->dbEntry : NULL;
+
+	if (dbEntry == NULL) return;
+	LWLockAcquire(diskquota_locks.dblist_lock, LW_SHARED);
+	if (dbentry_binding_current(dbEntry))
+	{
+		dbEntry->rejectmap_retry = true;
+		if (full) dbEntry->rejectmap_retry_full = true;
+	}
+	LWLockRelease(diskquota_locks.dblist_lock);
+}
+
+void
+diskquota_rejectmap_retry_clear(void)
+{
+	DiskquotaDBEntry *dbEntry = (MyWorkerInfo != NULL) ? MyWorkerInfo->dbEntry : NULL;
+
+	if (dbEntry == NULL) return;
+	LWLockAcquire(diskquota_locks.dblist_lock, LW_SHARED);
+	if (dbentry_binding_current(dbEntry))
+	{
+		dbEntry->rejectmap_retry      = false;
+		dbEntry->rejectmap_retry_full = false;
+	}
+	LWLockRelease(diskquota_locks.dblist_lock);
+}
+
+bool
+diskquota_rejectmap_retry_pending(bool *full)
+{
+	DiskquotaDBEntry *dbEntry = (MyWorkerInfo != NULL) ? MyWorkerInfo->dbEntry : NULL;
+	bool              pending = false;
+
+	if (dbEntry == NULL) return false;
+	LWLockAcquire(diskquota_locks.dblist_lock, LW_SHARED);
+	if (dbentry_binding_current(dbEntry))
+	{
+		if (full) *full = dbEntry->rejectmap_retry_full;
+		pending = dbEntry->rejectmap_retry;
+	}
+	LWLockRelease(diskquota_locks.dblist_lock);
+	return pending;
+}
+
+/* Sum of the published totals of all monitored databases. */
+int64
+diskquota_get_cluster_total_size(void)
+{
+	int64 total = 0;
+
+	if (DiskquotaLauncherShmem == NULL || DiskquotaLauncherShmem->dbArray == NULL) return 0;
+	/* dblist_lock keeps slot rebinding out of the scan (dbid/in_use are plain fields) */
+	LWLockAcquire(diskquota_locks.dblist_lock, LW_SHARED);
+	for (int i = 0; i < diskquota_max_monitored_databases; i++)
+	{
+		DiskquotaDBEntry *dbEntry = &DiskquotaLauncherShmem->dbArray[i];
+
+		if (dbEntry->in_use) total += (int64)pg_atomic_read_u64(&dbEntry->total_size);
+	}
+	LWLockRelease(diskquota_locks.dblist_lock);
+	return total;
+}
+
+/*
+ * Fetch a monitored database's published total and DATABASE_QUOTA
+ * limit. Returns false when the database has no dbArray slot (not
+ * monitored, or not on the dispatcher).
+ *
+ * This runs on every INSERT/UPDATE permission check, so the slot is
+ * cached per backend and revalidated by the slot generation; the
+ * O(max_monitored_databases) scan is paid only on a miss (first use,
+ * or the slot was released or re-claimed since).
+ */
+bool
+diskquota_get_database_status(Oid dbid, int64 *total_size, int64 *limit_mb)
+{
+	static int    cached_idx        = -1;
+	static Oid    cached_dbid       = InvalidOid;
+	static uint32 cached_generation = 0;
+
+	bool found = false;
+
+	if (DiskquotaLauncherShmem == NULL || DiskquotaLauncherShmem->dbArray == NULL) return false;
+	LWLockAcquire(diskquota_locks.dblist_lock, LW_SHARED);
+	if (cached_idx >= 0 && cached_dbid == dbid)
+	{
+		DiskquotaDBEntry *dbEntry = &DiskquotaLauncherShmem->dbArray[cached_idx];
+
+		if (dbEntry->in_use && dbEntry->dbid == dbid && dbEntry->generation == cached_generation)
+		{
+			*total_size = (int64)pg_atomic_read_u64(&dbEntry->total_size);
+			*limit_mb   = (int64)pg_atomic_read_u64(&dbEntry->db_quota_limit_mb);
+			LWLockRelease(diskquota_locks.dblist_lock);
+			return true;
+		}
+		cached_idx = -1;
+	}
+	for (int i = 0; i < diskquota_max_monitored_databases; i++)
+	{
+		DiskquotaDBEntry *dbEntry = &DiskquotaLauncherShmem->dbArray[i];
+
+		if (dbEntry->in_use && dbEntry->dbid == dbid)
+		{
+			*total_size       = (int64)pg_atomic_read_u64(&dbEntry->total_size);
+			*limit_mb         = (int64)pg_atomic_read_u64(&dbEntry->db_quota_limit_mb);
+			found             = true;
+			cached_idx        = i;
+			cached_dbid       = dbid;
+			cached_generation = dbEntry->generation;
+			break;
+		}
+	}
+	LWLockRelease(diskquota_locks.dblist_lock);
+	return found;
+}

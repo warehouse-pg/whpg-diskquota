@@ -1,0 +1,38 @@
+-- A CREATE EXTENSION whose post-commit monitor registration fails must
+-- report the failure to the caller, not a false success. The launcher runs
+-- CREATE in two stages: the first (database_list) transaction commits, then
+-- the post-commit phase establishes the shmem slot and segment monitoring.
+-- Unlike DROP, CREATE has no async retry, so a failure in that phase must
+-- surface as an error from CREATE EXTENSION rather than a silent success
+-- that leaves the database believing it is monitored when it is not.
+CREATE DATABASE cm_fail_db;
+-- fail the launcher's post-commit CREATE monitor step (armed from a database
+-- where gp_inject_fault is loaded; the fault fires in the coordinator launcher)
+SELECT gp_inject_fault('diskquota_create_monitor', 'error', dbid)
+  FROM gp_segment_configuration WHERE role = 'p' AND content = -1;
+ gp_inject_fault 
+-----------------
+ Success:
+(1 row)
+
+\c cm_fail_db
+-- expect fail: the post-commit phase did not commit, so CREATE must error
+CREATE EXTENSION diskquota;
+ERROR:  [diskquota] failed to create diskquota extension: unknown error (diskquota_utility.c:433)
+\c contrib_regression
+-- the fault really fired
+SELECT gp_wait_until_triggered_fault('diskquota_create_monitor', 1, dbid)
+  FROM gp_segment_configuration WHERE role = 'p' AND content = -1;
+ gp_wait_until_triggered_fault 
+-------------------------------
+ Success:
+(1 row)
+
+SELECT gp_inject_fault('diskquota_create_monitor', 'reset', dbid)
+  FROM gp_segment_configuration WHERE role = 'p' AND content = -1;
+ gp_inject_fault 
+-----------------
+ Success:
+(1 row)
+
+DROP DATABASE cm_fail_db;

@@ -137,3 +137,8 @@ DROP
 
 -- end_ignore
 (exited with code 0)
+!\retcode gpstop -u > /dev/null;
+-- start_ignore
+
+-- end_ignore
+(exited with code 0)

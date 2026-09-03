@@ -1,0 +1,606 @@
+-- Test cluster-wide and per-database disk quota
+CREATE SCHEMA cdqschema;
+SET search_path TO cdqschema;
+CREATE TABLE cdq_t (i INT, t TEXT) DISTRIBUTED BY (i);
+-- cap the whole cluster; an unmonitored database triggers the
+-- blind-spot warning (list normalized by init_file matchsubs)
+CREATE DATABASE cdq_unmonitored;
+SELECT diskquota.set_cluster_quota('10 MB');
+WARNING:  cluster quota counts monitored databases only; not monitored: cdq_unmonitored
+HINT:  run CREATE EXTENSION diskquota in those databases to include them
+ set_cluster_quota 
+-------------------
+ 
+(1 row)
+
+DROP DATABASE cdq_unmonitored;
+SELECT diskquota.wait_for_worker_new_epoch();
+ wait_for_worker_new_epoch 
+---------------------------
+ t
+(1 row)
+
+SELECT diskquota.cluster_quota_limit_mb();
+ cluster_quota_limit_mb 
+------------------------
+                     10
+(1 row)
+
+-- starts under the cap, so the load is allowed to complete (soft limit)
+INSERT INTO cdq_t SELECT g, repeat('x', 1000) FROM generate_series(1, 20000) g;
+SELECT diskquota.wait_for_worker_new_epoch();
+ wait_for_worker_new_epoch 
+---------------------------
+ t
+(1 row)
+
+SELECT diskquota.wait_for_worker_new_epoch();
+ wait_for_worker_new_epoch 
+---------------------------
+ t
+(1 row)
+
+-- expect fail: cluster cap exceeded
+INSERT INTO cdq_t VALUES (1, 'x');
+ERROR:  cluster's disk space quota exceeded
+HINT:  cluster usage 21 MB exceeds cluster quota 10 MB; free disk space or raise diskquota.set_cluster_quota()
+-- reads still work
+SELECT count(*) FROM cdq_t;
+ count 
+-------
+ 20000
+(1 row)
+
+-- === launcher exemption: the cap must not wedge its own controls ===
+-- raising the quota while over the cap must work: the launcher's
+-- write to its global config table is exempt from the cap it manages
+-- (silence the unmonitored-databases warning here: whether it fires
+-- depends on which other databases exist in the cluster, and it has
+-- its own deterministic coverage in this test)
+SET client_min_messages = error;
+SELECT diskquota.set_cluster_quota('1 GB');
+ set_cluster_quota 
+-------------------
+ 
+(1 row)
+
+RESET client_min_messages;
+SELECT diskquota.cluster_quota_limit_mb();
+ cluster_quota_limit_mb 
+------------------------
+                   1024
+(1 row)
+
+SELECT diskquota.wait_for_worker_new_epoch();
+ wait_for_worker_new_epoch 
+---------------------------
+ t
+(1 row)
+
+-- writes resume under the raised cap
+INSERT INTO cdqschema.cdq_t VALUES (1, 'x');
+-- lower it back under current usage; the cap bites again
+SET client_min_messages = error;
+SELECT diskquota.set_cluster_quota('10 MB');
+ set_cluster_quota 
+-------------------
+ 
+(1 row)
+
+RESET client_min_messages;
+SELECT diskquota.wait_for_worker_new_epoch();
+ wait_for_worker_new_epoch 
+---------------------------
+ t
+(1 row)
+
+-- expect fail: over the lowered cap again
+INSERT INTO cdqschema.cdq_t VALUES (1, 'x');
+ERROR:  cluster's disk space quota exceeded
+HINT:  cluster usage 21 MB exceeds cluster quota 10 MB; free disk space or raise diskquota.set_cluster_quota()
+-- a new database can start being monitored while the cluster is over
+-- the cap: CREATE EXTENSION goes through the launcher's bookkeeping
+CREATE DATABASE cdq_join;
+\c cdq_join
+-- unmonitored database while the cluster is over its cap: it is not
+-- counted in the cluster total, so it is not blocked by it either
+CREATE TABLE join_t (i INT, t TEXT) DISTRIBUTED BY (i);
+INSERT INTO join_t VALUES (1, 'x');
+DROP TABLE join_t;
+CREATE EXTENSION diskquota;
+SELECT diskquota.wait_for_worker_new_epoch();
+ wait_for_worker_new_epoch 
+---------------------------
+ t
+(1 row)
+
+DROP EXTENSION diskquota;
+\c contrib_regression
+SET search_path TO cdqschema;
+SELECT diskquota.wait_for_worker_new_epoch();
+ wait_for_worker_new_epoch 
+---------------------------
+ t
+(1 row)
+
+DROP DATABASE cdq_join;
+-- delete the cluster quota; writes resume
+SELECT diskquota.set_cluster_quota('-1');
+ set_cluster_quota 
+-------------------
+ 
+(1 row)
+
+SELECT diskquota.wait_for_worker_new_epoch();
+ wait_for_worker_new_epoch 
+---------------------------
+ t
+(1 row)
+
+INSERT INTO cdq_t VALUES (1, 'x');
+-- cap this database only
+SELECT diskquota.set_database_quota(current_database()::text, '10 MB');
+ set_database_quota 
+--------------------
+ 
+(1 row)
+
+SELECT diskquota.wait_for_worker_new_epoch();
+ wait_for_worker_new_epoch 
+---------------------------
+ t
+(1 row)
+
+-- expect fail: database usage already exceeds the cap
+INSERT INTO cdq_t VALUES (2, 'x');
+ERROR:  database's disk space quota exceeded with name: contrib_regression
+HINT:  database usage 21 MB exceeds database quota 10 MB; free disk space or raise diskquota.set_database_quota()
+-- expect fail: another database's quota cannot be set from here
+SELECT diskquota.set_database_quota('template1', '10 MB');
+ERROR:  set_database_quota() must be called from the target database
+HINT:  connect to "template1" and run it there
+-- delete the database quota; writes resume
+SELECT diskquota.set_database_quota(current_database()::text, '-1');
+ set_database_quota 
+--------------------
+ 
+(1 row)
+
+SELECT diskquota.wait_for_worker_new_epoch();
+ wait_for_worker_new_epoch 
+---------------------------
+ t
+(1 row)
+
+INSERT INTO cdq_t VALUES (3, 'x');
+DROP TABLE cdq_t;
+-- === the blind spot, end to end ===
+-- a database without the extension is invisible to the cluster cap
+-- until the extension is created and initialized there
+CREATE TABLE cdqschema.cdq_t2 (i INT, t TEXT) DISTRIBUTED BY (i);
+CREATE DATABASE cdq_blind;
+-- warning again: cdq_blind is unmonitored (list normalized by matchsubs)
+SELECT diskquota.set_cluster_quota('10 MB');
+WARNING:  cluster quota counts monitored databases only; not monitored: cdq_blind
+HINT:  run CREATE EXTENSION diskquota in those databases to include them
+ set_cluster_quota 
+-------------------
+ 
+(1 row)
+
+SELECT diskquota.wait_for_worker_new_epoch();
+ wait_for_worker_new_epoch 
+---------------------------
+ t
+(1 row)
+
+\c cdq_blind
+CREATE TABLE blind_t (i INT, t TEXT) DISTRIBUTED BY (i);
+-- ~15 MB, well over the 10 MB cap: succeeds, the database is invisible
+INSERT INTO blind_t SELECT g, repeat('x', 1000) FROM generate_series(1, 15000) g;
+\c contrib_regression
+SELECT diskquota.wait_for_worker_new_epoch();
+ wait_for_worker_new_epoch 
+---------------------------
+ t
+(1 row)
+
+SELECT diskquota.wait_for_worker_new_epoch();
+ wait_for_worker_new_epoch 
+---------------------------
+ t
+(1 row)
+
+-- the unmonitored load does not show in the cluster total...
+SELECT total_size_in_bytes < 10 * 1048576 AS blind_load_invisible
+FROM diskquota.show_cluster_quota_view;
+ blind_load_invisible 
+----------------------
+ t
+(1 row)
+
+-- ...and monitored databases stay writable
+INSERT INTO cdqschema.cdq_t2 VALUES (1, 'x');
+-- monitor the blind database; initialize its existing data
+\c cdq_blind
+CREATE EXTENSION diskquota;
+WARNING:  [diskquota] diskquota is not ready because current database is not empty
+HINT:  please run 'SELECT diskquota.init_table_size_table();' to initialize diskquota
+-- monitored but not yet initialized (blind_t predates the extension):
+-- re-setting the cluster quota warns that cdq_blind counts as 0.
+-- the scratch database keeps the unmonitored warning firing no matter
+-- which other databases exist; matchsubs normalize its list
+CREATE DATABASE cdq_scratch;
+SELECT diskquota.set_cluster_quota('10 MB');
+WARNING:  cluster quota counts monitored databases only; not monitored: <unmonitored databases>
+HINT:  run CREATE EXTENSION diskquota in those databases to include them
+WARNING:  cluster quota counts these monitored databases as 0 until initialized: cdq_blind
+HINT:  run SELECT diskquota.init_table_size_table(); in those databases to include them
+ set_cluster_quota 
+-------------------
+ 
+(1 row)
+
+DROP DATABASE cdq_scratch;
+SELECT diskquota.init_table_size_table();
+ init_table_size_table 
+-----------------------
+ 
+(1 row)
+
+SELECT diskquota.wait_for_worker_new_epoch();
+ wait_for_worker_new_epoch 
+---------------------------
+ t
+(1 row)
+
+\c contrib_regression
+SELECT diskquota.wait_for_worker_new_epoch();
+ wait_for_worker_new_epoch 
+---------------------------
+ t
+(1 row)
+
+-- the same ~15 MB is now visible and over the cap
+SELECT total_size_in_bytes > 10 * 1048576 AS blind_load_visible
+FROM diskquota.show_cluster_quota_view;
+ blind_load_visible 
+--------------------
+ t
+(1 row)
+
+-- expect fail: the cap now bites in every monitored database
+INSERT INTO cdqschema.cdq_t2 VALUES (2, 'x');
+ERROR:  cluster's disk space quota exceeded
+HINT:  cluster usage 17 MB exceeds cluster quota 10 MB; free disk space or raise diskquota.set_cluster_quota()
+-- stop monitoring the blind database; its size leaves the total
+\c cdq_blind
+SELECT diskquota.pause();
+ pause 
+-------
+ 
+(1 row)
+
+SELECT diskquota.wait_for_worker_new_epoch();
+ wait_for_worker_new_epoch 
+---------------------------
+ t
+(1 row)
+
+DROP EXTENSION diskquota;
+\c contrib_regression
+SELECT diskquota.wait_for_worker_new_epoch();
+ wait_for_worker_new_epoch 
+---------------------------
+ t
+(1 row)
+
+SELECT diskquota.wait_for_worker_new_epoch();
+ wait_for_worker_new_epoch 
+---------------------------
+ t
+(1 row)
+
+SELECT total_size_in_bytes < 10 * 1048576 AS unmonitored_excluded
+FROM diskquota.show_cluster_quota_view;
+ unmonitored_excluded 
+----------------------
+ t
+(1 row)
+
+INSERT INTO cdqschema.cdq_t2 VALUES (3, 'x');
+DROP DATABASE cdq_blind;
+-- === reaper: a dropped database's usage must leave the total ===
+-- monitor a database, fill it past the cap, then DROP DATABASE
+-- without DROP EXTENSION first: the launcher must release the dead
+-- database's bookkeeping so it stops counting toward the cluster cap
+CREATE DATABASE cdq_phantom;
+\c cdq_phantom
+CREATE EXTENSION diskquota;
+CREATE TABLE phantom_t (i INT, t TEXT) DISTRIBUTED BY (i);
+INSERT INTO phantom_t SELECT g, repeat('x', 1000) FROM generate_series(1, 15000) g;
+SELECT diskquota.wait_for_worker_new_epoch();
+ wait_for_worker_new_epoch 
+---------------------------
+ t
+(1 row)
+
+\c contrib_regression
+SET search_path TO cdqschema;
+-- the phantom load counts while its database exists
+SELECT total_size_in_bytes > 10 * 1048576 AS phantom_counted
+FROM diskquota.show_cluster_quota_view;
+ phantom_counted 
+-----------------
+ t
+(1 row)
+
+-- expect fail: over the cap
+INSERT INTO cdqschema.cdq_t2 VALUES (4, 'x');
+ERROR:  cluster's disk space quota exceeded
+HINT:  cluster usage 16 MB exceeds cluster quota 10 MB; free disk space or raise diskquota.set_cluster_quota()
+-- drop the database directly; retry while its worker's transient
+-- connections block the drop (prints DROPPED once it goes through)
+\! for i in $(seq 1 30); do psql -d contrib_regression -Atc "DROP DATABASE cdq_phantom" >/dev/null 2>&1 && { echo DROPPED; break; }; sleep 1; done
+DROPPED
+-- bounded wait for the launcher to reap the dead slot
+DO $$ BEGIN FOR i IN 1..600 LOOP EXIT WHEN diskquota.cluster_total_size() < 10 * 1048576; PERFORM pg_sleep(0.1); END LOOP; END $$;
+SELECT total_size_in_bytes < 10 * 1048576 AS phantom_reaped
+FROM diskquota.show_cluster_quota_view;
+ phantom_reaped 
+----------------
+ t
+(1 row)
+
+-- one worker cycle to clear the stale rejectmap entry; writes resume
+SELECT diskquota.wait_for_worker_new_epoch();
+ wait_for_worker_new_epoch 
+---------------------------
+ t
+(1 row)
+
+INSERT INTO cdqschema.cdq_t2 VALUES (5, 'x');
+-- === reaper: a stale bookkeeping row must not break rotation ===
+-- a database_list row that never got a dbArray slot was never counted
+-- in num_db; reaping it must not decrement the count, or dynamic
+-- rotation switches off while more databases than workers still need
+-- a worker, freezing one database's bookkeeping
+CREATE DATABASE cdq_rot;
+\c cdq_rot
+CREATE EXTENSION diskquota;
+SELECT diskquota.wait_for_worker_new_epoch();
+ wait_for_worker_new_epoch 
+---------------------------
+ t
+(1 row)
+
+\c contrib_regression
+SET search_path TO cdqschema;
+-- plant a bookkeeping row for a database oid that cannot exist
+\c diskquota
+INSERT INTO diskquota_namespace.database_list VALUES (987654321);
+\c contrib_regression
+SET search_path TO cdqschema;
+-- bounded wait: the reaper removes the stale row
+\! for i in $(seq 1 60); do n=$(psql -d diskquota -Atc "select count(*) from diskquota_namespace.database_list where dbid = 987654321"); [ "$n" = "0" ] && { echo REAPED; break; }; sleep 1; done
+REAPED
+-- with two monitored databases and diskquota.max_workers = 1, dynamic
+-- rotation must keep serving both: both epochs keep advancing
+\! A1=$(psql -d cdq_rot -Atc "select diskquota.show_worker_epoch()"); B1=$(psql -d contrib_regression -Atc "select diskquota.show_worker_epoch()"); sleep 10; A2=$(psql -d cdq_rot -Atc "select diskquota.show_worker_epoch()"); B2=$(psql -d contrib_regression -Atc "select diskquota.show_worker_epoch()"); { [ "$A1" != "$A2" ] && [ "$B1" != "$B2" ]; } && echo BOTH-ADVANCING || echo ROTATION-STUCK
+BOTH-ADVANCING
+\c cdq_rot
+DROP EXTENSION diskquota;
+\c contrib_regression
+SET search_path TO cdqschema;
+\! for i in $(seq 1 30); do psql -d contrib_regression -Atc "DROP DATABASE cdq_rot" >/dev/null 2>&1 && { echo DROPPED; break; }; sleep 1; done
+DROPPED
+-- === setter input validation ===
+-- expect fail: the limit would overflow the internal byte computation
+SELECT diskquota.set_database_quota(current_database()::text, '10000000000000 MB');
+ERROR:  database quota limit larger than 2147483647 MB is not supported
+-- expect fail: same cap on the cluster quota
+SELECT diskquota.set_cluster_quota('10000000000000 MB');
+ERROR:  cluster quota limit larger than 2147483647 MB is not supported
+-- expect fail: set_cluster_quota persists outside the caller's
+-- transaction, so it refuses to run inside an explicit block
+BEGIN;
+SELECT diskquota.set_cluster_quota('100 MB');
+ERROR:  diskquota.set_cluster_quota() cannot run inside a transaction block
+ROLLBACK;
+-- a rolled-back database-quota set must never reach enforcement: the
+-- worker is the only publisher of limits to shared memory
+BEGIN;
+SELECT diskquota.set_database_quota(current_database()::text, '1 MB');
+ set_database_quota 
+--------------------
+ 
+(1 row)
+
+ROLLBACK;
+SELECT diskquota.wait_for_worker_new_epoch();
+ wait_for_worker_new_epoch 
+---------------------------
+ t
+(1 row)
+
+SELECT diskquota.database_quota_limit_mb();
+ database_quota_limit_mb 
+-------------------------
+                       0
+(1 row)
+
+-- === a stale quota_config row (e.g. restored from a dump) is inert ===
+-- set_database_quota manages the row keyed by this database's oid; a
+-- restored row still carries the dump-time oid and must be neither
+-- enforced nor resurrected
+-- load a few MB so the 1 MB cap below is genuinely exceeded
+INSERT INTO cdqschema.cdq_t2 SELECT g, repeat('x', 1000) FROM generate_series(1, 3000) g;
+SELECT diskquota.set_database_quota(current_database()::text, '1 MB');
+ set_database_quota 
+--------------------
+ 
+(1 row)
+
+SELECT diskquota.wait_for_worker_new_epoch();
+ wait_for_worker_new_epoch 
+---------------------------
+ t
+(1 row)
+
+-- expect fail: the live row enforces
+INSERT INTO cdqschema.cdq_t2 VALUES (6, 'x');
+ERROR:  database's disk space quota exceeded with name: contrib_regression
+HINT:  database usage 4 MB exceeds database quota 1 MB; free disk space or raise diskquota.set_database_quota()
+-- simulate the dump/restore: the row survives with the old database's oid
+UPDATE diskquota.quota_config SET targetoid = 1 WHERE quotatype = 6;
+SELECT diskquota.wait_for_worker_new_epoch();
+ wait_for_worker_new_epoch 
+---------------------------
+ t
+(1 row)
+
+-- the stale row is not loaded: no phantom limit, writes work
+SELECT diskquota.database_quota_limit_mb();
+ database_quota_limit_mb 
+-------------------------
+                       0
+(1 row)
+
+INSERT INTO cdqschema.cdq_t2 VALUES (7, 'x');
+-- the API cannot see the stale row; remove it directly
+DELETE FROM diskquota.quota_config WHERE quotatype = 6;
+-- === dropping a table must shed its usage from the published totals ===
+-- the worker publishes the database total from its in-memory model;
+-- a dropped table's slice has to leave that total, or a cap would
+-- keep blocking writes after the space was freed
+CREATE TABLE cdqschema.cdq_big (i INT, t TEXT) DISTRIBUTED BY (i);
+INSERT INTO cdqschema.cdq_big SELECT g, repeat('x', 1000) FROM generate_series(1, 15000) g;
+SELECT diskquota.set_database_quota(current_database()::text, '10 MB');
+ set_database_quota 
+--------------------
+ 
+(1 row)
+
+SELECT diskquota.wait_for_worker_new_epoch();
+ wait_for_worker_new_epoch 
+---------------------------
+ t
+(1 row)
+
+-- the load shows in the database total
+SELECT total_size_in_bytes > 10 * 1048576 AS load_counted
+FROM diskquota.show_database_quota_view;
+ load_counted 
+--------------
+ t
+(1 row)
+
+-- expect fail: over the database cap
+INSERT INTO cdqschema.cdq_big VALUES (0, 'x');
+ERROR:  database's disk space quota exceeded with name: contrib_regression
+HINT:  database usage XXX MB exceeds database quota 10 MB; free disk space or raise diskquota.set_database_quota()
+DROP TABLE cdqschema.cdq_big;
+SELECT diskquota.wait_for_worker_new_epoch();
+ wait_for_worker_new_epoch 
+---------------------------
+ t
+(1 row)
+
+SELECT diskquota.wait_for_worker_new_epoch();
+ wait_for_worker_new_epoch 
+---------------------------
+ t
+(1 row)
+
+-- the dropped table's usage left the total; writes resume
+SELECT total_size_in_bytes < 10 * 1048576 AS drop_shed_from_total
+FROM diskquota.show_database_quota_view;
+ drop_shed_from_total 
+----------------------
+ t
+(1 row)
+
+INSERT INTO cdqschema.cdq_t2 VALUES (8, 'x');
+SELECT diskquota.set_database_quota(current_database()::text, '-1');
+ set_database_quota 
+--------------------
+ 
+(1 row)
+
+SELECT diskquota.wait_for_worker_new_epoch();
+ wait_for_worker_new_epoch 
+---------------------------
+ t
+(1 row)
+
+-- === the extension schema oid must be re-read after re-creation ===
+-- backends cache the diskquota schema oid for the object-independent
+-- quota exemption; DROP + CREATE EXTENSION changes the oid, and a
+-- stale cache would let the cluster cap block diskquota's own
+-- bookkeeping in this session
+-- go over the cluster cap and let this session cache the schema oid
+INSERT INTO cdqschema.cdq_t2 SELECT g, repeat('x', 1000) FROM generate_series(1, 15000) g;
+SELECT diskquota.wait_for_worker_new_epoch();
+ wait_for_worker_new_epoch 
+---------------------------
+ t
+(1 row)
+
+-- expect fail: over the cluster cap (this also warms the cache)
+INSERT INTO cdqschema.cdq_t2 VALUES (9, 'x');
+ERROR:  cluster's disk space quota exceeded
+HINT:  cluster usage XXX MB exceeds cluster quota 10 MB; free disk space or raise diskquota.set_cluster_quota()
+-- re-create the extension in this same session: new schema oid
+-- (reset search_path first: CREATE EXTENSION records the first schema
+-- on the search_path as the extension home, and it must not be
+-- recorded as living in cdqschema)
+RESET search_path;
+DROP EXTENSION diskquota;
+CREATE EXTENSION diskquota;
+WARNING:  [diskquota] diskquota is not ready because current database is not empty
+HINT:  please run 'SELECT diskquota.init_table_size_table();' to initialize diskquota
+SET search_path TO cdqschema;
+SELECT diskquota.init_table_size_table();
+ init_table_size_table 
+-----------------------
+ 
+(1 row)
+
+-- bounded wait: the first refresh after initialization is a full
+-- recalculation, so plain epoch waits can return before the worker
+-- republishes the totals
+DO $$ BEGIN FOR i IN 1..600 LOOP EXIT WHEN diskquota.cluster_total_size() > 10 * 1048576; PERFORM pg_sleep(0.1); END LOOP; END $$;
+SELECT total_size_in_bytes > 10 * 1048576 AS republished_over_cap
+FROM diskquota.show_cluster_quota_view;
+ republished_over_cap 
+----------------------
+ t
+(1 row)
+
+-- expect fail: still over the cluster cap after re-creation
+INSERT INTO cdqschema.cdq_t2 VALUES (10, 'x');
+ERROR:  cluster's disk space quota exceeded
+HINT:  cluster usage XXX MB exceeds cluster quota 10 MB; free disk space or raise diskquota.set_cluster_quota()
+-- diskquota's own bookkeeping stays exempt under the new schema oid:
+-- a repair write into diskquota.table_size must pass the cap check
+SELECT diskquota.init_table_size_table();
+ init_table_size_table 
+-----------------------
+ 
+(1 row)
+
+SELECT diskquota.set_cluster_quota('-1');
+ set_cluster_quota 
+-------------------
+ 
+(1 row)
+
+SELECT diskquota.wait_for_worker_new_epoch();
+ wait_for_worker_new_epoch 
+---------------------------
+ t
+(1 row)
+
+DROP TABLE cdqschema.cdq_t2;
+RESET search_path;
+DROP SCHEMA cdqschema;

@@ -1,0 +1,55 @@
+-- The launcher answers a backend command (CREATE/DROP EXTENSION,
+-- set_cluster_quota) by writing into the single shared message box.
+-- A late answer must carry the arming it was computed for: when a
+-- requester gives up on a command the launcher already copied (its
+-- wait times out and withdraws the message), a newer backend can arm
+-- the box, and the old command's verdict must not destroy that
+-- pending message and be handed to the new sender as its own.
+--
+-- The wait below runs with interrupts held (the sender holds
+-- extension_ddl_lock), so a query cancel cannot abandon it early:
+-- the session must sit out the sender's full timeout. That makes
+-- this the slowest kind of protocol test; there is only one such
+-- wait here.
+
+1: CREATE DATABASE msgbox_db;
+2:@db_name msgbox_db: CREATE EXTENSION diskquota;
+
+-- Suspend the launcher mid-DROP, after it copied the message.
+SELECT gp_inject_fault_infinite('diskquota_drop_unmonitor', 'suspend', dbid)
+  FROM gp_segment_configuration WHERE role='p' AND content=-1;
+2&:@db_name msgbox_db: DROP EXTENSION diskquota;
+SELECT gp_wait_until_triggered_fault('diskquota_drop_unmonitor', 1, dbid)
+  FROM gp_segment_configuration WHERE role='p' AND content=-1;
+
+-- The DROP times out against the parked launcher, reports failure,
+-- and withdraws its message; the launcher still holds the copy.
+2<:
+
+-- Arm the next command while the launcher is still busy with the
+-- DROP it copied.
+3&: SELECT diskquota.set_cluster_quota('10 GB');
+DO $$ BEGIN FOR i IN 1..100 LOOP PERFORM 1 FROM pg_stat_activity WHERE query LIKE 'SELECT diskquota.set_cluster_quota(''10 GB'');%' AND state = 'active'; IF FOUND THEN RETURN; END IF; PERFORM pg_sleep(0.1); END LOOP; RAISE EXCEPTION 'set_cluster_quota session never became active'; END $$;
+SELECT pg_sleep(0.5);
+
+-- Release the launcher. Its DROP verdict must be discarded (the box
+-- moved on to a newer arming), and the armed set_cluster_quota must
+-- then really run: without the sequence guard the verdict destroys
+-- the pending message, set_cluster_quota returns the DROP's
+-- "success" as its own, and the limit below reads 0.
+SELECT gp_inject_fault_infinite('diskquota_drop_unmonitor', 'reset', dbid)
+  FROM gp_segment_configuration WHERE role='p' AND content=-1;
+3<:
+1: SELECT quota_in_mb FROM diskquota.show_cluster_quota_view;
+
+-- cleanup: the timed-out DROP left the extension installed with its
+-- launcher bookkeeping already torn down; this DROP runs the full
+-- teardown again, and every step tolerates the parts the first one
+-- completed.
+1: SELECT diskquota.set_cluster_quota('-1');
+2:@db_name msgbox_db: DROP EXTENSION diskquota;
+2q:
+3q:
+1: SELECT quota_in_mb FROM diskquota.show_cluster_quota_view;
+1: DROP DATABASE msgbox_db;
+1q:

@@ -4,6 +4,55 @@ objects in Greenplum DB. Currently it supports to set quota limit on schema
 and role in a given database and limit the amount of disk space that a schema 
 or a role can use. 
 
+Two coarser scopes are also supported:
+
+1. A database quota caps the total size of one database, all schemas and
+roles combined: `select diskquota.set_database_quota('db1', '2 TB')`.
+
+2. A cluster quota caps the aggregate size of all monitored databases
+together: `select diskquota.set_cluster_quota('10 TB')`. Once the sum
+exceeds the cap, INSERT/UPDATE/COPY are rejected in every monitored
+database until usage drops below the cap again.
+
+Both follow the same soft-limit semantics as schema and role quotas, and
+both cooperate with `diskquota.hard_limit` to cancel in-flight queries
+that push past the cap.
+
+To downgrade to 2.3, first run `select diskquota.prepare_downgrade()`
+in every monitored database: it deletes that database's 2.4-only
+quota rows and drops the cluster cap from the launcher's
+`global_quota_config` (a leftover cap would silently re-arm on a
+later upgrade back to 2.4). Then point `shared_preload_libraries`
+back at `diskquota-2.3` and restart, then run `ALTER EXTENSION
+diskquota UPDATE TO '2.3'`. The 2.3 worker does not understand the
+2.4-only quota rows and hits undefined behavior on every refresh if
+any still exist. In place this cannot happen: the 2.3 worker idles
+behind a version gate until the ALTER commits, and the same
+transaction deletes the leftover rows atomically with the version
+flip.
+
+Skipping the preparation is refused outright: the downgrade script
+requires the mark prepare_downgrade() leaves in the database,
+whichever library is loaded (the cluster cap lives in the launcher's
+own database, out of the script's reach, so the mark is the script's
+only evidence the cap was cleared). While the 2.4 library is still
+loaded, a still-configured cap is additionally reported directly, and
+the 2.3 function bodies refuse to load a library that is not
+preloaded, rolling the whole ALTER back atomically. To cancel a
+prepared downgrade, run init_table_size_table(); until then the mark
+reads as "not ready" to a freshly started worker. The path with no gate is dump/restore: a dump of a 2.4
+database restored into a 2.3 cluster recreates the 2.4-only
+quota_config rows behind the 2.3 worker's back. Run
+prepare_downgrade() (or delete the quota_config rows with
+quotatype > 4) in the source database before taking a dump that a
+2.3 cluster will restore.
+
+After a cluster restart the caps re-arm within about one
+`diskquota.naptime`: limits reload and each worker republishes its
+database's size on its first loop. Writes in that brief window are
+admitted -- the check fails open, the same freshness contract as the
+soft limit itself.
+
 This project is inspired by Heikki's 
 [pg_quota project](https://github.com/hlinnaka/pg_quota) and enhance it in 
 two aspects:
@@ -68,11 +117,14 @@ Enforcement is implemented as hooks. There are two kinds of enforcement hooks:
 enforcement before query is running and enforcement during query is running.
 The 'before query' one is implemented at ExecutorCheckPerms_hook in function 
 ExecCheckRTPerms() 
-The 'during query' one is implemented at DispatcherCheckPerms_hook in function 
-checkDispatchResult(). For queries loading a huge number of data, dispatcher 
-will poll the connnection with a poll timeout. Hook will be called at every 
-poll timeout with waitMode == DISPATCH_WAIT_NONE. Currently only async 
-diskpatcher supports 'during query' quota enforcement.
+The 'during query' one requires GUC diskquota.hard_limit to be 'on'.
+Each refresh loop, the diskquota worker dispatches the rejectmap to all
+segments by calling diskquota.refresh_rejectmap() there; segments index
+it by relfilenode. The file_extend_hook in smgrextend() then looks up
+every file extension in that rejectmap and cancels the running query
+once its target is blocked, so a query that passed the 'before query'
+check but pushes usage past the limit while running is stopped within
+roughly one diskquota.naptime.
 
 ## Quota setting store
 Quota limit of a schema or a role is stored in table 'quota_config' in 
@@ -81,6 +133,16 @@ its own disk quota configuration. Note that although role is a db object in
 cluster level, we limit the diskquota of a role to be database specific. 
 That is to say, a role may have different quota limit on different databases 
 and their disk usage is isolated between databases.
+
+The database quota follows the same pattern: one row in the capped
+database's own quota_config (which is why set_database_quota() must be
+run while connected to that database).
+
+The cluster quota is the one exception: being a cluster-wide fact, it is
+stored once, in table 'global_quota_config' in the 'diskquota_namespace'
+schema of the diskquota launcher's database, and is managed by the
+launcher. set_cluster_quota() can therefore be called from any database,
+and the value survives cluster restarts.
 
 # Development
 
@@ -140,6 +202,12 @@ create extension diskquota;
 ```
 select diskquota.init_table_size_table();
 ```
+Note: on a database that is already being monitored, re-running
+`init_table_size_table()` repairs the persisted `diskquota.table_size`
+but does not reach the running worker's in-memory model: published
+totals (the cluster/database quota views) and enforcement keep the
+pre-repair numbers until the tables become active again or the worker
+is restarted (re-create the extension, or restart the cluster).
 
 ## clang-format
 
@@ -217,9 +285,35 @@ insert into a select generate_series(1,100);
 reset search_path;
 ```
 
-3. Show schema quota limit and current usage
+3. Set/update/delete a database quota using diskquota.set_database_quota
+```
+# must be run while connected to the database being capped
+select diskquota.set_database_quota(current_database()::text, '10 GB');
+
+# delete the database quota
+select diskquota.set_database_quota(current_database()::text, '-1');
+```
+
+4. Set/update/delete the cluster quota using diskquota.set_cluster_quota
+```
+# can be run from any database
+select diskquota.set_cluster_quota('100 GB');
+
+# delete the cluster quota
+select diskquota.set_cluster_quota('-1');
+```
+
+Note: the quota views below report the size diskquota tracks and enforces
+(the sum of diskquota.table_size -- user relations and their auxiliaries).
+show_fast_database_size_view additionally includes the system-catalog size,
+so it reads slightly larger for the same database; size database/cluster
+quotas from the quota views.
+
+5. Show quota limits and current usage
 ```
 select * from diskquota.show_fast_schema_quota_view;
+select * from diskquota.show_database_quota_view;
+select * from diskquota.show_cluster_quota_view;
 ```
 
 
@@ -256,6 +350,13 @@ If DBA created diskquota extension in a database, there will be a connection
 to this database from diskquota worker process. DBA need to firstly the drop diskquota
 extension in this database, and then database could be dropped successfully.
 
+Since 2.4, a monitored database that does get dropped without the
+extension being dropped first (possible when workers rotate across
+more databases than diskquota.max_workers, so no worker is connected
+at that moment) is cleaned up automatically: the launcher notices the
+dropped database, releases its bookkeeping, and purges its leftover
+rejectmap entries from every segment.
+
 2. Temp table.
 
 Diskquota supports to limit the disk usage of temp table as well. 
@@ -263,6 +364,25 @@ But schema and role are different. For role, i.e. the owner of the temp table,
 diskquota will treat it the same as normal tables and sum its table size to 
 its owner's quota. While for schema, temp table is located under namespace 
 'pg_temp_backend_id', so temp table size will not sum to the current schema's qouta.
+
+3. Cluster and database quotas never block system tables or diskquota
+itself.
+
+Writes to pg_catalog and to diskquota's own tables are exempt from the
+cluster and database caps (their sizes still count toward the totals).
+This is deliberate: diskquota records usage by writing to
+diskquota.table_size, so a cap that blocked those writes could never
+observe usage dropping and would stay locked forever.
+
+4. pause() disables enforcement only (changed in 2.4).
+
+Since 2.4, diskquota.pause() stops rejectmap maintenance and dispatch
+but the worker keeps refreshing table sizes, so a paused database keeps
+publishing its real total and stays correctly counted by the cluster
+quota. Before 2.4, pausing also froze size collection. Pausing
+therefore does not shed load: the paused worker still runs its full
+refresh, including the size queries dispatched to the segments, once
+per diskquota.naptime.
 
 # Known Issue.
 

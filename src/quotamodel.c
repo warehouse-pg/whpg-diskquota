@@ -21,6 +21,8 @@
 #include "postgres.h"
 
 #include "access/xact.h"
+#include "catalog/namespace.h"
+#include "catalog/pg_namespace.h"
 #include "catalog/pg_tablespace.h"
 #include "commands/dbcommands.h"
 #include "commands/tablespace.h"
@@ -39,6 +41,7 @@
 
 #include "cdb/cdbvars.h"
 #include "cdb/cdbdisp_query.h"
+#include "cdb/cdbgang.h"
 #include "cdb/cdbdispatchresult.h"
 #include "cdb/cdbutil.h"
 
@@ -140,10 +143,14 @@ typedef enum
  * | ROLE_TABLESPACE_QUOTA 		| 		2		|
  * | TABLESPACE_QUOTA 			| 		1		|
  * |----------------------------|---------------|
+ * CLUSTER_QUOTA and DATABASE_QUOTA have no per-object key (0 keys)
+ * and never enter quota_info_map; their limits live in launcher
+ * shared memory.
  */
-uint16 quota_key_num[NUM_QUOTA_TYPES]                            = {1, 1, 2, 2, 1};
+uint16 quota_key_num[NUM_QUOTA_TYPES]                            = {1, 1, 2, 2, 1, 0, 0};
 Oid    quota_key_caches[NUM_QUOTA_TYPES][MAX_NUM_KEYS_QUOTA_MAP] = {
-        {NAMESPACEOID}, {AUTHOID}, {NAMESPACEOID, TABLESPACEOID}, {AUTHOID, TABLESPACEOID}, {TABLESPACEOID}};
+        {NAMESPACEOID}, {AUTHOID},   {NAMESPACEOID, TABLESPACEOID}, {AUTHOID, TABLESPACEOID}, {TABLESPACEOID},
+        {InvalidOid},   {InvalidOid}};
 HTAB *quota_info_map;
 
 /* global rejectmap for which exceed their quota limit */
@@ -165,6 +172,13 @@ struct GlobalRejectMapEntry
 {
 	RejectMapEntry keyitem;
 	bool           segexceeded;
+	/*
+	 * QD only: whether this entry has ever been included in a dispatch
+	 * to the segments. With hardlimit off, additions stay local to the
+	 * QD; a removal-triggered dispatch must then resend only entries
+	 * the segments have already seen.
+	 */
+	bool dispatched;
 	/*
 	 * When the quota limit is exceeded on segment servers,
 	 * we need an extra auxiliary field to preserve the quota
@@ -202,13 +216,17 @@ static void transfer_table_for_quota(int64 totalsize, QuotaType type, Oid *old_k
 static QuotaInfoEntry *put_quota_map_entry(QuotaInfoEntryKey *key, bool *found);
 
 /* functions to refresh disk quota model*/
-static void refresh_disk_quota_usage(bool is_init);
-static void calculate_table_disk_usage(bool is_init, HTAB *local_active_table_stat_map);
-static void flush_to_table_size(void);
-static bool flush_local_reject_map(void);
-static void dispatch_rejectmap(HTAB *local_active_table_stat_map);
-static bool load_quotas(void);
-static void do_load_quotas(void);
+static void  refresh_disk_quota_usage(bool is_init);
+static void  calculate_table_disk_usage(bool is_init, HTAB *local_active_table_stat_map);
+static int64 flush_to_table_size(void);
+static void  stash_paused_active_oids(HTAB *active_map);
+static bool  merge_paused_active_backlog(HTAB *active_map);
+static void  clear_paused_active_backlog(void);
+static void  flush_to_table_size_after_commit(void);
+static bool  flush_local_reject_map(bool *entries_removed);
+static bool  dispatch_rejectmap(HTAB *local_active_table_stat_map, bool include_undispatched);
+static bool  load_quotas(void);
+static void  do_load_quotas(void);
 
 static Size DiskQuotaShmemSize(void);
 static void disk_quota_shmem_startup(void);
@@ -320,6 +338,16 @@ add_quota_to_rejectmap(QuotaType type, Oid targetOid, Oid tablespaceoid, bool se
 {
 	LocalRejectMapEntry *localrejectentry;
 	RejectMapEntry       keyitem = {0};
+
+	/*
+	 * A paused database keeps refreshing its usage but must not arm
+	 * enforcement: these local flags are only ever cleared by
+	 * flush_local_reject_map(), which does not run while paused, so a
+	 * mark taken during a paused cycle would replay into the shared
+	 * rejectmap on the first flush after resume, even if usage or the
+	 * quota itself is gone by then.
+	 */
+	if (diskquota_is_paused()) return;
 
 	keyitem.targetoid     = targetOid;
 	keyitem.databaseoid   = MyDatabaseId;
@@ -800,6 +828,7 @@ refresh_disk_quota_usage(bool is_init)
 	bool  connected                   = false;
 	bool  pushed_active_snap          = false;
 	bool  ret                         = true;
+	int64 db_total                    = 0;
 	HTAB *local_active_table_stat_map = NULL;
 
 	StartTransactionCommand();
@@ -834,17 +863,78 @@ refresh_disk_quota_usage(bool is_init)
 		/* refresh quota_info_map */
 		refresh_quota_info_map();
 		/* flush local table_size_map to user table table_size */
-		flush_to_table_size();
-		/* copy local reject map back to shared reject map */
-		bool reject_map_changed = flush_local_reject_map();
+		db_total = flush_to_table_size();
+		SIMPLE_FAULT_INJECTOR("diskquota_refresh_after_flush");
 		/*
-		 * Dispatch rejectmap entries to segments to perform hard-limit.
-		 * If the bgworker is in init mode, the rejectmap should be refreshed anyway.
-		 * Otherwise, only when the rejectmap is changed or the active_table_list is
-		 * not empty the rejectmap should be dispatched to segments.
+		 * Enforce the database and cluster caps: when either is
+		 * exceeded, put a block-this-database entry into the local
+		 * rejectmap so the regular flush/dispatch pipeline carries it
+		 * to the segments (hardlimit) and clears it once usage drops.
+		 * The cluster check reads the sum of the per-database totals in
+		 * launcher shmem; this database's own total is published there
+		 * only after the transaction commits (below), so the freshly
+		 * flushed local db_total drives the per-database check.
 		 */
-		if (is_init || (diskquota_hardlimit && (reject_map_changed || hasActiveTable)))
-			dispatch_rejectmap(local_active_table_stat_map);
+		{
+			int64 db_shmem_total, db_limit_mb, cluster_limit_mb;
+
+			if (diskquota_get_database_status(MyDatabaseId, &db_shmem_total, &db_limit_mb) && db_limit_mb > 0 &&
+			    db_total >= db_limit_mb * (int64)(1 << 20))
+				add_quota_to_rejectmap(DATABASE_QUOTA, InvalidOid, InvalidOid, false);
+
+			cluster_limit_mb = diskquota_get_cluster_limit_mb();
+			if (cluster_limit_mb > 0 && diskquota_get_cluster_total_size() >= cluster_limit_mb * (int64)(1 << 20))
+				add_quota_to_rejectmap(CLUSTER_QUOTA, InvalidOid, InvalidOid, false);
+		}
+		/*
+		 * A paused database is still counted -- everything above stays
+		 * fresh -- but never enforced: the shared rejectmap and the
+		 * segment maps are left untouched, which also keeps entries
+		 * planted by tests from being overwritten while they hold the
+		 * worker paused.
+		 */
+		if (!diskquota_is_paused())
+		{
+			bool had_backlog = merge_paused_active_backlog(local_active_table_stat_map);
+			/* copy local reject map back to shared reject map */
+			bool reject_map_removed = false;
+			bool reject_map_changed = flush_local_reject_map(&reject_map_removed);
+			/*
+			 * Dispatch rejectmap entries to segments to perform hard-limit.
+			 * If the bgworker is in init mode, the rejectmap should be refreshed anyway.
+			 * With hardlimit on, dispatch when the map changed or the active table
+			 * list is non-empty so new relfilenodes of already-rejected objects are
+			 * covered. With hardlimit off, dispatch only when entries were REMOVED:
+			 * segments enforce whatever map they last received under their own
+			 * hardlimit GUC, so a deleted quota must still reach them or they would
+			 * keep rejecting on it forever (mixed-GUC states). Additions are
+			 * never sent while hardlimit is off: the removal path resends only
+			 * entries the segments have already seen (see dispatch_rejectmap),
+			 * so a segment still enforcing under its own hardlimit GUC cannot
+			 * start cancelling writes for an entry the worker never published.
+			 * A dispatch the segments never confirmed is retried on the next
+			 * cycle, in at least the mode in which it was lost.
+			 */
+			bool retry_full    = false;
+			bool retry_pending = diskquota_rejectmap_retry_pending(&retry_full);
+			bool full_dispatch = is_init ||
+			                     (diskquota_hardlimit && (reject_map_changed || hasActiveTable || had_backlog)) ||
+			                     (retry_pending && retry_full);
+			if (full_dispatch || reject_map_removed || retry_pending)
+			{
+				/*
+				 * Clear the paused active-oid backlog only if the dispatch
+				 * actually reached the segments; dispatch_rejectmap early-
+				 * returns without dispatching on a stale binding.
+				 */
+				if (dispatch_rejectmap(local_active_table_stat_map, full_dispatch) && had_backlog)
+					clear_paused_active_backlog();
+			}
+		}
+		else
+		{
+			stash_paused_active_oids(local_active_table_stat_map);
+		}
 		hash_destroy(local_active_table_stat_map);
 	}
 	PG_CATCH();
@@ -861,9 +951,28 @@ refresh_disk_quota_usage(bool is_init)
 	if (connected) SPI_finish();
 	if (pushed_active_snap) PopActiveSnapshot();
 	if (ret)
+	{
 		CommitTransactionCommand();
+		flush_to_table_size_after_commit();
+		/*
+		 * Publish the committed total to launcher shmem only now: the
+		 * shared total feeds the cluster-wide quota, and a value from a
+		 * transaction that later aborted would leave the cluster
+		 * counting usage that was rolled back.
+		 */
+		diskquota_publish_db_total(db_total);
+	}
 	else
 		AbortCurrentTransaction();
+
+	/*
+	 * A paused database is still counted every naptime -- that is
+	 * deliberate -- but its worker must not pin per-segment gangs
+	 * between cycles while enforcement is off; the next cycle
+	 * re-creates them. Outside the transaction: the commit above can
+	 * be distributed.
+	 */
+	if (diskquota_is_paused()) DisconnectAndDestroyAllGangs(false);
 
 	return;
 }
@@ -1148,13 +1257,22 @@ calculate_table_disk_usage(bool is_init, HTAB *local_active_table_stat_map)
 			int seg_ed = TableSizeEntrySegidEnd(tsentry);
 			for (int i = seg_st; i < seg_ed; i++)
 			{
-				update_size_for_quota(-TableSizeEntryGetSize(tsentry, i), NAMESPACE_QUOTA,
-				                      (Oid[]){tsentry->namespaceoid}, i);
-				update_size_for_quota(-TableSizeEntryGetSize(tsentry, i), ROLE_QUOTA, (Oid[]){tsentry->owneroid}, i);
-				update_size_for_quota(-TableSizeEntryGetSize(tsentry, i), ROLE_TABLESPACE_QUOTA,
-				                      (Oid[]){tsentry->owneroid, tsentry->tablespaceoid}, i);
-				update_size_for_quota(-TableSizeEntryGetSize(tsentry, i), NAMESPACE_TABLESPACE_QUOTA,
+				int64 size = TableSizeEntryGetSize(tsentry, i);
+
+				update_size_for_quota(-size, NAMESPACE_QUOTA, (Oid[]){tsentry->namespaceoid}, i);
+				update_size_for_quota(-size, ROLE_QUOTA, (Oid[]){tsentry->owneroid}, i);
+				update_size_for_quota(-size, ROLE_TABLESPACE_QUOTA, (Oid[]){tsentry->owneroid, tsentry->tablespaceoid},
+				                      i);
+				update_size_for_quota(-size, NAMESPACE_TABLESPACE_QUOTA,
 				                      (Oid[]){tsentry->namespaceoid, tsentry->tablespaceoid}, i);
+				/*
+				 * The entry is removed only in flush_to_table_size_after_commit()
+				 * (post-commit). A refresh that aborts after this subtraction
+				 * keeps the entry with its old size; without zeroing it here, the
+				 * next cycle re-subtracts the same bytes, drifting the shared
+				 * quota totals below true usage until an is_init rebuild.
+				 */
+				TableSizeEntrySetSize(tsentry, i, 0);
 			}
 		}
 	}
@@ -1200,7 +1318,7 @@ insert_into_table_size_map(char *str)
  * entries in table table_size. And then insert new table size entries into
  * table table_size.
  */
-static void
+static int64
 flush_to_table_size(void)
 {
 	HASH_SEQ_STATUS iter;
@@ -1209,6 +1327,7 @@ flush_to_table_size(void)
 	StringInfoData  insert_statement;
 	int             delete_entries_num = 0;
 	int             insert_entries_num = 0;
+	int64           db_total           = 0;
 
 	/* TODO: Add flush_size_interval to avoid flushing size info in every loop */
 
@@ -1224,6 +1343,16 @@ flush_to_table_size(void)
 	{
 		int seg_st = TableSizeEntrySegidStart(tsentry);
 		int seg_ed = TableSizeEntrySegidEnd(tsentry);
+
+		/*
+		 * The segid = -1 slice is the table's cross-segment total; sum
+		 * it while we are walking the map anyway, so the caller can
+		 * publish the database total without a full scan of
+		 * diskquota.table_size.
+		 */
+		if (seg_st == -1 && get_table_size_entry_flag(tsentry, TABLE_EXIST))
+			db_total += TableSizeEntryGetSize(tsentry, -1);
+
 		for (int i = seg_st; i < seg_ed; i++)
 		{
 			/* delete dropped table from both table_size_map and table table_size */
@@ -1261,14 +1390,7 @@ flush_to_table_size(void)
 					resetStringInfo(&insert_statement);
 					insert_entries_num = 0;
 				}
-
-				TableSizeEntryResetFlushFlag(tsentry, i);
 			}
-		}
-		if (!get_table_size_entry_flag(tsentry, TABLE_EXIST))
-		{
-			hash_search(table_size_map, &tsentry->key, HASH_REMOVE, NULL);
-			pg_atomic_fetch_sub_u32(diskquota_table_size_entry_num, 1);
 		}
 	}
 
@@ -1279,6 +1401,121 @@ flush_to_table_size(void)
 
 	pfree(delete_statement.data);
 	pfree(insert_statement.data);
+
+	return db_total;
+}
+
+/*
+ * Active-table oids drained by paused refresh cycles. The fetch
+ * consumes (removes) the segments' active entries, and a paused cycle
+ * skips the dispatch, so a relfilenode that changed during the pause
+ * would otherwise be missing from the first post-resume dispatch and
+ * its table would escape segment-side hardlimit enforcement until its
+ * next extension. Worker-local; handed to the first unpaused
+ * dispatch. Process memory bounds the guarantee: a dynamic worker
+ * exits after every cycle, so in dynamic-worker mode (and across a
+ * worker restart) a paused cycle's drained oids die with the
+ * process and the first post-resume dispatch misses them -- the
+ * pre-fix exposure, bounded by the table's next extension. The
+ * fetch cannot simply be skipped while paused: it also feeds the
+ * size accounting, which deliberately continues.
+ */
+static HTAB *paused_active_backlog = NULL;
+
+static void
+stash_paused_active_oids(HTAB *active_map)
+{
+	HASH_SEQ_STATUS            iter;
+	DiskQuotaActiveTableEntry *entry;
+
+	if (paused_active_backlog == NULL)
+	{
+		HASHCTL ctl;
+
+		memset(&ctl, 0, sizeof(ctl));
+		ctl.keysize   = sizeof(Oid);
+		ctl.entrysize = sizeof(Oid);
+		ctl.hcxt      = TopMemoryContext;
+		paused_active_backlog =
+		        diskquota_hash_create("paused active backlog", 64, &ctl, HASH_ELEM | HASH_CONTEXT, DISKQUOTA_TAG_HASH);
+	}
+	hash_seq_init(&iter, active_map);
+	while ((entry = hash_seq_search(&iter)) != NULL)
+		(void)hash_search(paused_active_backlog, &entry->reloid, HASH_ENTER, NULL);
+}
+
+/* Returns whether anything was owed to this dispatch. */
+static bool
+merge_paused_active_backlog(HTAB *active_map)
+{
+	HASH_SEQ_STATUS iter;
+	Oid            *oid;
+	bool            merged = false;
+
+	if (paused_active_backlog == NULL) return false;
+	hash_seq_init(&iter, paused_active_backlog);
+	while ((oid = hash_seq_search(&iter)) != NULL)
+	{
+		TableEntryKey              key;
+		DiskQuotaActiveTableEntry *entry;
+		bool                       found;
+
+		key.reloid = *oid;
+		key.segid  = -1;
+		entry      = hash_search(active_map, &key, HASH_ENTER, &found);
+		if (!found)
+		{
+			entry->reloid    = *oid;
+			entry->segid     = -1;
+			entry->tablesize = 0;
+		}
+		merged = true;
+	}
+	return merged;
+}
+
+/* Drop the stashed oids once a dispatch has actually carried them. */
+static void
+clear_paused_active_backlog(void)
+{
+	HASH_SEQ_STATUS iter;
+	Oid            *oid;
+
+	if (paused_active_backlog == NULL) return;
+	hash_seq_init(&iter, paused_active_backlog);
+	while ((oid = hash_seq_search(&iter)) != NULL) hash_search(paused_active_backlog, oid, HASH_REMOVE, NULL);
+}
+
+/*
+ * Second half of flush_to_table_size(), run only after its transaction
+ * committed: reset the flush flags and drop the entries of vanished
+ * tables. The flags and the map are not transactional, so consuming
+ * them while the DML can still abort would lose the pending changes --
+ * the rows would never be re-flushed (a dropped table's rows never
+ * change size again), and a worker or cluster restart re-warms the
+ * model from the stale table and then enforces wrong totals. Nothing
+ * sets flush flags between the flush and this cleanup: both run in the
+ * same worker cycle.
+ */
+static void
+flush_to_table_size_after_commit(void)
+{
+	HASH_SEQ_STATUS iter;
+	TableSizeEntry *tsentry = NULL;
+
+	hash_seq_init(&iter, table_size_map);
+	while ((tsentry = hash_seq_search(&iter)) != NULL)
+	{
+		int seg_st = TableSizeEntrySegidStart(tsentry);
+		int seg_ed = TableSizeEntrySegidEnd(tsentry);
+
+		for (int i = seg_st; i < seg_ed; i++) TableSizeEntryResetFlushFlag(tsentry, i);
+		if (!get_table_size_entry_flag(tsentry, TABLE_EXIST))
+		{
+			hash_search(table_size_map, &tsentry->key, HASH_REMOVE, NULL);
+			pg_atomic_fetch_sub_u32(diskquota_table_size_entry_num, 1);
+		}
+	}
 }
 
 /*
@@ -1287,13 +1524,22 @@ flush_to_table_size(void)
  * local_rejectmap is used to reduce the lock contention.
  */
 static bool
-flush_local_reject_map(void)
+flush_local_reject_map(bool *entries_removed)
 {
 	bool                  changed = false;
 	HASH_SEQ_STATUS       iter;
 	LocalRejectMapEntry  *localrejectentry;
 	GlobalRejectMapEntry *rejectentry;
 	bool                  found;
+
+	/*
+	 * A worker whose slot binding moved on (DROP EXTENSION, or a drain +
+	 * re-CREATE) must not repopulate the shared rejectmap the new
+	 * incarnation owns: its entries would survive DROP's invalidate and,
+	 * for an object-independent CLUSTER/DATABASE entry, reject every write
+	 * in the database until postmaster restart.
+	 */
+	if (!diskquota_worker_binding_valid()) return false;
 
 	LWLockAcquire(diskquota_locks.reject_map_lock, LW_EXCLUSIVE);
 
@@ -1329,6 +1575,7 @@ flush_local_reject_map(void)
 				rejectentry->keyitem.targettype    = localrejectentry->keyitem.targettype;
 				rejectentry->keyitem.tablespaceoid = localrejectentry->keyitem.tablespaceoid;
 				rejectentry->segexceeded           = localrejectentry->segexceeded;
+				rejectentry->dispatched            = false;
 				changed                            = true;
 			}
 			if (rejectentry->segexceeded != localrejectentry->segexceeded)
@@ -1341,7 +1588,8 @@ flush_local_reject_map(void)
 		}
 		else
 		{
-			changed = true;
+			changed          = true;
+			*entries_removed = true;
 			/* db objects are removed or under quota limit in the new loop */
 			(void)hash_search(disk_quota_reject_map, (void *)&localrejectentry->keyitem, HASH_REMOVE, NULL);
 			(void)hash_search(local_disk_quota_reject_map, (void *)&localrejectentry->keyitem, HASH_REMOVE, NULL);
@@ -1353,33 +1601,77 @@ flush_local_reject_map(void)
 
 /*
  * Dispatch rejectmap to segment servers.
+ *
+ * include_undispatched=true sends the whole map and marks every entry
+ * as seen by the segments; false (the hardlimit-off removal path)
+ * resends only entries the segments already have, so additions that
+ * were never dispatched stay local to the QD.
  */
-static void
-dispatch_rejectmap(HTAB *local_active_table_stat_map)
+static bool
+dispatch_rejectmap(HTAB *local_active_table_stat_map, bool include_undispatched)
 {
 	HASH_SEQ_STATUS            hash_seq;
 	GlobalRejectMapEntry      *rejectmap_entry;
 	DiskQuotaActiveTableEntry *active_table_entry;
 	int                        num_entries, count = 0;
 	CdbPgResults               cdb_pgresults = {NULL, 0};
+	List                      *sent_keys     = NIL;
+	ListCell                  *cell;
 	StringInfoData             rows;
 	StringInfoData             active_oids;
 	StringInfoData             sql;
+
+	/*
+	 * A worker whose slot binding moved on (DROP EXTENSION plus
+	 * re-CREATE while this refresh was in flight) must not talk to the
+	 * segments: the new incarnation owns their state, and a late
+	 * dispatch would overwrite it with entries computed before the
+	 * drop. Its retry bookkeeping is discarded for the same reason
+	 * (see diskquota_rejectmap_retry_set).
+	 *
+	 * Known limitation: this is a coordinator-side point-in-time check.
+	 * It rejects a dispatch by a worker already known to be stale, but it
+	 * cannot fence a dispatch that was admitted here while the binding was
+	 * still valid and only went stale afterwards: such a CdbDispatchCommand
+	 * is already in flight and can still reach the segments after the
+	 * successor incarnation's dispatch, leaving them briefly enforcing
+	 * pre-drop state. Fully closing that window needs incarnation ordering
+	 * carried across the QD->QE boundary (a monotonic incarnation stamped
+	 * on the dispatch, remembered per database on the segment, with an
+	 * older stamp ignored); the segment payload has no such stamp today.
+	 * The exposure is narrow (a DROP+re-CREATE racing an in-flight refresh)
+	 * and self-heals on the successor's next refresh cycle.
+	 */
+	if (!diskquota_worker_binding_valid()) return false;
 
 	initStringInfo(&rows);
 	initStringInfo(&active_oids);
 	initStringInfo(&sql);
 
+	/*
+	 * Send only this database's entries: the dispatched query runs in
+	 * this database on every segment and replaces the segments' state
+	 * for this database alone; other databases' entries are managed by
+	 * their own workers. The dispatched flag is set only after the
+	 * dispatch succeeds, so remember the keys that were sent.
+	 */
 	LWLockAcquire(diskquota_locks.reject_map_lock, LW_SHARED);
-	num_entries = hash_get_num_entries(disk_quota_reject_map);
 	hash_seq_init(&hash_seq, disk_quota_reject_map);
 	while ((rejectmap_entry = hash_seq_search(&hash_seq)) != NULL)
 	{
+		RejectMapEntry *sent_key;
+
+		if (rejectmap_entry->keyitem.databaseoid != MyDatabaseId) continue;
+		if (!include_undispatched && !rejectmap_entry->dispatched) continue;
+
+		sent_key  = (RejectMapEntry *)palloc(sizeof(RejectMapEntry));
+		*sent_key = rejectmap_entry->keyitem;
+		sent_keys = lappend(sent_keys, sent_key);
+
+		if (rows.len > 0) appendStringInfo(&rows, ",");
 		appendStringInfo(&rows, "ROW(%d, %d, %d, %d, %s)", rejectmap_entry->keyitem.targetoid,
 		                 rejectmap_entry->keyitem.databaseoid, rejectmap_entry->keyitem.tablespaceoid,
 		                 rejectmap_entry->keyitem.targettype, rejectmap_entry->segexceeded ? "true" : "false");
-
-		if (++count != num_entries) appendStringInfo(&rows, ",");
 	}
 	LWLockRelease(diskquota_locks.reject_map_lock);
 
@@ -1398,12 +1690,41 @@ dispatch_rejectmap(HTAB *local_active_table_stat_map)
 	                 "ARRAY[%s]::diskquota.rejectmap_entry[], "
 	                 "ARRAY[%s]::oid[])",
 	                 rows.data, active_oids.data);
+	/*
+	 * The dispatch can fail (a segment may be down) and the worker's
+	 * refresh loop swallows the error, but flush_local_reject_map()
+	 * has already reconciled the QD map: remember that the segments
+	 * have not confirmed this state so the next cycle resends it.
+	 * Cleared below only once the dispatch returns.
+	 */
+	diskquota_rejectmap_retry_set(include_undispatched);
+
+	SIMPLE_FAULT_INJECTOR("diskquota_dispatch_rejectmap");
 	CdbDispatchCommand(sql.data, DF_NONE, &cdb_pgresults);
+
+	/*
+	 * The segments hold the sent state now. Mark the sent entries as
+	 * dispatched (marking before the dispatch would leave additions a
+	 * failed full dispatch never delivered eligible for the
+	 * removal-only resend path) and drop the retry flag.
+	 */
+	LWLockAcquire(diskquota_locks.reject_map_lock, LW_EXCLUSIVE);
+	foreach (cell, sent_keys)
+	{
+		bool found;
+
+		rejectmap_entry = hash_search(disk_quota_reject_map, (RejectMapEntry *)lfirst(cell), HASH_FIND, &found);
+		if (found && rejectmap_entry) rejectmap_entry->dispatched = true;
+	}
+	LWLockRelease(diskquota_locks.reject_map_lock);
+	diskquota_rejectmap_retry_clear();
+	list_free_deep(sent_keys);
 
 	pfree(rows.data);
 	pfree(active_oids.data);
 	pfree(sql.data);
 	cdbdisp_clearCdbPgResults(&cdb_pgresults);
+	return true;
 }
 
 /*
@@ -1480,6 +1801,12 @@ do_load_quotas(void)
 	int       ret;
 	TupleDesc tupdesc;
 	int       i;
+	/*
+	 * DATABASE_QUOTA limit found in this database's quota_config;
+	 * stays 0 when the row is absent so that deleting the quota also
+	 * clears the published limit on the next reload.
+	 */
+	int64 database_quota_limit_mb = 0;
 
 	/*
 	 * TODO: we should skip to reload quota config when there is no change in
@@ -1548,6 +1875,34 @@ do_load_quotas(void)
 		Oid   spcOid         = DatumGetObjectId(vals[4]);
 		Oid   primaryOid     = DatumGetObjectId(vals[5]);
 
+		/*
+		 * The cluster and database quotas have no per-object key, so
+		 * they do not enter quota_info_map; their limits live in
+		 * launcher shmem where every database's checks can see them.
+		 */
+		if (quotaType == CLUSTER_QUOTA)
+		{
+			/*
+			 * Legacy row from before the cluster quota moved to
+			 * diskquota_namespace.global_quota_config (managed by the
+			 * launcher). Ignored.
+			 */
+			continue;
+		}
+		if (quotaType == DATABASE_QUOTA)
+		{
+			/*
+			 * Only the row whose targetoid is this database is live:
+			 * set_database_quota() keys updates and deletes on the
+			 * current database's oid, while a row restored from a dump
+			 * still carries the dump-time oid. Loading a stale row would
+			 * enforce a limit the API can no longer see or delete.
+			 */
+			if (targetOid == MyDatabaseId)
+				database_quota_limit_mb = (quota_limit_mb > INT_MAX) ? INT_MAX : quota_limit_mb;
+			continue;
+		}
+
 		if (quotaType == NAMESPACE_TABLESPACE_QUOTA || quotaType == ROLE_TABLESPACE_QUOTA)
 		{
 			targetOid = primaryOid;
@@ -1568,6 +1923,8 @@ do_load_quotas(void)
 			update_limit_for_quota(quota_limit_mb * (1 << 20), segratio, quotaType, (Oid[]){targetOid, spcOid});
 		}
 	}
+
+	diskquota_publish_db_limit(database_quota_limit_mb);
 
 	return;
 }
@@ -1679,6 +2036,14 @@ prepare_rejectmap_search_key(RejectMapEntry *keyitem, QuotaType type, Oid relown
 		keyitem->targetoid = relnamespace;
 	else if (type == TABLESPACE_QUOTA)
 		keyitem->targetoid = reltablespace;
+	else if (type == CLUSTER_QUOTA || type == DATABASE_QUOTA)
+		/*
+		 * These quotas are object-independent; their rejectmap keys
+		 * carry no target oid. (The soft-limit checks do not go
+		 * through the rejectmap; this key shape is reserved for
+		 * hardlimit dispatch.)
+		 */
+		keyitem->targetoid = InvalidOid;
 	else
 		ereport(ERROR, (errcode(ERRCODE_INTERNAL_ERROR), errmsg("[diskquota] unknown quota type: %d", type)));
 
@@ -1693,30 +2058,75 @@ prepare_rejectmap_search_key(RejectMapEntry *keyitem, QuotaType type, Oid relown
 	keyitem->targettype  = type;
 }
 
+static Oid  diskquota_nsoid_cache               = InvalidOid;
+static bool diskquota_nsoid_callback_registered = false;
+
+static void
+diskquota_nsoid_cache_reset(Datum arg, int cacheid, uint32 hashvalue)
+{
+	diskquota_nsoid_cache = InvalidOid;
+}
+
 /*
- * Given table oid, check whether quota limit
- * of table's schema or table's owner are reached.
- * Do enforcement if quota exceeds.
+ * Oid of the "diskquota" schema, cached per backend: the write hot
+ * path consults it on every quota check. Any pg_namespace change
+ * resets the cache; the schema oid only changes when the extension
+ * is dropped and re-created.
+ */
+static Oid
+get_diskquota_nsoid(void)
+{
+	if (!diskquota_nsoid_callback_registered)
+	{
+		CacheRegisterSyscacheCallback(NAMESPACENAME, diskquota_nsoid_cache_reset, (Datum)0);
+		diskquota_nsoid_callback_registered = true;
+	}
+	if (!OidIsValid(diskquota_nsoid_cache)) diskquota_nsoid_cache = get_namespace_oid("diskquota", true /*missing_ok*/);
+	return diskquota_nsoid_cache;
+}
+
+/*
+ * The object-independent quotas (CLUSTER_QUOTA / DATABASE_QUOTA)
+ * match every relation of the database, so they must explicitly
+ * spare catalog relations and diskquota's own bookkeeping schema:
+ * blocking diskquota.table_size would prevent usage from ever being
+ * recorded as decreasing once a cap is hit, wedging the cap
+ * permanently.
  */
 static bool
-check_rejectmap_by_reloid(Oid reloid)
+objectwide_quota_exempt_ns(Oid relnamespace)
 {
-	Oid                   ownerOid      = InvalidOid;
-	Oid                   nsOid         = InvalidOid;
-	Oid                   tablespaceoid = InvalidOid;
+	return relnamespace == PG_CATALOG_NAMESPACE || relnamespace == get_diskquota_nsoid();
+}
+
+/*
+ * Same rule for the dispatcher's per-write check, where diskquota's
+ * own processes (workers and the launcher) are exempt as well, or
+ * they could not maintain the bookkeeping that lets usage decrease.
+ */
+static bool
+objectwide_quota_exempt(Oid relnamespace)
+{
+	return diskquota_am_bgworker() || diskquota_am_launcher() || objectwide_quota_exempt_ns(relnamespace);
+}
+
+/*
+ * Rejectmap probe for a relation whose owner, schema and tablespace
+ * are already resolved. The exemption predicate may read the catalog
+ * on a cache miss, so it is evaluated before taking the lock.
+ */
+static bool
+check_rejectmap_resolved(Oid ownerOid, Oid nsOid, Oid tablespaceoid)
+{
 	bool                  found;
 	RejectMapEntry        keyitem;
 	GlobalRejectMapEntry *entry;
-
-	bool found_rel = get_rel_owner_schema_tablespace(reloid, &ownerOid, &nsOid, &tablespaceoid);
-	if (!found_rel)
-	{
-		return true;
-	}
+	bool                  objectwide_exempt = objectwide_quota_exempt(nsOid);
 
 	LWLockAcquire(diskquota_locks.reject_map_lock, LW_SHARED);
 	for (QuotaType type = 0; type < NUM_QUOTA_TYPES; ++type)
 	{
+		if ((type == CLUSTER_QUOTA || type == DATABASE_QUOTA) && objectwide_exempt) continue;
 		prepare_rejectmap_search_key(&keyitem, type, ownerOid, nsOid, tablespaceoid);
 		entry = hash_search(disk_quota_reject_map, &keyitem, HASH_FIND, &found);
 		if (found)
@@ -1731,6 +2141,22 @@ check_rejectmap_by_reloid(Oid reloid)
 }
 
 /*
+ * Given table oid, check whether quota limit
+ * of table's schema or table's owner are reached.
+ * Do enforcement if quota exceeds.
+ */
+static bool
+check_rejectmap_by_reloid(Oid reloid)
+{
+	Oid ownerOid      = InvalidOid;
+	Oid nsOid         = InvalidOid;
+	Oid tablespaceoid = InvalidOid;
+
+	if (!get_rel_owner_schema_tablespace(reloid, &ownerOid, &nsOid, &tablespaceoid)) return true;
+	return check_rejectmap_resolved(ownerOid, nsOid, tablespaceoid);
+}
+
+/*
  * Given relation's oid or relfilenode, check whether the
  * quota limits of schema or owner are reached. Do enforcement
  * if the quota exceeds.
@@ -1739,10 +2165,80 @@ bool
 quota_check_common(Oid reloid, RelFileNode *relfilenode)
 {
 	bool enable_hardlimit;
+	bool paused;
+	bool monitored;
 
 	if (!IsTransactionState()) return true;
 
-	if (diskquota_is_paused()) return true;
+	/* one cache probe fetches both facts needed below */
+	monitored = diskquota_db_monitored_and_paused(MyDatabaseId, &paused);
+	if (paused) return true;
+
+	/*
+	 * Cluster-wide quota: reject the write when the aggregate size of
+	 * all monitored databases exceeds the configured cap. Runs on the
+	 * dispatcher only (the aggregate lives in launcher shmem there),
+	 * and only in monitored databases: an unmonitored database is not
+	 * counted in the aggregate, so it must not be blocked by it
+	 * either (set_cluster_quota() warns about such databases).
+	 * diskquota's own processes are exempt: the workers must be able
+	 * to keep maintaining diskquota.table_size, or the aggregate could
+	 * never decrease again after the cap is hit, and the launcher must
+	 * be able to write its bookkeeping tables, or the cap could never
+	 * be raised (set_cluster_quota) and no new database could be
+	 * monitored (CREATE EXTENSION) while the cluster is over quota.
+	 */
+	if (OidIsValid(reloid) && IS_QUERY_DISPATCHER() && !diskquota_am_bgworker() && !diskquota_am_launcher() &&
+	    monitored)
+	{
+		int64 db_total    = 0;
+		int64 db_limit_mb = 0;
+		int64 limit_mb;
+		Oid   ownerOid = InvalidOid, nsOid = InvalidOid, spcOid = InvalidOid;
+
+		/*
+		 * Read the configured limits first: they are two cheap shmem
+		 * reads, and when neither object-independent quota is set (the
+		 * common case) the catalog lookups below would be pure
+		 * per-write overhead.
+		 */
+		limit_mb = diskquota_get_cluster_limit_mb();
+		(void)diskquota_get_database_status(MyDatabaseId, &db_total, &db_limit_mb);
+		if (db_limit_mb <= 0 && limit_mb <= 0) return check_rejectmap_by_reloid(reloid);
+
+		/*
+		 * The object-independent quotas cover every relation, so they
+		 * must spare catalog relations and diskquota's own bookkeeping
+		 * (diskquota.table_size etc.): blocking those would prevent
+		 * usage from ever being recorded as decreasing — including by
+		 * repair tools such as init_table_size_table() — wedging the
+		 * cap permanently. Same rule as on segments in
+		 * refresh_rejectmap().
+		 */
+		if (!get_rel_owner_schema_tablespace(reloid, &ownerOid, &nsOid, &spcOid)) return true;
+		if (objectwide_quota_exempt(nsOid)) return check_rejectmap_resolved(ownerOid, nsOid, spcOid);
+
+		if (db_limit_mb > 0 && db_total >= db_limit_mb * (int64)(1 << 20))
+			ereport(ERROR,
+			        (errcode(ERRCODE_DISK_FULL),
+			         errmsg("database's disk space quota exceeded with name: %s", get_database_name(MyDatabaseId)),
+			         errhint("database usage " INT64_FORMAT " MB exceeds database quota " INT64_FORMAT
+			                 " MB; free disk space or raise diskquota.set_database_quota()",
+			                 db_total / (1 << 20), db_limit_mb)));
+
+		if (limit_mb > 0)
+		{
+			int64 total = diskquota_get_cluster_total_size();
+
+			if (total >= limit_mb * (int64)(1 << 20))
+				ereport(ERROR, (errcode(ERRCODE_DISK_FULL), errmsg("cluster's disk space quota exceeded"),
+				                errhint("cluster usage " INT64_FORMAT " MB exceeds cluster quota " INT64_FORMAT
+				                        " MB; free disk space or raise diskquota.set_cluster_quota()",
+				                        total / (1 << 20), limit_mb)));
+		}
+
+		return check_rejectmap_resolved(ownerOid, nsOid, spcOid);
+	}
 
 	if (OidIsValid(reloid)) return check_rejectmap_by_reloid(reloid);
 
@@ -1787,6 +2283,18 @@ GetNamespaceName(Oid spcid, bool skip_name)
 		return pstrdup(spcstr.data);
 	}
 	return get_namespace_name(spcid);
+}
+
+static char *
+GetDatabaseName(Oid dbid, bool skip_name)
+{
+	if (skip_name)
+	{
+		NameData dbstr;
+		pg_ltoa(dbid, dbstr.data);
+		return pstrdup(dbstr.data);
+	}
+	return get_database_name(dbid);
 }
 
 static char *
@@ -1854,6 +2362,13 @@ export_exceeded_error(GlobalRejectMapEntry *entry, bool skip_name)
 				        (errcode(ERRCODE_DISK_FULL), errmsg("tablespace: %s, role: %s diskquota exceeded",
 				                                            GetTablespaceName(rejectentry->tablespaceoid, skip_name),
 				                                            GetUserName(rejectentry->targetoid, skip_name))));
+			break;
+		case CLUSTER_QUOTA:
+			ereport(ERROR, (errcode(ERRCODE_DISK_FULL), errmsg("cluster's disk space quota exceeded")));
+			break;
+		case DATABASE_QUOTA:
+			ereport(ERROR, (errcode(ERRCODE_DISK_FULL), errmsg("database's disk space quota exceeded with name: %s",
+			                                                   GetDatabaseName(rejectentry->databaseoid, skip_name))));
 			break;
 		default:
 			ereport(ERROR, (errcode(ERRCODE_DISK_FULL), errmsg("diskquota exceeded, unknown quota type")));
@@ -1984,6 +2499,8 @@ refresh_rejectmap(PG_FUNCTION_ARGS)
 
 			for (QuotaType type = 0; type < NUM_QUOTA_TYPES; ++type)
 			{
+				if ((type == CLUSTER_QUOTA || type == DATABASE_QUOTA) && objectwide_quota_exempt_ns(relnamespace))
+					continue;
 				/* Check that if the current relation should be blocked. */
 				prepare_rejectmap_search_key(&keyitem, type, relowner, relnamespace, reltablespace);
 				rejectmapentry = hash_search(local_rejectmap, &keyitem, HASH_FIND, &found);
@@ -2087,6 +2604,8 @@ refresh_rejectmap(PG_FUNCTION_ARGS)
 				RejectMapEntry keyitem;
 				for (QuotaType type = 0; type < NUM_QUOTA_TYPES; ++type)
 				{
+					if ((type == CLUSTER_QUOTA || type == DATABASE_QUOTA) && objectwide_quota_exempt_ns(relnamespace))
+						continue;
 					/* Check that if the current relation should be blocked. */
 					prepare_rejectmap_search_key(&keyitem, type, relowner, relnamespace, reltablespace);
 					rejectmapentry = hash_search(local_rejectmap, &keyitem, HASH_FIND, &found);
@@ -2151,10 +2670,13 @@ refresh_rejectmap(PG_FUNCTION_ARGS)
 		GlobalRejectMapEntry *new_entry;
 
 		/*
-		 * Skip soft limit reject entry. We don't perform soft-limit on segment servers, so we don't flush the
-		 * rejectmap entry with a valid targetoid to the global rejectmap on segment servers.
+		 * The global rejectmap on segment servers is indexed by relfilenode, so flush only the relfilenode
+		 * entries derived above. Keyed entries stay local to this UDF: soft limit is not enforced on segment
+		 * servers, and the object-independent CLUSTER/DATABASE entries carry no valid targetoid at all, so
+		 * filtering by targetoid would let them leak into the segment maps, where QE-side permission checks
+		 * build the same key and can reject writes past the coordinator's control.
 		 */
-		if (OidIsValid(rejectmapentry->keyitem.targetoid)) continue;
+		if (!OidIsValid(rejectmapentry->keyitem.relfilenode.relNode)) continue;
 
 		new_entry = hash_search(disk_quota_reject_map, &rejectmapentry->keyitem, HASH_ENTER_NULL, &found);
 		if (!found && new_entry) memcpy(new_entry, rejectmapentry, sizeof(GlobalRejectMapEntry));
@@ -2276,6 +2798,12 @@ show_rejectmap(PG_FUNCTION_ARGS)
 				break;
 			case NAMESPACE_TABLESPACE_QUOTA:
 				StrNCpy(targettype_str, "NAMESPACE_TABLESPACE_QUOTA", _TARGETTYPE_STR_SIZE);
+				break;
+			case CLUSTER_QUOTA:
+				StrNCpy(targettype_str, "CLUSTER_QUOTA", _TARGETTYPE_STR_SIZE);
+				break;
+			case DATABASE_QUOTA:
+				StrNCpy(targettype_str, "DATABASE_QUOTA", _TARGETTYPE_STR_SIZE);
 				break;
 			default:
 				StrNCpy(targettype_str, "UNKNOWN", _TARGETTYPE_STR_SIZE);

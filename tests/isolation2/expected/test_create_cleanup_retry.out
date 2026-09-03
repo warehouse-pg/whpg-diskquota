@@ -1,0 +1,69 @@
+-- A CREATE EXTENSION that fails after claiming a slot queues a durable
+-- teardown: delete the committed phase-1 database_list row AND stop segment
+-- monitoring. If that teardown cannot run immediately (a segment is down),
+-- the row must not be left behind -- otherwise the launcher's startup replay
+-- would resurrect monitoring for a database whose CREATE reported failure.
+-- The teardown is therefore retried, and only drops the row once it commits.
+-- Hold the retry to observe the pending state, then release it and confirm
+-- the row is durably removed.
+1: CREATE DATABASE ccr_db;
+CREATE DATABASE
+
+-- hold the teardown retry (both the prompt one and the main-loop one)
+1: SELECT gp_inject_fault_infinite('diskquota_pending_unmonitor_retry', 'skip', dbid) FROM gp_segment_configuration WHERE role = 'p' AND content = -1;
+ gp_inject_fault_infinite 
+--------------------------
+ Success:                 
+(1 row)
+-- fail the CREATE after the slot is claimed
+1: SELECT gp_inject_fault_infinite('diskquota_create_post_slot', 'error', dbid) FROM gp_segment_configuration WHERE role = 'p' AND content = -1;
+ gp_inject_fault_infinite 
+--------------------------
+ Success:                 
+(1 row)
+2:@db_name ccr_db: CREATE EXTENSION diskquota;
+ERROR:  [diskquota] failed to create diskquota extension: unknown error (diskquota_utility.c:433)
+1: SELECT gp_inject_fault('diskquota_create_post_slot', 'reset', dbid) FROM gp_segment_configuration WHERE role = 'p' AND content = -1;
+ gp_inject_fault 
+-----------------
+ Success:        
+(1 row)
+
+-- the slot was released (no worker), but the durable row delete is still
+-- pending because the retry is held: the row must NOT be lost meanwhile
+1: SELECT count(*) AS workers FROM pg_stat_activity WHERE backend_type LIKE 'diskquota bgworker%' AND datname = 'ccr_db';
+ workers 
+---------
+ 0       
+(1 row)
+3:@db_name diskquota: SELECT count(*) AS row_pending FROM diskquota_namespace.database_list l JOIN pg_database d ON d.oid = l.dbid WHERE d.datname = 'ccr_db';
+ row_pending 
+-------------
+ 1           
+(1 row)
+
+-- release the retry; the teardown now runs and deletes the row
+1: SELECT gp_inject_fault('diskquota_pending_unmonitor_retry', 'reset', dbid) FROM gp_segment_configuration WHERE role = 'p' AND content = -1;
+ gp_inject_fault 
+-----------------
+ Success:        
+(1 row)
+!\retcode for i in $(seq 1 60); do n=$(psql -d diskquota -Atc "SELECT count(*) FROM diskquota_namespace.database_list l JOIN pg_database d ON d.oid = l.dbid WHERE d.datname = 'ccr_db'" 2>/dev/null); [ "$n" = "0" ] && break; sleep 1; done;
+-- start_ignore
+
+-- end_ignore
+(exited with code 0)
+
+-- the row is durably gone: startup replay cannot resurrect monitoring
+3:@db_name diskquota: SELECT count(*) AS row_cleaned FROM diskquota_namespace.database_list l JOIN pg_database d ON d.oid = l.dbid WHERE d.datname = 'ccr_db';
+ row_cleaned 
+-------------
+ 0           
+(1 row)
+
+-- cleanup
+2q: ... <quitting>
+3q: ... <quitting>
+1: DROP DATABASE ccr_db;
+DROP DATABASE
+1q: ... <quitting>

@@ -93,6 +93,28 @@ typedef enum
 	 */
 	TABLESPACE_QUOTA,
 
+	/*
+	 * CLUSTER_QUOTA
+	 * caps the aggregate disk usage of all monitored databases.
+	 * Persisted in diskquota_namespace.global_quota_config in the
+	 * launcher's database and managed by the launcher (see
+	 * CMD_SET_CLUSTER_QUOTA); rows of this type in a database's own
+	 * quota_config are ignored. It has no per-object key, so it never
+	 * enters quota_info_map; the limit and the aggregate usage live in
+	 * DiskquotaLauncherShmem instead.
+	 */
+	CLUSTER_QUOTA,
+
+	/*
+	 * DATABASE_QUOTA
+	 * caps the total disk usage of one database (all schemas and
+	 * roles combined). Stored in that database's own `quota_config`
+	 * with targetoid = the database oid; like CLUSTER_QUOTA it has
+	 * no entry in quota_info_map — the limit lives in the launcher
+	 * shmem dbArray slot of the database.
+	 */
+	DATABASE_QUOTA,
+
 	NUM_QUOTA_TYPES,
 } QuotaType;
 
@@ -118,6 +140,13 @@ typedef enum
 	FETCH_ACTIVE_OID,  /* fetch active table list */
 	FETCH_ACTIVE_SIZE, /* fetch size for active tables */
 	ADD_DB_TO_MONITOR,
+	/*
+	 * Like ADD_DB_TO_MONITOR but resets an existing entry's paused flag.
+	 * Sent only on CREATE EXTENSION (never on the per-refresh replay), so a
+	 * database re-created after a failed unmonitor dispatch does not inherit
+	 * a stale paused=true.
+	 */
+	ADD_DB_TO_MONITOR_FRESH,
 	REMOVE_DB_FROM_BEING_MONITORED,
 	PAUSE_DB_TO_MONITOR,
 	RESUME_DB_TO_MONITOR,
@@ -166,12 +195,25 @@ struct ExtensionDDLMessage
 	                   * MessageResult */
 	int dbid;         /* dbid of create/drop diskquota
 	                   * extensionstatement */
+	int64 payload;    /* command payload: the cluster quota limit
+	                   * in MB for CMD_SET_CLUSTER_QUOTA */
+	uint64 seq;       /* bumped by the sender on every arming; the
+	                   * launcher answers only the arming it copied */
 };
 
 enum MessageCommand
 {
 	CMD_CREATE_EXTENSION = 1,
 	CMD_DROP_EXTENSION,
+
+	/*
+	 * Set or delete the cluster-wide quota. The message's payload
+	 * field carries the limit in MB (negative = delete). Handled by the
+	 * launcher so that the value persists in
+	 * diskquota_namespace.global_quota_config in the launcher's
+	 * database, independent of which database the setter ran in.
+	 */
+	CMD_SET_CLUSTER_QUOTA,
 };
 
 enum MessageResult
@@ -212,6 +254,17 @@ struct DiskQuotaWorkerEntry
 	int      id;     // starts from 0, -1 means invalid
 	NameData dbname; // the database name. It does not need to be reset, when dbEntry == NULL, dbname is not valid.
 	DiskquotaDBEntry *dbEntry; // pointer to shared memory. DiskquotaLauncherShmem->dbArray
+
+	/*
+	 * The dbEntry generation this worker was started to serve, stamped
+	 * by the launcher when it binds dbEntry, before the bgworker is
+	 * registered. The worker fences on this stamp rather than on the
+	 * live slot: the slot can be released and re-claimed (bumping its
+	 * generation) before the worker finishes starting, and a worker
+	 * reading the live value then would adopt an incarnation it was
+	 * never started for.
+	 */
+	uint32 generation;
 };
 
 typedef struct
@@ -222,12 +275,54 @@ typedef struct
 	DiskquotaDBEntry *dbArrayTail;
 	volatile bool     isDynamicWorker;
 	/*
+	 * Cluster-wide quota limit in MB; 0 means no cluster quota is
+	 * configured. Written by set_cluster_quota() and by workers
+	 * reloading quota_config.
+	 */
+	pg_atomic_uint64 cluster_quota_limit_mb;
+	/*
 	DiskQuotaWorkerEntry worker[diskquota_max_workers]; // the hidden memory to store WorkerEntry
 	DiskquotaDBEntry     dbentry[diskquota_max_monitored_databases]; // the hidden memory for dbentry
 	*/
 } DiskquotaLauncherShmemStruct;
 
 /* In shmem, only used on master */
+/*
+ * A slot's lifecycle across a DROP/CREATE cycle. Meaningful only while
+ * in_use is true.
+ *
+ *   DB_SLOT_ACTIVE   - the database is monitored and its worker may run.
+ *   DB_SLOT_DRAINING - a DROP EXTENSION terminated the worker, but the
+ *                      slot is held (not recycled) until the worker has
+ *                      actually stopped, so a new incarnation cannot start
+ *                      and race the old worker's in-flight refresh
+ *                      (table_size flush, shared rejectmap, epoch). Once
+ *                      the worker leaves, the slot is freed.
+ *   DB_SLOT_REVIVING - a CREATE EXTENSION re-monitored the database while
+ *                      it was still draining; once the old worker leaves,
+ *                      the same slot is reactivated for the new incarnation
+ *                      from a clean model instead of freed.
+ *
+ * Legal transitions, all made under dblist_lock:
+ *   ACTIVE   --DROP-->   DRAINING
+ *   DRAINING --CREATE--> REVIVING
+ *   REVIVING --DROP-->   DRAINING   (a DROP cancels a pending revive, so a
+ *                                    DROP/CREATE/DROP sequence frees the
+ *                                    slot rather than resurrecting the
+ *                                    dropped database)
+ *   DRAINING --reap-->   (slot freed)      once the worker has left
+ *   REVIVING --reap-->   ACTIVE            once the worker has left
+ * A DROP that finds the slot already DRAINING is a duplicate: it is
+ * ignored, so it neither re-terminates the worker nor re-counts num_db.
+ * Reaped in reap_draining_db_entries().
+ */
+typedef enum DiskquotaSlotLifecycle
+{
+	DB_SLOT_ACTIVE = 0,
+	DB_SLOT_DRAINING,
+	DB_SLOT_REVIVING,
+} DiskquotaSlotLifecycle;
+
 struct DiskquotaDBEntry
 {
 	int id;   // the index of DiskquotaLauncherShmem->dbArray, start from 0
@@ -242,7 +337,52 @@ struct DiskquotaDBEntry
 	bool inited; // this entry is inited, will set to true after the worker finish the frist run.
 	bool in_use; // this slot is in using. AKA dbid != 0
 
+	/*
+	 * Slot lifecycle across a DROP/CREATE cycle; see
+	 * DiskquotaSlotLifecycle. Meaningful only while in_use is true.
+	 */
+	DiskquotaSlotLifecycle lifecycle;
+
 	TimestampTz last_log_time; // the last time log current database info.
+
+	/*
+	 * Total on-disk size of this database (sum over all segments),
+	 * published by its worker once per refresh loop. Input to the
+	 * cluster-wide and per-database quota checks.
+	 */
+	pg_atomic_uint64 total_size;
+
+	/*
+	 * DATABASE_QUOTA limit for this database in MB; 0 means no
+	 * database quota is configured. Written by set_database_quota()
+	 * and refreshed by the database's worker from quota_config.
+	 */
+	pg_atomic_uint64 db_quota_limit_mb;
+
+	/*
+	 * Set while a rejectmap dispatch for this database has not been
+	 * confirmed by the segments: the QD map is reconciled before the
+	 * dispatch, so a dispatch that fails (a segment down; the error is
+	 * swallowed by the worker's refresh loop) would otherwise lose the
+	 * state change for good and leave the segments enforcing stale
+	 * entries. The next worker cycle resends the map.
+	 * rejectmap_retry_full remembers whether the unconfirmed dispatch
+	 * carried not-yet-dispatched additions. Only the database's
+	 * current worker touches these fields; the accessors enforce that
+	 * under dblist_lock with the generation check the publishes use.
+	 */
+	bool rejectmap_retry;
+	bool rejectmap_retry_full;
+
+	/*
+	 * Bumped every time the slot is claimed. A worker captures the
+	 * value at startup and its publishes are discarded on a mismatch:
+	 * the in_use/dbid revalidation alone cannot tell a DROP EXTENSION
+	 * plus immediate re-CREATE of the same database apart from its own
+	 * binding, so a terminating worker of the previous incarnation
+	 * could republish its stale total over the zeroed slot.
+	 */
+	uint32 generation;
 };
 
 typedef enum MonitorDBStatus
@@ -278,6 +418,7 @@ extern void init_disk_quota_model(uint32 id);
 extern void refresh_disk_quota_model(bool force);
 extern bool check_diskquota_state_is_ready(void);
 extern bool quota_check_common(Oid reloid, RelFileNode *relfilenode);
+extern void invalidate_database_rejectmap(Oid dbid);
 
 /* quotaspi interface */
 extern void init_disk_quota_hook(void);
@@ -301,6 +442,9 @@ extern Oid      diskquota_parse_primary_table_oid(Oid namespace, char *relname);
 extern bool         worker_increase_epoch(Oid dbid);
 extern unsigned int worker_get_epoch(Oid dbid);
 extern bool         diskquota_is_paused(void);
+extern bool         diskquota_is_monitored_dbid(Oid dbid);
+extern bool         diskquota_db_monitored_and_paused(Oid dbid, bool *paused);
+extern bool         diskquota_monitored_db_status(Oid dbid, uint32 *status);
 extern bool         do_check_diskquota_state_is_ready(void);
 extern bool         diskquota_is_readiness_logged(void);
 extern void         diskquota_set_readiness_logged(void);
@@ -316,4 +460,19 @@ extern HTAB        *diskquota_hash_create(const char *tabname, long nelem, HASHC
 extern HTAB *DiskquotaShmemInitHash(const char *name, long init_size, long max_size, HASHCTL *infoP, int hash_flags,
                                     DiskquotaHashFunction hash_function);
 extern void  refresh_monitored_dbid_cache(void);
+
+/* cluster-wide and per-database quota */
+extern bool  diskquota_am_bgworker(void);
+extern bool  diskquota_am_launcher(void);
+extern void  diskquota_set_cluster_limit_mb(int64 limit_mb);
+extern int64 diskquota_get_cluster_limit_mb(void);
+extern void  diskquota_worker_capture_generation(void);
+extern bool  diskquota_worker_binding_valid(void);
+extern void  diskquota_publish_db_total(int64 total);
+extern void  diskquota_publish_db_limit(int64 limit_mb);
+extern void  diskquota_rejectmap_retry_set(bool full);
+extern void  diskquota_rejectmap_retry_clear(void);
+extern bool  diskquota_rejectmap_retry_pending(bool *full);
+extern int64 diskquota_get_cluster_total_size(void);
+extern bool  diskquota_get_database_status(Oid dbid, int64 *total_size, int64 *limit_mb);
 #endif

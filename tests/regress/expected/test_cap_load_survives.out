@@ -1,0 +1,61 @@
+-- A transient failure loading the persisted cluster cap at launcher startup
+-- (a segment down, a distributed query error) must not take the launcher
+-- down. Startup runs before the main loop, so an uncaught error would have
+-- the postmaster restart the launcher straight back into the same failure --
+-- a crash loop. The launcher must catch it, come up with the cap unloaded,
+-- and keep serving.
+SELECT diskquota.wait_for_worker_new_epoch();
+ wait_for_worker_new_epoch 
+---------------------------
+ t
+(1 row)
+
+-- make the next startup cap-load fail, then force a launcher restart. The
+-- postmaster restarts the launcher after BGW_DEFAULT_RESTART_INTERVAL (60s),
+-- shared memory intact; on restart it re-runs load_global_quota_config and
+-- hits the fault.
+SELECT gp_inject_fault_infinite('diskquota_load_global_quota_config', 'error', dbid)
+  FROM gp_segment_configuration WHERE role = 'p' AND content = -1;
+ gp_inject_fault_infinite 
+--------------------------
+ Success:
+(1 row)
+
+SELECT gp_inject_fault('diskquota_launcher_main', 'error', dbid)
+  FROM gp_segment_configuration WHERE role = 'p' AND content = -1;
+ gp_inject_fault 
+-----------------
+ Success:
+(1 row)
+
+\! sleep 75
+-- the restarted launcher survived the cap-load error: it answers a round
+-- trip. set_cluster_quota needs the launcher's main loop to process the
+-- message, so a crash-looping launcher would make this time out.
+SELECT diskquota.set_cluster_quota('10 MB');
+ set_cluster_quota 
+-------------------
+ 
+(1 row)
+
+SELECT diskquota.set_cluster_quota('-1');
+ set_cluster_quota 
+-------------------
+ 
+(1 row)
+
+-- stop failing the cap load and remove the spent restart fault
+SELECT gp_inject_fault('diskquota_load_global_quota_config', 'reset', dbid)
+  FROM gp_segment_configuration WHERE role = 'p' AND content = -1;
+ gp_inject_fault 
+-----------------
+ Success:
+(1 row)
+
+SELECT gp_inject_fault('diskquota_launcher_main', 'reset', dbid)
+  FROM gp_segment_configuration WHERE role = 'p' AND content = -1;
+ gp_inject_fault 
+-----------------
+ Success:
+(1 row)
+

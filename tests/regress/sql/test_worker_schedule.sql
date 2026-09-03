@@ -220,7 +220,9 @@ DROP DATABASE t9;
 DROP DATABASE t10;
 DROP DATABASE t11;
 DROP DATABASE t12;
-\! gpconfig -r diskquota.worker_timeout;
-\! gpconfig -r diskquota.max_workers;
+-- Restore the schedule contract, not the factory default: the suite
+-- runs with diskquota.max_workers = 1 (see config), and later tests
+-- depend on the dynamic-worker mode it implies.
+\! gpconfig -c diskquota.max_workers -v 1;
 \! gpstop -arf;
 --end_ignore
