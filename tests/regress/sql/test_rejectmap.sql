@@ -78,6 +78,13 @@ CREATE OR REPLACE FUNCTION block_relation_on_seg0(rel regclass, block_type text)
   END; $$
 LANGUAGE 'plpgsql';
 
+-- The sections below populate segment rejectmaps directly through
+-- refresh_rejectmap(). Pause the bgworker so its own dispatches
+-- cannot overwrite them, then outwait any refresh already in
+-- flight (the epoch advances even while paused).
+SELECT diskquota.pause();
+SELECT diskquota.wait_for_worker_new_epoch();
+
 --
 -- 1. Create an ordinary table and add its oid to rejectmap on seg0.
 --    Check that it's relfilenode is blocked on seg0 by various conditions.
@@ -216,3 +223,4 @@ DROP TABLE blocked_t5;
 DROP TABLESPACE blocked_space;
 SET search_path TO DEFAULT;
 DROP SCHEMA s_rejectmap;
+SELECT diskquota.resume();

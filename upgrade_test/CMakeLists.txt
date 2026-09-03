@@ -22,6 +22,13 @@ list(APPEND schedule_files
   ${CMAKE_CURRENT_SOURCE_DIR}/schedule_2.2--2.3
   ${CMAKE_CURRENT_SOURCE_DIR}/schedule_2.3--2.2
 )
+# 2.4 ships for GP7-based WHPG only
+if(NOT ${GP_MAJOR_VERSION} EQUAL 6)
+  list(APPEND schedule_files
+    ${CMAKE_CURRENT_SOURCE_DIR}/schedule_2.3--2.4
+    ${CMAKE_CURRENT_SOURCE_DIR}/schedule_2.4--2.3
+  )
+endif()
 regresstarget_add(
   upgradecheck
   INIT_FILE

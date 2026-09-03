@@ -1,0 +1,176 @@
+-- A table dropped while a schema quota is set must have its size subtracted
+-- from the schema's in-memory quota total exactly once. The subtraction
+-- happens in calculate_table_disk_usage(); the table_size entry that carries
+-- the size is removed only by the post-commit flush. If a refresh aborts
+-- after the subtraction but before that flush, the entry survives and the
+-- next refresh subtracts the same bytes again. Repeated over several aborted
+-- cycles this drives the schema's model total far below true usage, so the
+-- schema is no longer rejected even when it truly exceeds its quota.
+--
+-- A fault fails the rejectmap dispatch so every refresh aborts after the
+-- subtraction; hardlimit is enabled for the drift phase (with a no-quota
+-- table kept active) so a dispatch, and thus the fault, fires each cycle.
+-- After the drift the schema is refilled past its quota and must still be
+-- enforced. Pre-fix the drifted-negative total leaves it unrejected and the
+-- write wrongly succeeds. Enforcement is checked with soft-limit (hardlimit
+-- off), whose rejection is coordinator-side and deterministic.
+!\retcode gpconfig -c "diskquota.hard_limit" -v "off" > /dev/null;
+-- start_ignore
+
+-- end_ignore
+(exited with code 0)
+!\retcode gpstop -u > /dev/null;
+-- start_ignore
+
+-- end_ignore
+(exited with code 0)
+
+1: CREATE DATABASE abort_dd_db;
+CREATE DATABASE
+1q: ... <quitting>
+2:@db_name abort_dd_db: CREATE EXTENSION diskquota;
+CREATE EXTENSION
+2:@db_name abort_dd_db: CREATE SCHEMA s;
+CREATE SCHEMA
+2:@db_name abort_dd_db: CREATE SCHEMA act;
+CREATE SCHEMA
+2:@db_name abort_dd_db: CREATE TABLE act.driver (i int) DISTRIBUTED BY (i);
+CREATE TABLE
+-- fill s.counted (~50 MB) before any quota/hardlimit applies, so the fill is
+-- never rejected mid-statement (that would race the worker's dispatch)
+2:@db_name abort_dd_db: CREATE TABLE s.counted (t text) DISTRIBUTED BY (t);
+CREATE TABLE
+2:@db_name abort_dd_db: INSERT INTO s.counted SELECT repeat('x', 900) FROM generate_series(1, 60000);
+INSERT 0 60000
+2:@db_name abort_dd_db: CREATE TABLE s.probe (i int) DISTRIBUTED BY (i);
+CREATE TABLE
+2:@db_name abort_dd_db: SELECT diskquota.set_schema_quota('s', '1 MB');
+ set_schema_quota 
+------------------
+                  
+(1 row)
+2:@db_name abort_dd_db: SELECT diskquota.wait_for_worker_new_epoch();
+ wait_for_worker_new_epoch 
+---------------------------
+ t                         
+(1 row)
+2:@db_name abort_dd_db: SELECT diskquota.wait_for_worker_new_epoch();
+ wait_for_worker_new_epoch 
+---------------------------
+ t                         
+(1 row)
+
+-- baseline: schema s is over its 1 MB quota, so a write to it is rejected
+2:@db_name abort_dd_db: INSERT INTO s.probe VALUES (1);
+ERROR:  schema's disk space quota exceeded with name: s
+
+-- enable hardlimit so an active table forces a dispatch (and the abort fault)
+-- every refresh cycle during the drift phase
+!\retcode gpconfig -c "diskquota.hard_limit" -v "on" > /dev/null;
+-- start_ignore
+
+-- end_ignore
+(exited with code 0)
+!\retcode gpstop -u > /dev/null;
+-- start_ignore
+
+-- end_ignore
+(exited with code 0)
+
+-- arm: every refresh now aborts after calculate_table_disk_usage() has
+-- subtracted the counted table's size
+SELECT gp_inject_fault_infinite('diskquota_dispatch_rejectmap', 'error', dbid) FROM gp_segment_configuration WHERE role='p' AND content=-1;
+ gp_inject_fault_infinite 
+--------------------------
+ Success:                 
+(1 row)
+
+-- drop the counted table; its ~50 MB is subtracted from schema s on every
+-- aborted cycle. Each act.driver write keeps a table active so the dispatch
+-- (and the fault) fires, and always succeeds (act has no quota).
+2:@db_name abort_dd_db: DROP TABLE s.counted;
+DROP TABLE
+2:@db_name abort_dd_db: INSERT INTO act.driver VALUES (1);
+INSERT 0 1
+2:@db_name abort_dd_db: SELECT diskquota.wait_for_worker_new_epoch();
+ wait_for_worker_new_epoch 
+---------------------------
+ t                         
+(1 row)
+2:@db_name abort_dd_db: INSERT INTO act.driver VALUES (2);
+INSERT 0 1
+2:@db_name abort_dd_db: SELECT diskquota.wait_for_worker_new_epoch();
+ wait_for_worker_new_epoch 
+---------------------------
+ t                         
+(1 row)
+2:@db_name abort_dd_db: INSERT INTO act.driver VALUES (3);
+INSERT 0 1
+2:@db_name abort_dd_db: SELECT diskquota.wait_for_worker_new_epoch();
+ wait_for_worker_new_epoch 
+---------------------------
+ t                         
+(1 row)
+2:@db_name abort_dd_db: INSERT INTO act.driver VALUES (4);
+INSERT 0 1
+2:@db_name abort_dd_db: SELECT diskquota.wait_for_worker_new_epoch();
+ wait_for_worker_new_epoch 
+---------------------------
+ t                         
+(1 row)
+
+-- lift the fault and return to soft-limit only for a deterministic
+-- enforcement check
+SELECT gp_inject_fault('diskquota_dispatch_rejectmap', 'reset', dbid) FROM gp_segment_configuration WHERE role='p' AND content=-1;
+ gp_inject_fault 
+-----------------
+ Success:        
+(1 row)
+!\retcode gpconfig -c "diskquota.hard_limit" -v "off" > /dev/null;
+-- start_ignore
+
+-- end_ignore
+(exited with code 0)
+!\retcode gpstop -u > /dev/null;
+-- start_ignore
+
+-- end_ignore
+(exited with code 0)
+2:@db_name abort_dd_db: SELECT diskquota.wait_for_worker_new_epoch();
+ wait_for_worker_new_epoch 
+---------------------------
+ t                         
+(1 row)
+2:@db_name abort_dd_db: SELECT diskquota.wait_for_worker_new_epoch();
+ wait_for_worker_new_epoch 
+---------------------------
+ t                         
+(1 row)
+
+-- refill schema s well past its 1 MB quota (soft-limit lets the statement in
+-- because the schema is under quota when it starts)
+2:@db_name abort_dd_db: INSERT INTO s.probe SELECT generate_series(1, 500000);
+INSERT 0 500000
+2:@db_name abort_dd_db: SELECT diskquota.wait_for_worker_new_epoch();
+ wait_for_worker_new_epoch 
+---------------------------
+ t                         
+(1 row)
+2:@db_name abort_dd_db: SELECT diskquota.wait_for_worker_new_epoch();
+ wait_for_worker_new_epoch 
+---------------------------
+ t                         
+(1 row)
+
+-- schema s is truly over quota: the write must be rejected. Pre-fix the
+-- drifted-negative model total leaves it unrejected and this INSERT succeeds.
+2:@db_name abort_dd_db: INSERT INTO s.probe VALUES (2);
+ERROR:  schema's disk space quota exceeded with name: s
+
+-- cleanup
+2:@db_name abort_dd_db: DROP EXTENSION diskquota;
+DROP EXTENSION
+2q: ... <quitting>
+1: DROP DATABASE abort_dd_db;
+DROP DATABASE
+1q: ... <quitting>

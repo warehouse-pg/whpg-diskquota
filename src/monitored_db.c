@@ -156,6 +156,64 @@ diskquota_is_paused()
 	return paused;
 }
 
+/*
+ * One-probe variant for the per-write quota check: returns whether
+ * dbid is monitored, and fills *paused with its paused flag (false
+ * when not monitored).
+ */
+bool
+diskquota_db_monitored_and_paused(Oid dbid, bool *paused)
+{
+	bool           found;
+	MonitorDBEntry entry;
+
+	*paused = false;
+	LWLockAcquire(diskquota_locks.monitored_dbid_cache_lock, LW_SHARED);
+	entry = hash_search(monitored_dbid_cache, &dbid, HASH_FIND, &found);
+	if (found) *paused = entry->paused;
+	LWLockRelease(diskquota_locks.monitored_dbid_cache_lock);
+	return found;
+}
+
+/*
+ * True when dbid is a diskquota-monitored database, i.e. the
+ * extension is installed there and the launcher tracks it. The
+ * object-independent quotas cover monitored databases only: an
+ * unmonitored database is neither counted in the cluster total nor
+ * blocked by it (see warn_uncounted_databases()).
+ */
+bool
+diskquota_is_monitored_dbid(Oid dbid)
+{
+	bool found = false;
+
+	LWLockAcquire(diskquota_locks.monitored_dbid_cache_lock, LW_SHARED);
+	hash_search(monitored_dbid_cache, &dbid, HASH_FIND, &found);
+	LWLockRelease(diskquota_locks.monitored_dbid_cache_lock);
+	return found;
+}
+
+/*
+ * Worker status of a monitored database; false when dbid is not
+ * monitored. DB_RUNNING is the only status in which the database's
+ * worker refreshes and publishes its total size, so any other status
+ * means the cluster quota counts the database as 0.
+ */
+bool
+diskquota_monitored_db_status(Oid dbid, uint32 *status)
+{
+	bool found = false;
+
+	LWLockAcquire(diskquota_locks.monitored_dbid_cache_lock, LW_SHARED);
+	{
+		MonitorDBEntry entry = (MonitorDBEntry)hash_search(monitored_dbid_cache, &dbid, HASH_FIND, &found);
+
+		if (found) *status = pg_atomic_read_u32(&entry->status);
+	}
+	LWLockRelease(diskquota_locks.monitored_dbid_cache_lock);
+	return found;
+}
+
 bool
 diskquota_is_readiness_logged()
 {
@@ -246,16 +304,31 @@ update_monitor_db(Oid dbid, FetchTableStatType action)
 	// monitoring in hook functions
 
 	LWLockAcquire(diskquota_locks.monitored_dbid_cache_lock, LW_EXCLUSIVE);
-	if (action == ADD_DB_TO_MONITOR)
+	if (action == ADD_DB_TO_MONITOR || action == ADD_DB_TO_MONITOR_FRESH)
 	{
 		MonitorDBEntry entry = hash_search(monitored_dbid_cache, &dbid, HASH_ENTER_NULL, &found);
 		if (entry == NULL)
 		{
 			ereport(WARNING, (errmsg("can't alloc memory on dbid cache, there ary too many databases to monitor")));
 		}
-		entry->paused = false;
-		pg_atomic_init_u32(&(entry->epoch), 0);
-		pg_atomic_init_u32(&(entry->status), DB_INIT);
+		/*
+		 * Initialize only a newly created entry: the ADD is replayed --
+		 * at every launcher restart, and on the segments during every
+		 * refresh -- and resetting an existing entry would zero the
+		 * epoch under a waiting wait_for_worker_new_epoch() and clobber
+		 * the status the database's worker has already published.
+		 */
+		else if (!found)
+		{
+			entry->paused = false;
+			pg_atomic_init_u32(&(entry->epoch), 0);
+			pg_atomic_init_u32(&(entry->status), DB_INIT);
+		}
+		else if (action == ADD_DB_TO_MONITOR_FRESH)
+		{
+			/* create-or-reset: clear a stale paused left by a failed unmonitor */
+			entry->paused = false;
+		}
 	}
 	else if (action == REMOVE_DB_FROM_BEING_MONITORED)
 	{

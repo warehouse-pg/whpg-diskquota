@@ -85,6 +85,12 @@ set_target_properties(
              C_STANDARD 99
              LINKER_LANGUAGE "C")
 
+# 2.4 targets WHPG 7 only; WHPG 6 keeps shipping from the 2.3.x tags.
+if(${GP_MAJOR_VERSION} EQUAL 6)
+  message(FATAL_ERROR "diskquota ${DISKQUOTA_VERSION} requires WHPG 7; "
+          "build WHPG6 packages from the 2.3.x maintenance tags")
+endif()
+
 if (${GP_MAJOR_VERSION} STRGREATER_EQUAL "7")
   TARGET_LINK_LIBRARIES(diskquota ${PG_LIB_DIR}/libpq.so)
 endif()

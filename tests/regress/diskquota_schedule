@@ -15,7 +15,7 @@ test: test_quota_view_no_table
 # test: test_table_size
 test: test_fast_disk_check
 test: test_worker_not_ready
-#test: test_insert_after_drop
+test: test_insert_after_drop
 test: test_role test_schema test_drop_table test_column test_copy test_update test_toast test_truncate test_reschema test_temp_role test_rename test_delete_quota test_mistake test_tablespace_role test_tablespace_schema test_tablespace_role_perseg test_tablespace_schema_perseg test_index test_recreate
 test: test_ctas_no_preload_lib
 test: test_ctas_before_set_quota
@@ -39,8 +39,15 @@ test: test_ctas_tablespace_role
 test: test_ctas_tablespace_schema
 test: test_default_tablespace
 test: test_tablespace_diff_schema
-# test: test_worker_schedule
+test: test_worker_schedule
 # test: test_worker_schedule_exception
+test: test_cluster_database_quota
+test: test_launcher_restart
+test: test_cap_load_survives
+test: test_downgrade_guard
+test: test_flush_retry
+test: test_unmonitor_retry
+test: test_create_monitor_fail
 test: test_dbname_encoding
 test: test_drop_any_extension
 test: test_drop_extension
