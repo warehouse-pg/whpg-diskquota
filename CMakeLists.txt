@@ -70,6 +70,38 @@ file(GLOB diskquota_SRC "${SRC_DIR}/*.c")
 set(DISKQUOTA_DDL_DIR "${CMAKE_CURRENT_SOURCE_DIR}/control/ddl")
 file(GLOB diskquota_DDL "${DISKQUOTA_DDL_DIR}/*")
 
+# WHPG19 (PG19) dropped the composite-type -> "char" I/O cast that the released
+# relation_size() DDL relies on:
+#
+#   ERROR:  cannot cast type pg_class to "char"
+#
+# The cast is only reached on server lines *without* pg_class.relstorage, where
+# the bare `relstorage` inside the CASE resolves to the whole-row variable of
+# the `... as relstorage` alias instead of to a column. Going through text is
+# equivalent everywhere, but it cannot be applied to the tracked files:
+# upgrade_test/CMakeLists.txt diffs control/ddl against the last release tag, so
+# editing them in place both trips that gate and silently rewrites upgrade
+# scripts that have already shipped. Patch a copy in the build tree instead and
+# keep the tracked DDL byte-identical to the tag.
+if(${GP_MAJOR_VERSION} GREATER_EQUAL 8)
+  set(DISKQUOTA_DDL_BUILD_DIR "${CMAKE_BINARY_DIR}/ddl")
+  file(MAKE_DIRECTORY ${DISKQUOTA_DDL_BUILD_DIR})
+  set(diskquota_DDL_generated "")
+  foreach(ddl_file IN LISTS diskquota_DDL)
+    cmake_path(GET ddl_file FILENAME ddl_name)
+    set(ddl_generated "${DISKQUOTA_DDL_BUILD_DIR}/${ddl_name}")
+    file(READ ${ddl_file} ddl_contents)
+    string(REPLACE "THEN relstorage::\"char\"" "THEN relstorage::text::\"char\""
+           ddl_contents "${ddl_contents}")
+    file(WRITE ${ddl_generated} "${ddl_contents}")
+    list(APPEND diskquota_DDL_generated ${ddl_generated})
+    # Re-run configure when the source DDL changes, since the copies are
+    # generated at configure time.
+    set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS ${ddl_file})
+  endforeach()
+  set(diskquota_DDL ${diskquota_DDL_generated})
+endif()
+
 add_library(diskquota MODULE ${diskquota_SRC})
 
 if(CMAKE_INSTALL_PREFIX_INITIALIZED_TO_DEFAULT)

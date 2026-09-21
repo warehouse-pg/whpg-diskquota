@@ -102,13 +102,13 @@ CREATE FUNCTION diskquota.relation_size(relation regclass) RETURNS bigint STRICT
        SELECT SUM(size)::bigint FROM (
                SELECT diskquota.relation_size_local(reltablespace, relfilenode, relpersistence,
 		CASE WHEN EXISTS
-	(SELECT FROM pg_catalog.pg_attribute WHERE attrelid = 'pg_class'::regclass AND attname = 'relstorage') THEN relstorage::text::"char" ELSE ''::"char" END,
+	(SELECT FROM pg_catalog.pg_attribute WHERE attrelid = 'pg_class'::regclass AND attname = 'relstorage') THEN relstorage::"char" ELSE ''::"char" END,
 		relam) AS size
                FROM gp_dist_random('pg_class') as relstorage WHERE oid = relation
                UNION ALL
                SELECT diskquota.relation_size_local(reltablespace, relfilenode, relpersistence,
 		CASE WHEN EXISTS
-	(SELECT FROM pg_catalog.pg_attribute WHERE attrelid = 'pg_class'::regclass AND attname = 'relstorage') THEN relstorage::text::"char" ELSE ''::"char" END,
+	(SELECT FROM pg_catalog.pg_attribute WHERE attrelid = 'pg_class'::regclass AND attname = 'relstorage') THEN relstorage::"char" ELSE ''::"char" END,
 		relam) AS size
                FROM pg_class as relstorage WHERE oid = relation
        ) AS t $$ LANGUAGE SQL;

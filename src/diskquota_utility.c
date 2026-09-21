@@ -31,6 +31,7 @@
 #include "catalog/objectaccess.h"
 #include "catalog/pg_authid.h"
 #include "catalog/pg_collation.h"
+#include "catalog/pg_database.h" /* get_database_oid() moved here on WHPG19 */
 #include "catalog/pg_extension.h"
 #include "catalog/pg_namespace.h"
 #include "catalog/indexing.h"
