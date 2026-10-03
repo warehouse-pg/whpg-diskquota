@@ -182,12 +182,11 @@ typedef bits8 diskquota_bits8;
 
 #if GP_VERSION_NUM >= 190000
 /*
- * WHPG19's utils/relfilenodemap.h still declares RelidByRelfilenode(), but
- * the server binary no longer exports it - it was renamed to
- * RelidByRelfilenumber() in utils/relfilenumbermap.h. Linking against the
- * stale declaration succeeds (it's just an extern prototype); loading the
- * .so fails at runtime with "undefined symbol" since dlopen resolves it
- * against the running postgres binary's actual exported symbols.
+ * PG16 renamed RelidByRelfilenode() to RelidByRelfilenumber() in
+ * utils/relfilenumbermap.h. WHPG19 kept the old utils/relfilenodemap.h for a
+ * while (a stale extern prototype: linking succeeded, loading the .so failed
+ * with "undefined symbol") and dropped it on 2026-08-18 (WHPGN-1033), so
+ * relation_cache.c includes one header or the other by GP_VERSION_NUM.
  */
 #define DiskquotaRelidByRelfilenode(reltablespace, relfilenode) RelidByRelfilenumber(reltablespace, relfilenode)
 #else

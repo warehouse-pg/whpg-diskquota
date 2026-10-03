@@ -24,10 +24,11 @@
 #include "storage/backendid.h" /* TempRelBackendId/InvalidBackendId no longer transitively available on WHPG19 */
 #include "utils/rel.h"
 #include "utils/relcache.h"
-#include "utils/relfilenodemap.h"
 #if GP_VERSION_NUM >= 190000
-#include "utils/relfilenumbermap.h" /* RelidByRelfilenode() renamed RelidByRelfilenumber(), not exported anymore */
-#endif                              /* GP_VERSION_NUM >= 190000 */
+#include "utils/relfilenumbermap.h" /* RelidByRelfilenode() became RelidByRelfilenumber(); WHPG19 dropped relfilenodemap.h with it */
+#else
+#include "utils/relfilenodemap.h"
+#endif /* GP_VERSION_NUM >= 190000 */
 #include "utils/syscache.h"
 #include "utils/array.h"
 #include "utils/inval.h"
