@@ -17,7 +17,7 @@ SHOW diskquota.max_active_tables;
 SHOW diskquota.worker_timeout;
  diskquota.worker_timeout 
 --------------------------
- 60
+ 180
 (1 row)
 
 SHOW diskquota.hard_limit;
