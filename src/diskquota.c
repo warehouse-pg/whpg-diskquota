@@ -32,6 +32,7 @@
 #include "port/atomics.h"
 #include "storage/ipc.h"
 #include "storage/proc.h"
+#include "storage/procsignal.h" /* procsignal_sigusr1_handler() */
 #include "storage/sinval.h"
 #include "tcop/utility.h"
 #include "utils/builtins.h"
@@ -43,6 +44,7 @@
 #include "utils/syscache.h"
 #include "utils/timestamp.h"
 #include "utils/formatting.h"
+#include "utils/lsyscache.h" /* get_database_name() moved here on WHPG19 */
 #include "tcop/pquery.h"
 
 PG_MODULE_MAGIC;
@@ -372,7 +374,18 @@ disk_quota_sigusr1(SIGNAL_ARGS)
 
 	got_sigusr1 = true;
 
-	if (MyProc) SetLatch(&MyProc->procLatch);
+	/*
+	 * SIGUSR1 is also the carrier for the core ProcSignal mechanism, so we must
+	 * chain to the core handler instead of swallowing the signal. Otherwise
+	 * ProcSignalBarrierPending is never set and ProcessProcSignalBarrier() never
+	 * runs, which makes any backend calling WaitForProcSignalBarrier() wait
+	 * forever -- on PG15+ that includes DROP DATABASE, DROP TABLESPACE and
+	 * ALTER DATABASE ... SET TABLESPACE.
+	 *
+	 * procsignal_sigusr1_handler() sets MyLatch itself, so no explicit SetLatch
+	 * is needed here.
+	 */
+	procsignal_sigusr1_handler(DISKQUOTA_FORWARD_SIGNAL_ARGS);
 
 	errno = save_errno;
 }
@@ -552,12 +565,11 @@ disk_quota_worker_main(Datum main_arg)
 			            _errmsg[sizeof(_errfmt) + sizeof("2147483647" /* INT_MAX */) + 1] = {};
 			snprintf(_errmsg, sizeof(_errmsg), _errfmt, times * diskquota_naptime);
 
-			init_ps_display("bgworker:", "[diskquota]", dbname, _errmsg);
+			DiskquotaInitPsDisplay(dbname, _errmsg);
 		}
 		else
 		{
-			init_ps_display("bgworker:", "[diskquota]", dbname,
-			                "v" DISKQUOTA_VERSION " is not matching with current SQL. stop working");
+			DiskquotaInitPsDisplay(dbname, "v" DISKQUOTA_VERSION " is not matching with current SQL. stop working");
 		}
 
 		ereportif(!has_error && times == 0, WARNING,
@@ -585,7 +597,7 @@ disk_quota_worker_main(Datum main_arg)
 	 * function `init_ps_display`, we only want the ps name looks like
 	 * 'bgworker: [diskquota] <dbname> ...'
 	 */
-	init_ps_display("bgworker:", "[diskquota]", dbname, "");
+	DiskquotaInitPsDisplay(dbname, "");
 
 	/* suppose the database is ready, if not, then set it to false */
 	bool is_ready = true;
@@ -1190,12 +1202,20 @@ init_database_list(void)
 		                     tupdesc->natts != 1 ? tupdesc->natts : tupdesc->attrs[0]->atttypid)));
 		ereport(ERROR, (errmsg("[diskquota launcher] table database_list corrupt, launcher will exit. natts: ")));
 	}
-#else
+#elif GP_VERSION_NUM < 190000
 
 	if (tupdesc->natts != 1 || tupdesc->attrs[0].atttypid != OIDOID)
 	{
 		ereport(LOG, (errmsg("[diskquota launcher], natts/atttypid: %d.",
 		                     tupdesc->natts != 1 ? tupdesc->natts : tupdesc->attrs[0].atttypid)));
+		ereport(ERROR, (errmsg("[diskquota launcher] table database_list corrupt, launcher will exit. natts: ")));
+	}
+#else
+	/* WHPG19 dropped the GP-specific TupleDescData->attrs[] compat member; use the portable accessor. */
+	if (tupdesc->natts != 1 || TupleDescAttr(tupdesc, 0)->atttypid != OIDOID)
+	{
+		ereport(LOG, (errmsg("[diskquota launcher], natts/atttypid: %d.",
+		                     tupdesc->natts != 1 ? tupdesc->natts : TupleDescAttr(tupdesc, 0)->atttypid)));
 		ereport(ERROR, (errmsg("[diskquota launcher] table database_list corrupt, launcher will exit. natts: ")));
 	}
 #endif /* GP_VERSION_NUM */
@@ -2158,9 +2178,10 @@ add_db_entry(Oid dbid, bool *is_new)
 		 */
 		pg_atomic_write_u64(&hole->total_size, 0);
 		pg_atomic_write_u64(&hole->db_quota_limit_mb, 0);
-		hole->rejectmap_retry      = false;
-		hole->rejectmap_retry_full = false;
-		hole->inited               = false;
+		hole->rejectmap_retry            = false;
+		hole->rejectmap_retry_full       = false;
+		hole->table_size_map_full_warned = false;
+		hole->inited                     = false;
 		hole->generation++;
 		hole->dbid          = dbid;
 		hole->lifecycle     = DB_SLOT_ACTIVE;
@@ -2438,11 +2459,12 @@ reap_draining_db_entries(void)
 			vacuum_disk_quota_model(db->id);
 			pg_atomic_write_u64(&db->total_size, 0);
 			pg_atomic_write_u64(&db->db_quota_limit_mb, 0);
-			db->rejectmap_retry      = false;
-			db->rejectmap_retry_full = false;
-			db->inited               = false;
-			db->next_run_time        = GetCurrentTimestamp();
-			db->lifecycle            = DB_SLOT_ACTIVE;
+			db->rejectmap_retry            = false;
+			db->rejectmap_retry_full       = false;
+			db->table_size_map_full_warned = false;
+			db->inited                     = false;
+			db->next_run_time              = GetCurrentTimestamp();
+			db->lifecycle                  = DB_SLOT_ACTIVE;
 		}
 		else
 		{
@@ -2546,11 +2568,12 @@ static void
 vacuum_db_entry(DiskquotaDBEntry *db)
 {
 	if (db == NULL) return;
-	db->dbid      = InvalidOid;
-	db->inited    = false;
-	db->workerId  = INVALID_WORKER_ID;
-	db->in_use    = false;
-	db->lifecycle = DB_SLOT_ACTIVE;
+	db->dbid                       = InvalidOid;
+	db->inited                     = false;
+	db->table_size_map_full_warned = false;
+	db->workerId                   = INVALID_WORKER_ID;
+	db->in_use                     = false;
+	db->lifecycle                  = DB_SLOT_ACTIVE;
 }
 
 static void
@@ -3040,6 +3063,30 @@ diskquota_publish_db_total(int64 total)
 	LWLockAcquire(diskquota_locks.dblist_lock, LW_SHARED);
 	if (dbentry_binding_current(dbEntry)) pg_atomic_write_u64(&dbEntry->total_size, (total > 0) ? (uint64)total : 0);
 	LWLockRelease(diskquota_locks.dblist_lock);
+}
+
+/*
+ * Record that the calling worker found its database's table_size_map full.
+ * Returns true the first time this is reported for the current slot binding,
+ * so the caller logs the condition once per database rather than once per
+ * worker process (see DiskquotaDBEntry.table_size_map_full_warned). Same
+ * slot-binding rule as diskquota_publish_db_total().
+ */
+bool
+diskquota_worker_note_table_size_map_full(void)
+{
+	DiskquotaDBEntry *dbEntry = (MyWorkerInfo != NULL) ? MyWorkerInfo->dbEntry : NULL;
+	bool              first   = false;
+
+	if (dbEntry == NULL) return false;
+	LWLockAcquire(diskquota_locks.dblist_lock, LW_SHARED);
+	if (dbentry_binding_current(dbEntry) && !dbEntry->table_size_map_full_warned)
+	{
+		dbEntry->table_size_map_full_warned = true;
+		first                               = true;
+	}
+	LWLockRelease(diskquota_locks.dblist_lock);
+	return first;
 }
 
 /*

@@ -1,12 +1,15 @@
 #include "diskquota.h"
 #include "postgres.h"
 
+#include "access/htup_details.h" /* heap_form_tuple() no longer transitively available on WHPG19 */
 #include "funcapi.h"
 #include "pgstat.h"
 #include "port/atomics.h"
 #include "commands/dbcommands.h"
+#include "catalog/pg_type_d.h" /* OIDOID/TEXTOID/INT8OID/BOOLOID no longer transitively available on WHPG19 */
 #include "storage/proc.h"
 #include "utils/builtins.h"
+#include "utils/lsyscache.h" /* get_database_name() moved here on WHPG19 */
 
 PG_FUNCTION_INFO_V1(show_worker_epoch);
 PG_FUNCTION_INFO_V1(db_status);

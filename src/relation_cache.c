@@ -11,6 +11,7 @@
  */
 #include "postgres.h"
 
+#include "access/htup_details.h" /* heap_freetuple() no longer transitively available on WHPG19 */
 #if GP_VERSION_NUM >= 70000
 #include "access/relation.h"
 #endif /* GP_VERSION_NUM */
@@ -19,9 +20,15 @@
 #include "catalog/pg_namespace.h"
 #include "catalog/pg_tablespace.h"
 #include "catalog/objectaccess.h"
+#include "miscadmin.h"         /* MyDatabaseId/MyDatabaseTableSpace no longer transitively available on WHPG19 */
+#include "storage/backendid.h" /* TempRelBackendId/InvalidBackendId no longer transitively available on WHPG19 */
 #include "utils/rel.h"
 #include "utils/relcache.h"
+#if GP_VERSION_NUM >= 190000
+#include "utils/relfilenumbermap.h" /* RelidByRelfilenode() became RelidByRelfilenumber(); WHPG19 dropped relfilenodemap.h with it */
+#else
 #include "utils/relfilenodemap.h"
+#endif /* GP_VERSION_NUM >= 190000 */
 #include "utils/syscache.h"
 #include "utils/array.h"
 #include "utils/inval.h"
@@ -60,14 +67,14 @@ get_relid_by_relfilenode(RelFileNode relfilenode)
 {
 	Oid relid;
 
-	relid = RelidByRelfilenode(relfilenode.spcNode, relfilenode.relNode);
+	relid = DiskquotaRelidByRelfilenode(DQ_RFN_SPC(relfilenode), DQ_RFN_REL(relfilenode));
 	if (OidIsValid(relid))
 	{
-		remove_cache_entry(InvalidOid, relfilenode.relNode);
+		remove_cache_entry(InvalidOid, DQ_RFN_REL(relfilenode));
 		return relid;
 	}
 
-	relid = get_uncommitted_table_relid(relfilenode.relNode);
+	relid = get_uncommitted_table_relid(DQ_RFN_REL(relfilenode));
 	return relid;
 }
 
@@ -83,7 +90,7 @@ remove_cache_entry(Oid relid, Oid relfilenode)
 		relation_entry = hash_search(relation_cache, &relid, HASH_FIND, NULL);
 		if (relation_entry)
 		{
-			hash_search(relid_cache, &relation_entry->rnode.node.relNode, HASH_REMOVE, NULL);
+			hash_search(relid_cache, &DQ_RFN_REL(DQ_RFNB_NODE(relation_entry->rnode)), HASH_REMOVE, NULL);
 			hash_search(relation_cache, &relid, HASH_REMOVE, NULL);
 		}
 	}
@@ -145,18 +152,18 @@ update_relation_entry(Oid relid, DiskQuotaRelationCacheEntry *relation_entry, Di
 
 	if (relation_entry)
 	{
-		relation_entry->relid         = relid;
-		relation_entry->rnode.node    = rel->rd_node;
-		relation_entry->rnode.backend = rel->rd_backend;
-		relation_entry->owneroid      = rel->rd_rel->relowner;
-		relation_entry->namespaceoid  = rel->rd_rel->relnamespace;
-		relation_entry->relstorage    = DiskquotaGetRelstorage(rel->rd_rel);
-		relation_entry->relam         = rel->rd_rel->relam;
+		relation_entry->relid               = relid;
+		DQ_RFNB_NODE(relation_entry->rnode) = DQ_REL_NODE(rel);
+		relation_entry->rnode.backend       = rel->rd_backend;
+		relation_entry->owneroid            = rel->rd_rel->relowner;
+		relation_entry->namespaceoid        = rel->rd_rel->relnamespace;
+		relation_entry->relstorage          = DiskquotaGetRelstorage(rel->rd_rel);
+		relation_entry->relam               = rel->rd_rel->relam;
 	}
 
 	if (relid_entry)
 	{
-		relid_entry->relfilenode = rel->rd_node.relNode;
+		relid_entry->relfilenode = DQ_RFN_REL(DQ_REL_NODE(rel));
 		relid_entry->relid       = relid;
 	}
 
@@ -285,7 +292,7 @@ remove_committed_relation_from_cache(void)
 	while ((entry = hash_seq_search(&iter)) != NULL)
 	{
 		/* The session of db1 should not see the table inside db2. */
-		if (entry->rnode.node.dbNode != MyDatabaseId) continue;
+		if (DQ_RFN_DB(DQ_RFNB_NODE(entry->rnode)) != MyDatabaseId) continue;
 		local_entry = hash_search(local_relation_cache, &entry->relid, HASH_ENTER, NULL);
 		memcpy(local_entry, entry, sizeof(DiskQuotaRelationCacheEntry));
 	}
@@ -300,9 +307,10 @@ remove_committed_relation_from_cache(void)
 		 * remains in relation_cache, the outdated relation_cache_entry should
 		 * be removed.
 		 */
-		if (OidIsValid(RelidByRelfilenode(local_entry->rnode.node.spcNode, local_entry->rnode.node.relNode)))
+		if (OidIsValid(DiskquotaRelidByRelfilenode(DQ_RFN_SPC(DQ_RFNB_NODE(local_entry->rnode)),
+		                                           DQ_RFN_REL(DQ_RFNB_NODE(local_entry->rnode)))))
 		{
-			remove_cache_entry(InvalidOid, local_entry->rnode.node.relNode);
+			remove_cache_entry(InvalidOid, DQ_RFN_REL(DQ_RFNB_NODE(local_entry->rnode)));
 		}
 	}
 	hash_destroy(local_relation_cache);
@@ -364,7 +372,7 @@ show_relation_cache(PG_FUNCTION_ARGS)
 		while ((entry = (DiskQuotaRelationCacheEntry *)hash_seq_search(&hash_seq)) != NULL)
 		{
 			/* The session of db1 should not see the table inside db2. */
-			if (entry->rnode.node.dbNode != MyDatabaseId) continue;
+			if (DQ_RFN_DB(DQ_RFNB_NODE(entry->rnode)) != MyDatabaseId) continue;
 			DiskQuotaRelationCacheEntry *local_entry =
 			        hash_search(relation_cache_ctx->relation_cache, &entry->relid, HASH_ENTER_NULL, NULL);
 			if (local_entry)
@@ -405,9 +413,9 @@ show_relation_cache(PG_FUNCTION_ARGS)
 		values[3]  = ObjectIdGetDatum(entry->owneroid);
 		values[4]  = ObjectIdGetDatum(entry->namespaceoid);
 		values[5]  = Int32GetDatum(entry->rnode.backend);
-		values[6]  = ObjectIdGetDatum(entry->rnode.node.spcNode);
-		values[7]  = ObjectIdGetDatum(entry->rnode.node.dbNode);
-		values[8]  = ObjectIdGetDatum(entry->rnode.node.relNode);
+		values[6]  = ObjectIdGetDatum(DQ_RFN_SPC(DQ_RFNB_NODE(entry->rnode)));
+		values[7]  = ObjectIdGetDatum(DQ_RFN_DB(DQ_RFNB_NODE(entry->rnode)));
+		values[8]  = ObjectIdGetDatum(DQ_RFN_REL(DQ_RFNB_NODE(entry->rnode)));
 		values[9]  = CharGetDatum(entry->relstorage);
 		values[10] = PointerGetDatum(array);
 		values[11] = ObjectIdGetDatum(entry->relam);
@@ -476,10 +484,10 @@ get_relation_entry_from_pg_class(Oid relid, DiskQuotaRelationCacheEntry *relatio
 	relation_entry->namespaceoid        = classForm->relnamespace;
 	relation_entry->relstorage          = DiskquotaGetRelstorage(classForm);
 	relation_entry->relam               = classForm->relam;
-	relation_entry->rnode.node.spcNode =
+	DQ_RFN_SPC(DQ_RFNB_NODE(relation_entry->rnode)) =
 	        OidIsValid(classForm->reltablespace) ? classForm->reltablespace : MyDatabaseTableSpace;
-	relation_entry->rnode.node.dbNode  = MyDatabaseId;
-	relation_entry->rnode.node.relNode = classForm->relfilenode;
+	DQ_RFN_DB(DQ_RFNB_NODE(relation_entry->rnode))  = MyDatabaseId;
+	DQ_RFN_REL(DQ_RFNB_NODE(relation_entry->rnode)) = classForm->relfilenode;
 	relation_entry->rnode.backend =
 	        classForm->relpersistence == RELPERSISTENCE_TEMP ? TempRelBackendId : InvalidBackendId;
 
@@ -574,13 +582,14 @@ get_relfilenode_by_relid(Oid relid, RelFileNodeBackend *rnode, char *relstorage,
 	classTup = SearchSysCacheCopy1(RELOID, ObjectIdGetDatum(relid));
 	if (HeapTupleIsValid(classTup))
 	{
-		classForm           = (Form_pg_class)GETSTRUCT(classTup);
-		rnode->node.spcNode = OidIsValid(classForm->reltablespace) ? classForm->reltablespace : MyDatabaseTableSpace;
-		rnode->node.dbNode  = MyDatabaseId;
-		rnode->node.relNode = classForm->relfilenode;
-		rnode->backend      = classForm->relpersistence == RELPERSISTENCE_TEMP ? TempRelBackendId : InvalidBackendId;
-		*relstorage         = DiskquotaGetRelstorage(classForm);
-		*relam              = classForm->relam;
+		classForm = (Form_pg_class)GETSTRUCT(classTup);
+		DQ_RFN_SPC(DQ_RFNB_NODE(*rnode)) =
+		        OidIsValid(classForm->reltablespace) ? classForm->reltablespace : MyDatabaseTableSpace;
+		DQ_RFN_DB(DQ_RFNB_NODE(*rnode))  = MyDatabaseId;
+		DQ_RFN_REL(DQ_RFNB_NODE(*rnode)) = classForm->relfilenode;
+		rnode->backend = classForm->relpersistence == RELPERSISTENCE_TEMP ? TempRelBackendId : InvalidBackendId;
+		*relstorage    = DiskquotaGetRelstorage(classForm);
+		*relam         = classForm->relam;
 		heap_freetuple(classTup);
 		remove_cache_entry(relid, InvalidOid);
 		return;

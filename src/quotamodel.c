@@ -427,6 +427,26 @@ clean_all_quota_limit(void)
 	}
 }
 
+#if PG_VERSION_NUM >= 150000
+static shmem_request_hook_type prev_shmem_request_hook = NULL;
+
+/*
+ * PG15 forbids calling RequestAddinShmemSpace()/RequestNamedLWLockTranche()
+ * outside of a shmem_request_hook (previously they were called directly
+ * from _PG_init(), which now errors with "cannot request additional shared
+ * memory outside shmem_request_hook"). Move the requests here and chain any
+ * previously-installed hook, same pattern as shmem_startup_hook below.
+ */
+static void
+disk_quota_shmem_request(void)
+{
+	if (prev_shmem_request_hook) (*prev_shmem_request_hook)();
+
+	RequestAddinShmemSpace(DiskQuotaShmemSize());
+	RequestNamedLWLockTranche("DiskquotaLocks", DiskQuotaLocksItemNumber);
+}
+#endif /* PG_VERSION_NUM >= 150000 */
+
 /* ---- Functions for disk quota shared memory ---- */
 /*
  * DiskQuotaShmemInit
@@ -436,6 +456,10 @@ clean_all_quota_limit(void)
 void
 init_disk_quota_shmem(void)
 {
+#if PG_VERSION_NUM >= 150000
+	prev_shmem_request_hook = shmem_request_hook;
+	shmem_request_hook      = disk_quota_shmem_request;
+#else
 	/*
 	 * Request additional shared resources.  (These are no-ops if we're not in
 	 * the postmaster process.)  We'll allocate or attach to the shared
@@ -448,6 +472,7 @@ init_disk_quota_shmem(void)
 #else
 	RequestNamedLWLockTranche("DiskquotaLocks", DiskQuotaLocksItemNumber);
 #endif /* GP_VERSION_NUM */
+#endif /* PG_VERSION_NUM >= 150000 */
 
 	/* Install startup hook to initialize our shared memory. */
 	prev_shmem_startup_hook = shmem_startup_hook;
@@ -548,8 +573,7 @@ static Size
 diskquota_worker_shmem_size()
 {
 	Size size;
-	size = hash_estimate_size(MAX_NUM_TABLE_SIZE_ENTRIES / diskquota_max_monitored_databases + 100,
-	                          sizeof(TableSizeEntry));
+	size = hash_estimate_size(MAX_NUM_TABLE_SIZE_ENTRIES_PER_DB, sizeof(TableSizeEntry));
 	size = add_size(size, hash_estimate_size(MAX_LOCAL_DISK_QUOTA_REJECT_ENTRIES, sizeof(LocalRejectMapEntry)));
 	return size;
 }
@@ -599,8 +623,8 @@ init_disk_quota_model(uint32 id)
 	memset(&hash_ctl, 0, sizeof(hash_ctl));
 	hash_ctl.keysize   = sizeof(TableSizeEntryKey);
 	hash_ctl.entrysize = sizeof(TableSizeEntry);
-	table_size_map     = DiskquotaShmemInitHash(str.data, INIT_NUM_TABLE_SIZE_ENTRIES, MAX_NUM_TABLE_SIZE_ENTRIES,
-	                                            &hash_ctl, HASH_ELEM, DISKQUOTA_TAG_HASH);
+	table_size_map = DiskquotaShmemInitHash(str.data, INIT_NUM_TABLE_SIZE_ENTRIES, MAX_NUM_TABLE_SIZE_ENTRIES_PER_DB,
+	                                        &hash_ctl, HASH_ELEM, DISKQUOTA_TAG_HASH);
 
 	/* for localrejectmap */
 	/* WARNNING: The max length of name of the map is 48 */
@@ -652,8 +676,8 @@ vacuum_disk_quota_model(uint32 id)
 	memset(&hash_ctl, 0, sizeof(hash_ctl));
 	hash_ctl.keysize   = sizeof(TableSizeEntryKey);
 	hash_ctl.entrysize = sizeof(TableSizeEntry);
-	table_size_map     = DiskquotaShmemInitHash(str.data, INIT_NUM_TABLE_SIZE_ENTRIES, MAX_NUM_TABLE_SIZE_ENTRIES,
-	                                            &hash_ctl, HASH_ELEM, DISKQUOTA_TAG_HASH);
+	table_size_map = DiskquotaShmemInitHash(str.data, INIT_NUM_TABLE_SIZE_ENTRIES, MAX_NUM_TABLE_SIZE_ENTRIES_PER_DB,
+	                                        &hash_ctl, HASH_ELEM, DISKQUOTA_TAG_HASH);
 	hash_seq_init(&iter, table_size_map);
 	while ((tsentry = hash_seq_search(&iter)) != NULL)
 	{
@@ -765,8 +789,11 @@ do_check_diskquota_state_is_ready(void)
 	tupdesc = SPI_tuptable->tupdesc;
 #if GP_VERSION_NUM < 70000
 	if (SPI_processed != 1 || tupdesc->natts != 1 || ((tupdesc)->attrs[0])->atttypid != INT4OID)
-#else
+#elif GP_VERSION_NUM < 190000
 	if (SPI_processed != 1 || tupdesc->natts != 1 || ((tupdesc)->attrs[0]).atttypid != INT4OID)
+#else
+	/* WHPG19 dropped the GP-specific TupleDescData->attrs[] compat member; use the portable accessor. */
+	if (SPI_processed != 1 || tupdesc->natts != 1 || TupleDescAttr(tupdesc, 0)->atttypid != INT4OID)
 #endif /* GP_VERSION_NUM */
 	{
 		ereport(ERROR, (errcode(ERRCODE_INTERNAL_ERROR),
@@ -995,7 +1022,7 @@ merge_uncommitted_table_to_oidlist(List *oidlist)
 	while ((entry = hash_seq_search(&iter)) != NULL)
 	{
 		/* The session of db1 should not see the table inside db2. */
-		if (entry->primary_table_relid == entry->relid && entry->rnode.node.dbNode == MyDatabaseId)
+		if (entry->primary_table_relid == entry->relid && DQ_RFN_DB(DQ_RFNB_NODE(entry->rnode)) == MyDatabaseId)
 		{
 			oidlist = lappend_oid(oidlist, entry->relid);
 		}
@@ -1104,7 +1131,7 @@ calculate_table_disk_usage(bool is_init, HTAB *local_active_table_stat_map)
 			}
 			relnamespace  = relation_entry->namespaceoid;
 			relowner      = relation_entry->owneroid;
-			reltablespace = relation_entry->rnode.node.spcNode;
+			reltablespace = DQ_RFN_SPC(DQ_RFNB_NODE(relation_entry->rnode));
 			LWLockRelease(diskquota_locks.relation_cache_lock);
 		}
 
@@ -1132,7 +1159,33 @@ calculate_table_disk_usage(bool is_init, HTAB *local_active_table_stat_map)
 			}
 			else
 			{
-				tsentry = (TableSizeEntry *)hash_search(table_size_map, &key, HASH_ENTER, &table_size_map_found);
+				tsentry = (TableSizeEntry *)hash_search(table_size_map, &key, HASH_ENTER_NULL, &table_size_map_found);
+
+				/*
+				 * This database's table_size_map lives in a fixed-size slice of
+				 * shared memory (its share of diskquota.max_table_segments, see
+				 * MAX_NUM_TABLE_SIZE_ENTRIES_PER_DB) and it is full. HASH_ENTER
+				 * would raise "out of shared memory" here, on every refresh
+				 * cycle for as long as the tables exist: each cycle aborts, so
+				 * none of this database's quotas is refreshed any more. Leave
+				 * the overflowing tables untracked instead, the same way the
+				 * cluster-wide limit above does, and keep serving the tables
+				 * that are tracked.
+				 */
+				if (tsentry == NULL)
+				{
+					if (diskquota_worker_note_table_size_map_full())
+					{
+						ereport(WARNING,
+						        (errmsg("[diskquota] the table size map of database \"%s\" is full, tables beyond it "
+						                "are not tracked",
+						                get_database_name(MyDatabaseId)),
+						         errhint("Increase diskquota.max_table_segments or decrease "
+						                 "diskquota.max_monitored_databases: a database can track at most %d tables.",
+						                 (int)MAX_NUM_TABLE_SIZE_ENTRIES_PER_DB)));
+					}
+					break;
+				}
 
 				if (!table_size_map_found)
 				{
@@ -1841,9 +1894,13 @@ do_load_quotas(void)
 #if GP_VERSION_NUM < 70000
 	if (tupdesc->natts != NUM_QUOTA_CONFIG_ATTRS || ((tupdesc)->attrs[0])->atttypid != OIDOID ||
 	    ((tupdesc)->attrs[1])->atttypid != INT4OID || ((tupdesc)->attrs[2])->atttypid != INT8OID)
-#else
+#elif GP_VERSION_NUM < 190000
 	if (tupdesc->natts != NUM_QUOTA_CONFIG_ATTRS || ((tupdesc)->attrs[0]).atttypid != OIDOID ||
 	    ((tupdesc)->attrs[1]).atttypid != INT4OID || ((tupdesc)->attrs[2]).atttypid != INT8OID)
+#else
+	/* WHPG19 dropped the GP-specific TupleDescData->attrs[] compat member; use the portable accessor. */
+	if (tupdesc->natts != NUM_QUOTA_CONFIG_ATTRS || TupleDescAttr(tupdesc, 0)->atttypid != OIDOID ||
+	    TupleDescAttr(tupdesc, 1)->atttypid != INT4OID || TupleDescAttr(tupdesc, 2)->atttypid != INT8OID)
 #endif /* GP_VERSION_NUM */
 	{
 		ereport(ERROR, (errcode(ERRCODE_INTERNAL_ERROR),
@@ -2265,7 +2322,7 @@ invalidate_database_rejectmap(Oid dbid)
 	hash_seq_init(&iter, disk_quota_reject_map);
 	while ((entry = hash_seq_search(&iter)) != NULL)
 	{
-		if (entry->databaseoid == dbid || entry->relfilenode.dbNode == dbid)
+		if (entry->databaseoid == dbid || DQ_RFN_DB(entry->relfilenode) == dbid)
 		{
 			hash_search(disk_quota_reject_map, entry, HASH_REMOVE, NULL);
 		}
@@ -2554,9 +2611,8 @@ refresh_rejectmap(PG_FUNCTION_ARGS)
 							Form_pg_class curr_form = (Form_pg_class)GETSTRUCT(curr_tuple);
 							Oid curr_reltablespace  = OidIsValid(curr_form->reltablespace) ? curr_form->reltablespace
 							                                                               : MyDatabaseTableSpace;
-							RelFileNode           relfilenode = {.dbNode  = MyDatabaseId,
-							                                     .relNode = curr_form->relfilenode,
-							                                     .spcNode = curr_reltablespace};
+							RelFileNode relfilenode =
+							        DQ_RFN_MAKE(curr_reltablespace, MyDatabaseId, curr_form->relfilenode);
 							bool                  found;
 							GlobalRejectMapEntry *blocked_filenode_entry;
 							RejectMapEntry        blocked_filenode_keyitem;
@@ -2596,10 +2652,10 @@ refresh_rejectmap(PG_FUNCTION_ARGS)
 			LWLockAcquire(diskquota_locks.relation_cache_lock, LW_SHARED);
 			relation_cache_entry = hash_search(relation_cache, &active_oid, HASH_FIND, &found);
 			/* The session of db1 should not see the table inside db2. */
-			if (found && relation_cache_entry && relation_cache_entry->rnode.node.dbNode == MyDatabaseId)
+			if (found && relation_cache_entry && DQ_RFN_DB(DQ_RFNB_NODE(relation_cache_entry->rnode)) == MyDatabaseId)
 			{
 				Oid            relnamespace  = relation_cache_entry->namespaceoid;
-				Oid            reltablespace = relation_cache_entry->rnode.node.spcNode;
+				Oid            reltablespace = DQ_RFN_SPC(DQ_RFNB_NODE(relation_cache_entry->rnode));
 				Oid            relowner      = relation_cache_entry->owneroid;
 				RejectMapEntry keyitem;
 				for (QuotaType type = 0; type < NUM_QUOTA_TYPES; ++type)
@@ -2631,8 +2687,8 @@ refresh_rejectmap(PG_FUNCTION_ARGS)
 							if (found && relation_cache_entry)
 							{
 								memset(&blocked_filenode_keyitem, 0, sizeof(RejectMapEntry));
-								memcpy(&blocked_filenode_keyitem.relfilenode, &relation_cache_entry->rnode.node,
-								       sizeof(RelFileNode));
+								memcpy(&blocked_filenode_keyitem.relfilenode,
+								       &DQ_RFNB_NODE(relation_cache_entry->rnode), sizeof(RelFileNode));
 
 								blocked_filenode_entry = hash_search(local_rejectmap, &blocked_filenode_keyitem,
 								                                     HASH_ENTER_NULL, &found);
@@ -2656,7 +2712,7 @@ refresh_rejectmap(PG_FUNCTION_ARGS)
 	hash_seq_init(&hash_seq, disk_quota_reject_map);
 	while ((rejectmapentry = hash_seq_search(&hash_seq)) != NULL)
 	{
-		if (rejectmapentry->keyitem.relfilenode.dbNode != MyDatabaseId &&
+		if (DQ_RFN_DB(rejectmapentry->keyitem.relfilenode) != MyDatabaseId &&
 		    rejectmapentry->keyitem.databaseoid != MyDatabaseId)
 			continue;
 		hash_search(disk_quota_reject_map, &rejectmapentry->keyitem, HASH_REMOVE, NULL);
@@ -2676,7 +2732,7 @@ refresh_rejectmap(PG_FUNCTION_ARGS)
 		 * filtering by targetoid would let them leak into the segment maps, where QE-side permission checks
 		 * build the same key and can reject writes past the coordinator's control.
 		 */
-		if (!OidIsValid(rejectmapentry->keyitem.relfilenode.relNode)) continue;
+		if (!OidIsValid(DQ_RFN_REL(rejectmapentry->keyitem.relfilenode))) continue;
 
 		new_entry = hash_search(disk_quota_reject_map, &rejectmapentry->keyitem, HASH_ENTER_NULL, &found);
 		if (!found && new_entry) memcpy(new_entry, rejectmapentry, sizeof(GlobalRejectMapEntry));
@@ -2779,7 +2835,7 @@ show_rejectmap(PG_FUNCTION_ARGS)
 		 * If the rejectmap entry is indexed by relfilenode, we dump the blocking
 		 * condition from auxblockinfo.
 		 */
-		if (!OidIsValid(blocked_relfilenode.relNode))
+		if (!OidIsValid(DQ_RFN_REL(blocked_relfilenode)))
 			memcpy(&keyitem, &rejectmap_entry->keyitem, sizeof(keyitem));
 		else
 			memcpy(&keyitem, &rejectmap_entry->auxblockinfo, sizeof(keyitem));
@@ -2815,9 +2871,9 @@ show_rejectmap(PG_FUNCTION_ARGS)
 		values[2] = ObjectIdGetDatum(keyitem.databaseoid);
 		values[3] = ObjectIdGetDatum(keyitem.tablespaceoid);
 		values[4] = BoolGetDatum(rejectmap_entry->segexceeded);
-		values[5] = ObjectIdGetDatum(blocked_relfilenode.dbNode);
-		values[6] = ObjectIdGetDatum(blocked_relfilenode.spcNode);
-		values[7] = ObjectIdGetDatum(blocked_relfilenode.relNode);
+		values[5] = ObjectIdGetDatum(DQ_RFN_DB(blocked_relfilenode));
+		values[6] = ObjectIdGetDatum(DQ_RFN_SPC(blocked_relfilenode));
+		values[7] = ObjectIdGetDatum(DQ_RFN_REL(blocked_relfilenode));
 		values[8] = Int32GetDatum(GpIdentity.segindex);
 
 		memset(nulls, false, sizeof(nulls));

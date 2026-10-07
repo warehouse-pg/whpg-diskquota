@@ -19,7 +19,13 @@ SELECT gp_inject_fault('diskquota_launcher_main', 'error', dbid)
 -- the restarted launcher survived the cap-load error: it answers a round
 -- trip. set_cluster_quota needs the launcher's main loop to process the
 -- message, so a crash-looping launcher would make this time out.
+-- (silence the unmonitored-databases warning: whether it fires depends on
+-- which other databases happen to exist in the cluster, so leaving it
+-- visible makes this test fail on any cluster that has unrelated ones;
+-- test_cluster_database_quota covers that warning deterministically)
+SET client_min_messages = error;
 SELECT diskquota.set_cluster_quota('10 MB');
+RESET client_min_messages;
 SELECT diskquota.set_cluster_quota('-1');
 
 -- stop failing the cap load and remove the spent restart fault

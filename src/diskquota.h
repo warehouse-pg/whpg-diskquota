@@ -21,14 +21,61 @@
 #include "lib/ilist.h"
 #include "lib/stringinfo.h"
 #include "fmgr.h"
+#include "storage/latch.h"
 #include "storage/lock.h"
 #include "storage/lwlock.h"
+#if PG_VERSION_NUM >= 160000
+#include "storage/relfilelocator.h"
+#else
 #include "storage/relfilenode.h"
+#endif /* PG_VERSION_NUM */
 #include "postmaster/bgworker.h"
+
+/*
+ * PG16 renamed RelFileNode -> RelFileLocator (and RelFileNodeBackend ->
+ * RelFileLocatorBackend), their fields (spcNode/dbNode/relNode ->
+ * spcOid/dbOid/relNumber, .node -> .locator) and Relation->rd_node ->
+ * rd_locator.
+ *
+ * The two type names are aliased with typedefs; the old names no longer exist
+ * in PG16+ headers, so this cannot collide with anything. Field names cannot
+ * be aliased that way, so they go through the DQ_* accessors below, which
+ * expand to the right member on either side of the rename. Do NOT #define the
+ * field names themselves (in particular "node"): a macro rewrites every
+ * identifier of that name in every header included afterwards, and "node" is
+ * a very common one (diskquota's own DiskQuotaWorkerEntry.node is a dlist_node,
+ * unrelated to RelFileNode).
+ *
+ * DQ_RFN_*(rfn)   field of a RelFileNode (an lvalue, so assignable)
+ * DQ_RFNB_NODE(b) the RelFileNode inside a RelFileNodeBackend (pass *ptr
+ *                 for a pointer)
+ * DQ_REL_NODE(r)  the RelFileNode of a Relation (r is a Relation pointer)
+ * DQ_RFN_MAKE()   build a RelFileNode value
+ */
+#if PG_VERSION_NUM >= 160000
+typedef RelFileLocator        RelFileNode;
+typedef RelFileLocatorBackend RelFileNodeBackend;
+#define DQ_RFN_SPC(rfn) ((rfn).spcOid)
+#define DQ_RFN_DB(rfn) ((rfn).dbOid)
+#define DQ_RFN_REL(rfn) ((rfn).relNumber)
+#define DQ_RFNB_NODE(rfnb) ((rfnb).locator)
+#define DQ_REL_NODE(rel) ((rel)->rd_locator)
+#define DQ_RFN_MAKE(spc, db, rel) ((RelFileNode){.spcOid = (spc), .dbOid = (db), .relNumber = (rel)})
+#else
+#define DQ_RFN_SPC(rfn) ((rfn).spcNode)
+#define DQ_RFN_DB(rfn) ((rfn).dbNode)
+#define DQ_RFN_REL(rfn) ((rfn).relNode)
+#define DQ_RFNB_NODE(rfnb) ((rfnb).node)
+#define DQ_REL_NODE(rel) ((rel)->rd_node)
+#define DQ_RFN_MAKE(spc, db, rel) ((RelFileNode){.spcNode = (spc), .dbNode = (db), .relNode = (rel)})
+#endif /* PG_VERSION_NUM */
 
 #include "utils/hsearch.h"
 #include "utils/relcache.h"
 #include "utils/timestamp.h"
+#if PG_VERSION_NUM >= 170000
+#include "utils/wait_event.h"
+#endif /* PG_VERSION_NUM */
 
 #include <signal.h>
 
@@ -36,6 +83,16 @@
 #define INIT_NUM_TABLE_SIZE_ENTRIES 128
 /* max number of TableSizeEntry in table_size_map */
 #define MAX_NUM_TABLE_SIZE_ENTRIES (diskquota_max_table_segments / SEGMENT_SIZE_ARRAY_LENGTH)
+/*
+ * Each monitored database gets its own table_size_map in shared memory, so
+ * the MAX_NUM_TABLE_SIZE_ENTRIES budget is shared across up to
+ * diskquota_max_monitored_databases of them - this must match what
+ * diskquota_worker_shmem_size() reserves per worker in quotamodel.c, or a
+ * 2nd+ monitored database fails ShmemInitHash() with "not enough shared
+ * memory" (init_disk_quota_model()/vacuum_disk_quota_model() were
+ * requesting the full undivided budget per worker instead of its share).
+ */
+#define MAX_NUM_TABLE_SIZE_ENTRIES_PER_DB (MAX_NUM_TABLE_SIZE_ENTRIES / diskquota_max_monitored_databases + 100)
 /* length of segment size array in TableSizeEntry */
 #define SEGMENT_SIZE_ARRAY_LENGTH 100
 /* max number of keys in QuotaInfoEntryKey */
@@ -58,6 +115,17 @@ typedef enum
 #define EXTENSION_SCHEMA "diskquota"
 extern int diskquota_worker_timeout;
 
+/*
+ * WHPG19 widens SIGNAL_ARGS to "int postgres_signal_arg, const pg_signal_info
+ * *pg_siginfo", so forwarding a signal on to a core handler needs the extra
+ * argument there. Use this to pass a handler's own parameters through verbatim.
+ */
+#if GP_VERSION_NUM >= 190000
+#define DISKQUOTA_FORWARD_SIGNAL_ARGS postgres_signal_arg, pg_siginfo
+#else
+#define DISKQUOTA_FORWARD_SIGNAL_ARGS postgres_signal_arg
+#endif /* GP_VERSION_NUM >= 190000 */
+
 #if GP_VERSION_NUM < 70000
 #define TableIsHeap(relstorage, relam) ((bool)(relstorage == RELSTORAGE_HEAP))
 #define TableIsAoRows(relstorage, relam) ((bool)(relstorage == RELSTORAGE_AOROWS))
@@ -71,9 +139,93 @@ extern int diskquota_worker_timeout;
 #define TableIsAoRows(relstorage, relam) ((bool)(relam == AO_ROW_TABLE_AM_OID))
 #define TableIsAoCols(relstorage, relam) ((bool)(relam == AO_COLUMN_TABLE_AM_OID))
 #define DiskquotaCreateTemplateTupleDesc(natts) CreateTemplateTupleDesc(natts);
+#if PG_VERSION_NUM >= 170000
+/*
+ * PG17 replaced the static WAIT_EVENT_* enum constants with a dynamic
+ * registration API (WaitEventExtensionNew()) for extension-defined wait
+ * events. Resolve diskquota's wait event id once (per translation unit,
+ * idempotent - the name maps to the same global id everywhere) and use it
+ * in place of the removed WAIT_EVENT_PG_SLEEP constant.
+ */
+static inline int
+DiskquotaWaitLatch(Latch *latch, int wakeEvents, long timeout)
+{
+	static uint32 diskquota_wait_event_sleep = 0;
+
+	if (diskquota_wait_event_sleep == 0) diskquota_wait_event_sleep = WaitEventExtensionNew("DiskquotaSleep");
+	return WaitLatch(latch, wakeEvents, timeout, diskquota_wait_event_sleep);
+}
+#else
 #define DiskquotaWaitLatch(latch, wakeEvents, timeout) WaitLatch(latch, wakeEvents, timeout, WAIT_EVENT_PG_SLEEP)
+#endif /* PG_VERSION_NUM >= 170000 */
 #define DiskquotaGetRelstorage(classForm) (0)
+#if GP_VERSION_NUM >= 190000
+/*
+ * PG16 collapsed init_ps_display()'s 4-arg form (username, dbname, host_info,
+ * initial_str - each shown as a separate ", "-joined field) into a single
+ * combined fixed_part string. Rebuild the same "bgworker: [diskquota] <dbname>
+ * <suffix>" display text diskquota relied on from the old call shape.
+ *
+ * The title is formatted into a stack buffer rather than psprintf()'d:
+ * init_ps_display() copies it into its own ps_buffer, and some callers sit in
+ * the worker's wait loop, where a palloc'd string would be a per-iteration
+ * leak in whatever long-lived context the worker runs in. A title longer than
+ * the buffer is truncated, which is harmless for a process title. The
+ * separating space is only emitted for a non-empty suffix, so the title has
+ * no trailing blank.
+ */
+#include "utils/ps_status.h"
+static inline void
+DiskquotaInitPsDisplay(const char *dbname, const char *suffix)
+{
+	char title[NAMEDATALEN + 256];
+
+	snprintf(title, sizeof(title), "bgworker: [diskquota] %s%s%s", dbname, suffix[0] ? " " : "", suffix);
+	init_ps_display(title);
+}
+#else
+#define DiskquotaInitPsDisplay(dbname, suffix) init_ps_display("bgworker:", "[diskquota]", (dbname), (suffix))
+#endif /* GP_VERSION_NUM >= 190000 */
+#if GP_VERSION_NUM >= 190000
+/*
+ * WHPG19 dropped the StrNCpy() macro from c.h entirely. Reproduce its exact
+ * semantics (strncpy() the given length, then force-terminate at the last
+ * byte - unlike plain strncpy(), which does not guarantee termination when
+ * src is >= len bytes long) so every call site keeps its original behavior.
+ */
+#define StrNCpy(dst, src, len)          \
+	do                                  \
+	{                                   \
+		char *_dst = (dst);             \
+		Size  _len = (len);             \
+		if (_len > 0)                   \
+		{                               \
+			strncpy(_dst, (src), _len); \
+			_dst[_len - 1] = '\0';      \
+		}                               \
+	} while (0)
+#endif /* GP_VERSION_NUM >= 190000 */
 #endif /* GP_VERSION_NUM */
+
+#if GP_VERSION_NUM >= 190000
+/* WHPG19 dropped the bits8 typedef from c.h; ARR_NULLBITMAP() etc. now return uint8* directly. */
+typedef uint8 diskquota_bits8;
+#else
+typedef bits8 diskquota_bits8;
+#endif /* GP_VERSION_NUM >= 190000 */
+
+#if GP_VERSION_NUM >= 190000
+/*
+ * PG16 renamed RelidByRelfilenode() to RelidByRelfilenumber() in
+ * utils/relfilenumbermap.h. WHPG19 kept the old utils/relfilenodemap.h for a
+ * while (a stale extern prototype: linking succeeded, loading the .so failed
+ * with "undefined symbol") and dropped it on 2026-08-18 (WHPGN-1033), so
+ * relation_cache.c includes one header or the other by GP_VERSION_NUM.
+ */
+#define DiskquotaRelidByRelfilenode(reltablespace, relfilenode) RelidByRelfilenumber(reltablespace, relfilenode)
+#else
+#define DiskquotaRelidByRelfilenode(reltablespace, relfilenode) RelidByRelfilenode(reltablespace, relfilenode)
+#endif /* GP_VERSION_NUM >= 190000 */
 
 typedef enum
 {
@@ -375,6 +527,16 @@ struct DiskquotaDBEntry
 	bool rejectmap_retry_full;
 
 	/*
+	 * Set once this database's worker has logged that its table_size_map
+	 * is full (see calculate_table_disk_usage()). Kept here rather than in
+	 * the worker process: with dynamic workers a database gets a fresh
+	 * worker process every rotation, and a per-process flag would repeat
+	 * the warning once per cycle for as long as the overflow lasts.
+	 * Reset whenever the slot is (re)bound to a database.
+	 */
+	bool table_size_map_full_warned;
+
+	/*
 	 * Bumped every time the slot is claimed. A worker captures the
 	 * value at startup and its publishes are discarded on a mismatch:
 	 * the in_use/dbid revalidation alone cannot tell a DROP EXTENSION
@@ -469,6 +631,7 @@ extern int64 diskquota_get_cluster_limit_mb(void);
 extern void  diskquota_worker_capture_generation(void);
 extern bool  diskquota_worker_binding_valid(void);
 extern void  diskquota_publish_db_total(int64 total);
+extern bool  diskquota_worker_note_table_size_map_full(void);
 extern void  diskquota_publish_db_limit(int64 limit_mb);
 extern void  diskquota_rejectmap_retry_set(bool full);
 extern void  diskquota_rejectmap_retry_clear(void);

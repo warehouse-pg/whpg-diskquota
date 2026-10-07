@@ -33,6 +33,7 @@
 #include "funcapi.h"
 #include "libpq-fe.h"
 #include "storage/smgr.h"
+#include "utils/array.h" /* ArrayType/ARR_* macros no longer transitively available on WHPG19 */
 #include "utils/faultinjector.h"
 #include "utils/lsyscache.h"
 #include "utils/syscache.h"
@@ -158,7 +159,7 @@ active_table_hook_smgrextend(RelFileNodeBackend rnode)
 	if (prev_file_extend_hook) (*prev_file_extend_hook)(rnode);
 
 	report_active_table_helper(&rnode);
-	quota_check_common(InvalidOid /*reloid*/, &rnode.node);
+	quota_check_common(InvalidOid /*reloid*/, &DQ_RFNB_NODE(rnode));
 }
 
 /*
@@ -182,7 +183,7 @@ active_table_hook_smgrunlink(RelFileNodeBackend rnode)
 	 * relation oid, we need to do the cleaning here to avoid memory leak
 	 */
 	remove_from_active_table_map(&rnode);
-	remove_cache_entry(InvalidOid, rnode.node.relNode);
+	remove_cache_entry(InvalidOid, DQ_RFN_REL(DQ_RFNB_NODE(rnode)));
 }
 
 static void
@@ -292,7 +293,7 @@ report_active_table_helper(const RelFileNodeBackend *relFileNode)
 	DiskQuotaActiveTableFileEntry *entry;
 	DiskQuotaActiveTableFileEntry  item;
 	bool                           found = false;
-	Oid                            dbid  = relFileNode->node.dbNode;
+	Oid                            dbid  = DQ_RFN_DB(DQ_RFNB_NODE(*relFileNode));
 
 	/* We do not collect the active table in mirror segments  */
 	if (IsRoleMirror())
@@ -313,9 +314,9 @@ report_active_table_helper(const RelFileNodeBackend *relFileNode)
 	found = false;
 
 	MemSet(&item, 0, sizeof(DiskQuotaActiveTableFileEntry));
-	item.dbid          = relFileNode->node.dbNode;
-	item.relfilenode   = relFileNode->node.relNode;
-	item.tablespaceoid = relFileNode->node.spcNode;
+	item.dbid          = DQ_RFN_DB(DQ_RFNB_NODE(*relFileNode));
+	item.relfilenode   = DQ_RFN_REL(DQ_RFNB_NODE(*relFileNode));
+	item.tablespaceoid = DQ_RFN_SPC(DQ_RFNB_NODE(*relFileNode));
 
 	LWLockAcquire(diskquota_locks.active_table_lock, LW_EXCLUSIVE);
 	entry = hash_search(active_tables_map, &item, HASH_ENTER_NULL, &found);
@@ -340,9 +341,9 @@ remove_from_active_table_map(const RelFileNodeBackend *relFileNode)
 {
 	DiskQuotaActiveTableFileEntry item = {0};
 
-	item.dbid          = relFileNode->node.dbNode;
-	item.relfilenode   = relFileNode->node.relNode;
-	item.tablespaceoid = relFileNode->node.spcNode;
+	item.dbid          = DQ_RFN_DB(DQ_RFNB_NODE(*relFileNode));
+	item.relfilenode   = DQ_RFN_REL(DQ_RFNB_NODE(*relFileNode));
+	item.tablespaceoid = DQ_RFN_SPC(DQ_RFNB_NODE(*relFileNode));
 
 	LWLockAcquire(diskquota_locks.active_table_lock, LW_EXCLUSIVE);
 	hash_search(active_tables_map, &item, HASH_REMOVE, NULL);
@@ -600,7 +601,7 @@ get_active_tables_stats(ArrayType *array)
 	bool                       typbyval;
 	char                       typalign;
 	char                      *ptr;
-	bits8                     *bitmap;
+	diskquota_bits8           *bitmap;
 	int                        bitmask;
 	int                        i;
 	Oid                        relOid;
@@ -734,7 +735,7 @@ is_cached_relfilenode_stale(Oid relOid, RelFileNode rnode)
 	 * the active table map.
 	 */
 	Oid  cached_relfilenode = reltup->relfilenode;
-	bool is_stale           = cached_relfilenode != rnode.relNode;
+	bool is_stale           = cached_relfilenode != DQ_RFN_REL(rnode);
 	heap_freetuple(tp);
 	return is_stale;
 }
@@ -825,10 +826,10 @@ get_active_tables_oid(void)
 		/* The session of db1 should not see the table inside db2. */
 		if (active_table_file_entry->dbid != MyDatabaseId) continue;
 
-		rnode.dbNode  = active_table_file_entry->dbid;
-		rnode.relNode = active_table_file_entry->relfilenode;
-		rnode.spcNode = active_table_file_entry->tablespaceoid;
-		relOid        = get_relid_by_relfilenode(rnode);
+		DQ_RFN_DB(rnode)  = active_table_file_entry->dbid;
+		DQ_RFN_REL(rnode) = active_table_file_entry->relfilenode;
+		DQ_RFN_SPC(rnode) = active_table_file_entry->tablespaceoid;
+		relOid            = get_relid_by_relfilenode(rnode);
 
 		/* If relfilenode is not prepared for some relation, just skip it. */
 		if (!OidIsValid(relOid)) continue;
@@ -974,9 +975,13 @@ load_table_size(HTAB *local_table_stats_map)
 #if GP_VERSION_NUM < 70000
 	if (tupdesc->natts != 3 || ((tupdesc)->attrs[0])->atttypid != OIDOID ||
 	    ((tupdesc)->attrs[1])->atttypid != INT8OID || ((tupdesc)->attrs[2])->atttypid != INT2OID)
-#else
+#elif GP_VERSION_NUM < 190000
 	if (tupdesc->natts != 3 || ((tupdesc)->attrs[0]).atttypid != OIDOID || ((tupdesc)->attrs[1]).atttypid != INT8OID ||
 	    ((tupdesc)->attrs[2]).atttypid != INT2OID)
+#else
+	/* WHPG19 dropped the GP-specific TupleDescData->attrs[] compat member; use the portable accessor. */
+	if (tupdesc->natts != 3 || TupleDescAttr(tupdesc, 0)->atttypid != OIDOID ||
+	    TupleDescAttr(tupdesc, 1)->atttypid != INT8OID || TupleDescAttr(tupdesc, 2)->atttypid != INT2OID)
 #endif /* GP_VERSION_NUM */
 	{
 		if (tupdesc->natts != 3)
@@ -988,9 +993,12 @@ load_table_size(HTAB *local_table_stats_map)
 #if GP_VERSION_NUM < 70000
 			ereport(WARNING, (errmsg("[diskquota] attrs: %d, %d, %d", tupdesc->attrs[0]->atttypid,
 			                         tupdesc->attrs[1]->atttypid, tupdesc->attrs[2]->atttypid)));
-#else
+#elif GP_VERSION_NUM < 190000
 			ereport(WARNING, (errmsg("[diskquota] attrs: %d, %d, %d", tupdesc->attrs[0].atttypid,
 			                         tupdesc->attrs[1].atttypid, tupdesc->attrs[2].atttypid)));
+#else
+			ereport(WARNING, (errmsg("[diskquota] attrs: %d, %d, %d", TupleDescAttr(tupdesc, 0)->atttypid,
+			                         TupleDescAttr(tupdesc, 1)->atttypid, TupleDescAttr(tupdesc, 2)->atttypid)));
 #endif /* GP_VERSION_NUM */
 		}
 		ereport(ERROR, (errmsg("[diskquota] table \"table_size\" is corrupted in database \"%s\","
