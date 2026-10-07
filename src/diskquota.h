@@ -33,22 +33,41 @@
 
 /*
  * PG16 renamed RelFileNode -> RelFileLocator (and RelFileNodeBackend ->
- * RelFileLocatorBackend), along with several of its fields and the
- * Relation struct's rd_node member. diskquota accesses these types/fields
- * extensively (relation_cache.c, gp_activetable.c, diskquota_utility.c,
- * quotamodel.c), so provide textual compatibility macros here rather than
- * threading #if guards through every call site. These identifiers are not
- * reused elsewhere in this codebase for unrelated purposes (verified via
- * grep), so blanket substitution is safe within diskquota's own sources.
+ * RelFileLocatorBackend), their fields (spcNode/dbNode/relNode ->
+ * spcOid/dbOid/relNumber, .node -> .locator) and Relation->rd_node ->
+ * rd_locator.
+ *
+ * The two type names are aliased with typedefs; the old names no longer exist
+ * in PG16+ headers, so this cannot collide with anything. Field names cannot
+ * be aliased that way, so they go through the DQ_* accessors below, which
+ * expand to the right member on either side of the rename. Do NOT #define the
+ * field names themselves (in particular "node"): a macro rewrites every
+ * identifier of that name in every header included afterwards, and "node" is
+ * a very common one (diskquota's own DiskQuotaWorkerEntry.node is a dlist_node,
+ * unrelated to RelFileNode).
+ *
+ * DQ_RFN_*(rfn)   field of a RelFileNode (an lvalue, so assignable)
+ * DQ_RFNB_NODE(b) the RelFileNode inside a RelFileNodeBackend (pass *ptr
+ *                 for a pointer)
+ * DQ_REL_NODE(r)  the RelFileNode of a Relation (r is a Relation pointer)
+ * DQ_RFN_MAKE()   build a RelFileNode value
  */
 #if PG_VERSION_NUM >= 160000
-#define RelFileNode RelFileLocator
-#define RelFileNodeBackend RelFileLocatorBackend
-#define relNode relNumber
-#define spcNode spcOid
-#define dbNode dbOid
-#define node locator
-#define rd_node rd_locator
+typedef RelFileLocator        RelFileNode;
+typedef RelFileLocatorBackend RelFileNodeBackend;
+#define DQ_RFN_SPC(rfn)           ((rfn).spcOid)
+#define DQ_RFN_DB(rfn)            ((rfn).dbOid)
+#define DQ_RFN_REL(rfn)           ((rfn).relNumber)
+#define DQ_RFNB_NODE(rfnb)        ((rfnb).locator)
+#define DQ_REL_NODE(rel)          ((rel)->rd_locator)
+#define DQ_RFN_MAKE(spc, db, rel) ((RelFileNode){.spcOid = (spc), .dbOid = (db), .relNumber = (rel)})
+#else
+#define DQ_RFN_SPC(rfn)           ((rfn).spcNode)
+#define DQ_RFN_DB(rfn)            ((rfn).dbNode)
+#define DQ_RFN_REL(rfn)           ((rfn).relNode)
+#define DQ_RFNB_NODE(rfnb)        ((rfnb).node)
+#define DQ_REL_NODE(rel)          ((rel)->rd_node)
+#define DQ_RFN_MAKE(spc, db, rel) ((RelFileNode){.spcNode = (spc), .dbNode = (db), .relNode = (rel)})
 #endif /* PG_VERSION_NUM */
 
 #include "utils/hsearch.h"
@@ -146,9 +165,24 @@ DiskquotaWaitLatch(Latch *latch, int wakeEvents, long timeout)
  * initial_str - each shown as a separate ", "-joined field) into a single
  * combined fixed_part string. Rebuild the same "bgworker: [diskquota] <dbname>
  * <suffix>" display text diskquota relied on from the old call shape.
+ *
+ * The title is formatted into a stack buffer rather than psprintf()'d:
+ * init_ps_display() copies it into its own ps_buffer, and some callers sit in
+ * the worker's wait loop, where a palloc'd string would be a per-iteration
+ * leak in whatever long-lived context the worker runs in. A title longer than
+ * the buffer is truncated, which is harmless for a process title. The
+ * separating space is only emitted for a non-empty suffix, so the title has
+ * no trailing blank.
  */
-#define DiskquotaInitPsDisplay(dbname, suffix) \
-	init_ps_display(psprintf("bgworker: [diskquota] %s %s", (dbname), (suffix)))
+#include "utils/ps_status.h"
+static inline void
+DiskquotaInitPsDisplay(const char *dbname, const char *suffix)
+{
+	char title[NAMEDATALEN + 256];
+
+	snprintf(title, sizeof(title), "bgworker: [diskquota] %s%s%s", dbname, suffix[0] ? " " : "", suffix);
+	init_ps_display(title);
+}
 #else
 #define DiskquotaInitPsDisplay(dbname, suffix) init_ps_display("bgworker:", "[diskquota]", (dbname), (suffix))
 #endif /* GP_VERSION_NUM >= 190000 */
@@ -493,6 +527,16 @@ struct DiskquotaDBEntry
 	bool rejectmap_retry_full;
 
 	/*
+	 * Set once this database's worker has logged that its table_size_map
+	 * is full (see calculate_table_disk_usage()). Kept here rather than in
+	 * the worker process: with dynamic workers a database gets a fresh
+	 * worker process every rotation, and a per-process flag would repeat
+	 * the warning once per cycle for as long as the overflow lasts.
+	 * Reset whenever the slot is (re)bound to a database.
+	 */
+	bool table_size_map_full_warned;
+
+	/*
 	 * Bumped every time the slot is claimed. A worker captures the
 	 * value at startup and its publishes are discarded on a mismatch:
 	 * the in_use/dbid revalidation alone cannot tell a DROP EXTENSION
@@ -587,6 +631,7 @@ extern int64 diskquota_get_cluster_limit_mb(void);
 extern void  diskquota_worker_capture_generation(void);
 extern bool  diskquota_worker_binding_valid(void);
 extern void  diskquota_publish_db_total(int64 total);
+extern bool diskquota_worker_note_table_size_map_full(void);
 extern void  diskquota_publish_db_limit(int64 limit_mb);
 extern void  diskquota_rejectmap_retry_set(bool full);
 extern void  diskquota_rejectmap_retry_clear(void);

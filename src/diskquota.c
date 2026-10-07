@@ -2178,9 +2178,10 @@ add_db_entry(Oid dbid, bool *is_new)
 		 */
 		pg_atomic_write_u64(&hole->total_size, 0);
 		pg_atomic_write_u64(&hole->db_quota_limit_mb, 0);
-		hole->rejectmap_retry      = false;
-		hole->rejectmap_retry_full = false;
-		hole->inited               = false;
+		hole->rejectmap_retry            = false;
+		hole->rejectmap_retry_full       = false;
+		hole->table_size_map_full_warned = false;
+		hole->inited                     = false;
 		hole->generation++;
 		hole->dbid          = dbid;
 		hole->lifecycle     = DB_SLOT_ACTIVE;
@@ -2458,10 +2459,11 @@ reap_draining_db_entries(void)
 			vacuum_disk_quota_model(db->id);
 			pg_atomic_write_u64(&db->total_size, 0);
 			pg_atomic_write_u64(&db->db_quota_limit_mb, 0);
-			db->rejectmap_retry      = false;
-			db->rejectmap_retry_full = false;
-			db->inited               = false;
-			db->next_run_time        = GetCurrentTimestamp();
+			db->rejectmap_retry            = false;
+			db->rejectmap_retry_full       = false;
+			db->table_size_map_full_warned = false;
+			db->inited                     = false;
+			db->next_run_time              = GetCurrentTimestamp();
 			db->lifecycle            = DB_SLOT_ACTIVE;
 		}
 		else
@@ -2566,11 +2568,12 @@ static void
 vacuum_db_entry(DiskquotaDBEntry *db)
 {
 	if (db == NULL) return;
-	db->dbid      = InvalidOid;
-	db->inited    = false;
-	db->workerId  = INVALID_WORKER_ID;
-	db->in_use    = false;
-	db->lifecycle = DB_SLOT_ACTIVE;
+	db->dbid                       = InvalidOid;
+	db->inited                     = false;
+	db->table_size_map_full_warned = false;
+	db->workerId                   = INVALID_WORKER_ID;
+	db->in_use                     = false;
+	db->lifecycle                  = DB_SLOT_ACTIVE;
 }
 
 static void
@@ -3060,6 +3063,30 @@ diskquota_publish_db_total(int64 total)
 	LWLockAcquire(diskquota_locks.dblist_lock, LW_SHARED);
 	if (dbentry_binding_current(dbEntry)) pg_atomic_write_u64(&dbEntry->total_size, (total > 0) ? (uint64)total : 0);
 	LWLockRelease(diskquota_locks.dblist_lock);
+}
+
+/*
+ * Record that the calling worker found its database's table_size_map full.
+ * Returns true the first time this is reported for the current slot binding,
+ * so the caller logs the condition once per database rather than once per
+ * worker process (see DiskquotaDBEntry.table_size_map_full_warned). Same
+ * slot-binding rule as diskquota_publish_db_total().
+ */
+bool
+diskquota_worker_note_table_size_map_full(void)
+{
+	DiskquotaDBEntry *dbEntry = (MyWorkerInfo != NULL) ? MyWorkerInfo->dbEntry : NULL;
+	bool              first   = false;
+
+	if (dbEntry == NULL) return false;
+	LWLockAcquire(diskquota_locks.dblist_lock, LW_SHARED);
+	if (dbentry_binding_current(dbEntry) && !dbEntry->table_size_map_full_warned)
+	{
+		dbEntry->table_size_map_full_warned = true;
+		first                               = true;
+	}
+	LWLockRelease(diskquota_locks.dblist_lock);
+	return first;
 }
 
 /*

@@ -277,9 +277,9 @@ calculate_all_table_size()
 		/* ignore system table */
 		if (relid < FirstNormalObjectId) continue;
 
-		rnode.node.dbNode  = MyDatabaseId;
-		rnode.node.relNode = classForm->relfilenode;
-		rnode.node.spcNode = OidIsValid(classForm->reltablespace) ? classForm->reltablespace : MyDatabaseTableSpace;
+		DQ_RFN_DB(DQ_RFNB_NODE(rnode))  = MyDatabaseId;
+		DQ_RFN_REL(DQ_RFNB_NODE(rnode)) = classForm->relfilenode;
+		DQ_RFN_SPC(DQ_RFNB_NODE(rnode)) = OidIsValid(classForm->reltablespace) ? classForm->reltablespace : MyDatabaseTableSpace;
 		rnode.backend      = classForm->relpersistence == RELPERSISTENCE_TEMP ? TempRelBackendId : InvalidBackendId;
 		relstorage         = DiskquotaGetRelstorage(classForm);
 
@@ -1659,7 +1659,7 @@ calculate_relation_size_all_forks(RelFileNodeBackend *rnode, char relstorage, Oi
 		for (forkNum = 0; forkNum <= MAX_FORKNUM; forkNum++)
 		{
 			RelationFileStatCtx ctx = {0};
-			ctx.relation_path       = DiskquotaRelpathBackend(rnode->node, rnode->backend, forkNum);
+			ctx.relation_path       = DiskquotaRelpathBackend(DQ_RFNB_NODE(*rnode), rnode->backend, forkNum);
 			ctx.size                = 0;
 			for (segno = 0;; segno++)
 			{
@@ -1672,7 +1672,7 @@ calculate_relation_size_all_forks(RelFileNodeBackend *rnode, char relstorage, Oi
 	else if (TableIsAoRows(relstorage, relam) || TableIsAoCols(relstorage, relam))
 	{
 		RelationFileStatCtx ctx = {0};
-		ctx.relation_path       = DiskquotaRelpathBackend(rnode->node, rnode->backend, MAIN_FORKNUM);
+		ctx.relation_path       = DiskquotaRelpathBackend(DQ_RFNB_NODE(*rnode), rnode->backend, MAIN_FORKNUM);
 		ctx.size                = 0;
 		/*
 		 * Since the extension file with (segno=0, column=1) is not traversed by
@@ -1700,9 +1700,9 @@ relation_size_local(PG_FUNCTION_ARGS)
 	RelFileNodeBackend rnode          = {0};
 	int64              size           = 0;
 
-	rnode.node.dbNode  = MyDatabaseId;
-	rnode.node.relNode = relfilenode;
-	rnode.node.spcNode = OidIsValid(reltablespace) ? reltablespace : MyDatabaseTableSpace;
+	DQ_RFN_DB(DQ_RFNB_NODE(rnode))  = MyDatabaseId;
+	DQ_RFN_REL(DQ_RFNB_NODE(rnode)) = relfilenode;
+	DQ_RFN_SPC(DQ_RFNB_NODE(rnode)) = OidIsValid(reltablespace) ? reltablespace : MyDatabaseTableSpace;
 	rnode.backend      = relpersistence == RELPERSISTENCE_TEMP ? TempRelBackendId : InvalidBackendId;
 
 	size = calculate_relation_size_all_forks(&rnode, relstorage, relam);
