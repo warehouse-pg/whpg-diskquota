@@ -2464,7 +2464,7 @@ reap_draining_db_entries(void)
 			db->table_size_map_full_warned = false;
 			db->inited                     = false;
 			db->next_run_time              = GetCurrentTimestamp();
-			db->lifecycle            = DB_SLOT_ACTIVE;
+			db->lifecycle                  = DB_SLOT_ACTIVE;
 		}
 		else
 		{

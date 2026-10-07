@@ -279,9 +279,10 @@ calculate_all_table_size()
 
 		DQ_RFN_DB(DQ_RFNB_NODE(rnode))  = MyDatabaseId;
 		DQ_RFN_REL(DQ_RFNB_NODE(rnode)) = classForm->relfilenode;
-		DQ_RFN_SPC(DQ_RFNB_NODE(rnode)) = OidIsValid(classForm->reltablespace) ? classForm->reltablespace : MyDatabaseTableSpace;
-		rnode.backend      = classForm->relpersistence == RELPERSISTENCE_TEMP ? TempRelBackendId : InvalidBackendId;
-		relstorage         = DiskquotaGetRelstorage(classForm);
+		DQ_RFN_SPC(DQ_RFNB_NODE(rnode)) =
+		        OidIsValid(classForm->reltablespace) ? classForm->reltablespace : MyDatabaseTableSpace;
+		rnode.backend = classForm->relpersistence == RELPERSISTENCE_TEMP ? TempRelBackendId : InvalidBackendId;
+		relstorage    = DiskquotaGetRelstorage(classForm);
 
 		tablesize = calculate_relation_size_all_forks(&rnode, relstorage, classForm->relam);
 
@@ -1703,7 +1704,7 @@ relation_size_local(PG_FUNCTION_ARGS)
 	DQ_RFN_DB(DQ_RFNB_NODE(rnode))  = MyDatabaseId;
 	DQ_RFN_REL(DQ_RFNB_NODE(rnode)) = relfilenode;
 	DQ_RFN_SPC(DQ_RFNB_NODE(rnode)) = OidIsValid(reltablespace) ? reltablespace : MyDatabaseTableSpace;
-	rnode.backend      = relpersistence == RELPERSISTENCE_TEMP ? TempRelBackendId : InvalidBackendId;
+	rnode.backend                   = relpersistence == RELPERSISTENCE_TEMP ? TempRelBackendId : InvalidBackendId;
 
 	size = calculate_relation_size_all_forks(&rnode, relstorage, relam);
 

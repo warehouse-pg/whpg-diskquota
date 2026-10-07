@@ -2687,8 +2687,8 @@ refresh_rejectmap(PG_FUNCTION_ARGS)
 							if (found && relation_cache_entry)
 							{
 								memset(&blocked_filenode_keyitem, 0, sizeof(RejectMapEntry));
-								memcpy(&blocked_filenode_keyitem.relfilenode, &DQ_RFNB_NODE(relation_cache_entry->rnode),
-								       sizeof(RelFileNode));
+								memcpy(&blocked_filenode_keyitem.relfilenode,
+								       &DQ_RFNB_NODE(relation_cache_entry->rnode), sizeof(RelFileNode));
 
 								blocked_filenode_entry = hash_search(local_rejectmap, &blocked_filenode_keyitem,
 								                                     HASH_ENTER_NULL, &found);

@@ -152,13 +152,13 @@ update_relation_entry(Oid relid, DiskQuotaRelationCacheEntry *relation_entry, Di
 
 	if (relation_entry)
 	{
-		relation_entry->relid         = relid;
-		DQ_RFNB_NODE(relation_entry->rnode)    = DQ_REL_NODE(rel);
-		relation_entry->rnode.backend = rel->rd_backend;
-		relation_entry->owneroid      = rel->rd_rel->relowner;
-		relation_entry->namespaceoid  = rel->rd_rel->relnamespace;
-		relation_entry->relstorage    = DiskquotaGetRelstorage(rel->rd_rel);
-		relation_entry->relam         = rel->rd_rel->relam;
+		relation_entry->relid               = relid;
+		DQ_RFNB_NODE(relation_entry->rnode) = DQ_REL_NODE(rel);
+		relation_entry->rnode.backend       = rel->rd_backend;
+		relation_entry->owneroid            = rel->rd_rel->relowner;
+		relation_entry->namespaceoid        = rel->rd_rel->relnamespace;
+		relation_entry->relstorage          = DiskquotaGetRelstorage(rel->rd_rel);
+		relation_entry->relam               = rel->rd_rel->relam;
 	}
 
 	if (relid_entry)
@@ -307,7 +307,8 @@ remove_committed_relation_from_cache(void)
 		 * remains in relation_cache, the outdated relation_cache_entry should
 		 * be removed.
 		 */
-		if (OidIsValid(DiskquotaRelidByRelfilenode(DQ_RFN_SPC(DQ_RFNB_NODE(local_entry->rnode)), DQ_RFN_REL(DQ_RFNB_NODE(local_entry->rnode)))))
+		if (OidIsValid(DiskquotaRelidByRelfilenode(DQ_RFN_SPC(DQ_RFNB_NODE(local_entry->rnode)),
+		                                           DQ_RFN_REL(DQ_RFNB_NODE(local_entry->rnode)))))
 		{
 			remove_cache_entry(InvalidOid, DQ_RFN_REL(DQ_RFNB_NODE(local_entry->rnode)));
 		}
@@ -581,13 +582,14 @@ get_relfilenode_by_relid(Oid relid, RelFileNodeBackend *rnode, char *relstorage,
 	classTup = SearchSysCacheCopy1(RELOID, ObjectIdGetDatum(relid));
 	if (HeapTupleIsValid(classTup))
 	{
-		classForm           = (Form_pg_class)GETSTRUCT(classTup);
-		DQ_RFN_SPC(DQ_RFNB_NODE(*rnode)) = OidIsValid(classForm->reltablespace) ? classForm->reltablespace : MyDatabaseTableSpace;
+		classForm = (Form_pg_class)GETSTRUCT(classTup);
+		DQ_RFN_SPC(DQ_RFNB_NODE(*rnode)) =
+		        OidIsValid(classForm->reltablespace) ? classForm->reltablespace : MyDatabaseTableSpace;
 		DQ_RFN_DB(DQ_RFNB_NODE(*rnode))  = MyDatabaseId;
 		DQ_RFN_REL(DQ_RFNB_NODE(*rnode)) = classForm->relfilenode;
-		rnode->backend      = classForm->relpersistence == RELPERSISTENCE_TEMP ? TempRelBackendId : InvalidBackendId;
-		*relstorage         = DiskquotaGetRelstorage(classForm);
-		*relam              = classForm->relam;
+		rnode->backend = classForm->relpersistence == RELPERSISTENCE_TEMP ? TempRelBackendId : InvalidBackendId;
+		*relstorage    = DiskquotaGetRelstorage(classForm);
+		*relam         = classForm->relam;
 		heap_freetuple(classTup);
 		remove_cache_entry(relid, InvalidOid);
 		return;

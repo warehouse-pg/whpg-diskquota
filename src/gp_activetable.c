@@ -829,7 +829,7 @@ get_active_tables_oid(void)
 		DQ_RFN_DB(rnode)  = active_table_file_entry->dbid;
 		DQ_RFN_REL(rnode) = active_table_file_entry->relfilenode;
 		DQ_RFN_SPC(rnode) = active_table_file_entry->tablespaceoid;
-		relOid        = get_relid_by_relfilenode(rnode);
+		relOid            = get_relid_by_relfilenode(rnode);
 
 		/* If relfilenode is not prepared for some relation, just skip it. */
 		if (!OidIsValid(relOid)) continue;

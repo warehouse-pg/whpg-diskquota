@@ -55,18 +55,18 @@
 #if PG_VERSION_NUM >= 160000
 typedef RelFileLocator        RelFileNode;
 typedef RelFileLocatorBackend RelFileNodeBackend;
-#define DQ_RFN_SPC(rfn)           ((rfn).spcOid)
-#define DQ_RFN_DB(rfn)            ((rfn).dbOid)
-#define DQ_RFN_REL(rfn)           ((rfn).relNumber)
-#define DQ_RFNB_NODE(rfnb)        ((rfnb).locator)
-#define DQ_REL_NODE(rel)          ((rel)->rd_locator)
+#define DQ_RFN_SPC(rfn) ((rfn).spcOid)
+#define DQ_RFN_DB(rfn) ((rfn).dbOid)
+#define DQ_RFN_REL(rfn) ((rfn).relNumber)
+#define DQ_RFNB_NODE(rfnb) ((rfnb).locator)
+#define DQ_REL_NODE(rel) ((rel)->rd_locator)
 #define DQ_RFN_MAKE(spc, db, rel) ((RelFileNode){.spcOid = (spc), .dbOid = (db), .relNumber = (rel)})
 #else
-#define DQ_RFN_SPC(rfn)           ((rfn).spcNode)
-#define DQ_RFN_DB(rfn)            ((rfn).dbNode)
-#define DQ_RFN_REL(rfn)           ((rfn).relNode)
-#define DQ_RFNB_NODE(rfnb)        ((rfnb).node)
-#define DQ_REL_NODE(rel)          ((rel)->rd_node)
+#define DQ_RFN_SPC(rfn) ((rfn).spcNode)
+#define DQ_RFN_DB(rfn) ((rfn).dbNode)
+#define DQ_RFN_REL(rfn) ((rfn).relNode)
+#define DQ_RFNB_NODE(rfnb) ((rfnb).node)
+#define DQ_REL_NODE(rel) ((rel)->rd_node)
 #define DQ_RFN_MAKE(spc, db, rel) ((RelFileNode){.spcNode = (spc), .dbNode = (db), .relNode = (rel)})
 #endif /* PG_VERSION_NUM */
 
@@ -631,7 +631,7 @@ extern int64 diskquota_get_cluster_limit_mb(void);
 extern void  diskquota_worker_capture_generation(void);
 extern bool  diskquota_worker_binding_valid(void);
 extern void  diskquota_publish_db_total(int64 total);
-extern bool diskquota_worker_note_table_size_map_full(void);
+extern bool  diskquota_worker_note_table_size_map_full(void);
 extern void  diskquota_publish_db_limit(int64 limit_mb);
 extern void  diskquota_rejectmap_retry_set(bool full);
 extern void  diskquota_rejectmap_retry_clear(void);
