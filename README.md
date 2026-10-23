@@ -1,3 +1,43 @@
+# WarehousePG diskquota
+
+This repository is forked from
+[greenplum-db/diskquota-archive](https://github.com/greenplum-db/diskquota-archive)
+and maintained specifically for WarehousePG. The `main` branch (diskquota
+2.4) supports WarehousePG 7 and 19; WarehousePG 6 packages are built from
+the 2.3.x maintenance tags (e.g. `2.3.1-WHPG`).
+
+## Building and Testing
+
+With the WarehousePG `pg_config` on your `PATH` (e.g. after sourcing
+`greenplum_path.sh`) and [cmake](https://cmake.org) 3.20 or later:
+
+```
+mkdir -p build && cd build
+cmake ..
+make install
+# needs a running WarehousePG demo cluster; the suite reconfigures the
+# cluster (shared_preload_libraries and diskquota GUCs) and restarts it
+make installcheck
+```
+
+See [Development](#development) and [Test](#test) below for enabling the
+extension and running individual tests.
+
+## Contributing
+
+Contributions are welcome. See [CONTRIBUTING.md](CONTRIBUTING.md) and the
+[Code of Conduct](CODE-OF-CONDUCT.md). Report bugs through
+[GitHub issues](https://github.com/warehouse-pg/whpg-diskquota/issues), and
+security vulnerabilities privately as described in
+[SECURITY.md](SECURITY.md).
+
+## License
+
+WarehousePG diskquota is released under the PostgreSQL License. See
+[LICENSE.md](LICENSE.md).
+
+The upstream diskquota documentation is kept below.
+
 # Overview
 Diskquota is an extension that provides disk usage enforcement for database 
 objects in Greenplum DB. Currently it supports to set quota limit on schema 
