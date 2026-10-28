@@ -1104,7 +1104,8 @@ create_monitor_db_table(void)
 	      "smallint);"
 	      "CREATE FUNCTION " LAUNCHER_SCHEMA ".diskquota_fetch_table_stat(int4, oid[]) RETURNS setof " LAUNCHER_SCHEMA
 	      ".diskquota_active_table_type AS '$libdir/" DISKQUOTA_BINARY_NAME
-	      ".so', 'diskquota_fetch_table_stat' LANGUAGE C VOLATILE;";
+	      ".so', 'diskquota_fetch_table_stat' LANGUAGE C VOLATILE;"
+	      "REVOKE EXECUTE ON FUNCTION " LAUNCHER_SCHEMA ".diskquota_fetch_table_stat(int4, oid[]) FROM PUBLIC;";
 
 	StartTransactionCommand();
 
