@@ -32,6 +32,7 @@
 #include "executor/spi.h"
 #include "funcapi.h"
 #include "libpq-fe.h"
+#include "miscadmin.h"
 #include "storage/smgr.h"
 #include "utils/array.h" /* ArrayType/ARR_* macros no longer transitively available on WHPG19 */
 #include "utils/faultinjector.h"
@@ -416,6 +417,13 @@ gp_fetch_active_tables(bool is_init)
  * - REMOVE_DB_FROM_BEING_MONITORED: remove MyDatabaseId from the monitored
  * db cache so that active tables in the current database will be recorded.
  * This is used when DROP EXTENSION.
+ *
+ * The function is dispatched to the segments by the diskquota workers and
+ * launcher, which connect as the bootstrap superuser. It is not meant to be
+ * called by users: the monitor modes switch a database's monitoring on and
+ * off on the segment, and FETCH_ACTIVE_OID drains the active table list
+ * before the worker gets to read it. The superuser check below blocks
+ * other callers, whatever the function's EXECUTE grant.
  */
 Datum
 diskquota_fetch_table_stat(PG_FUNCTION_ARGS)
@@ -429,6 +437,9 @@ diskquota_fetch_table_stat(PG_FUNCTION_ARGS)
 	HTAB                      *localCacheTable = NULL;
 	DiskQuotaSetOFCache       *cache           = NULL;
 	DiskQuotaActiveTableEntry *results_entry   = NULL;
+
+	if (!superuser())
+		ereport(ERROR, (errcode(ERRCODE_INSUFFICIENT_PRIVILEGE), errmsg("must be superuser to fetch table stat")));
 
 #ifdef FAULT_INJECTOR
 	if (SIMPLE_FAULT_INJECTOR("ereport_warning_from_segment") == FaultInjectorTypeSkip)
@@ -574,12 +585,21 @@ diskquota_fetch_table_stat(PG_FUNCTION_ARGS)
 static Oid
 get_dbid(ArrayType *array)
 {
-	Assert(ARR_ELEMTYPE(array) == OIDOID);
 	char *ptr;
 	bool  typbyval;
 	int16 typlen;
 	char  typalign;
 	Oid   dbid;
+
+	Assert(ARR_ELEMTYPE(array) == OIDOID);
+
+	/*
+	 * The callers always pass a single database oid. Check it before reading
+	 * the array data: an empty array has no data to read.
+	 */
+	if (ARR_HASNULL(array) || ArrayGetNItems(ARR_NDIM(array), ARR_DIMS(array)) != 1)
+		ereport(ERROR,
+		        (errcode(ERRCODE_INVALID_PARAMETER_VALUE), errmsg("expected an array of exactly one database oid")));
 
 	get_typlenbyvalalign(ARR_ELEMTYPE(array), &typlen, &typbyval, &typalign);
 	ptr  = ARR_DATA_PTR(array);
